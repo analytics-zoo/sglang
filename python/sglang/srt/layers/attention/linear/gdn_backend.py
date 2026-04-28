@@ -18,7 +18,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
@@ -463,7 +463,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 query_start_loc=query_start_loc,
             )
 
-            if (is_npu() or is_cpu()) and last_recurrent_state is not None:
+            if (
+                is_npu() or is_cpu() or is_xpu()
+            ) and last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

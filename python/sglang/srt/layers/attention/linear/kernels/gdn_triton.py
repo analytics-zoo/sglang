@@ -3,7 +3,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_npu, is_xpu
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -29,6 +29,17 @@ elif is_cpu():
     fused_sigmoid_gating_delta_rule_update = (
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
+elif is_xpu():
+    # Triton-XPU 3.7.0 cannot compile the block-pointer-heavy GDN kernels
+    # (chunk_delta_h / chunk_fwd / chunk_o). Route extend() through a pure-
+    # PyTorch reference implementation until the Intel Triton backend supports
+    # these patterns. decode() / target_verify() still use Triton, since those
+    # kernels compile successfully today.
+    from sglang.srt.layers.attention.fla.chunk_torch_xpu import (
+        chunk_gated_delta_rule_torch,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_torch
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -137,7 +148,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-        if is_npu() or is_cpu():
+        if is_npu() or is_cpu() or is_xpu():
+            # These backends don't mutate the state pool in-place; they take
+            # only the slice they need, return the new state, and let the
+            # caller scatter it back (see gdn_backend.py::forward_extend).
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
         return chunk_gated_delta_rule(
