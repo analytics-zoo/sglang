@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -93,6 +94,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
     make_layers,
     set_weight_attrs,
 )
@@ -102,6 +104,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -472,6 +475,155 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    def _forward_xpu_fast_path(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Run conv1d + GDN + RMSNormGated + out_proj using the vendored
+        torch.ops.sgl_kernel.gdn_attention kernel. Returns None if the op is
+        unusable (non-contiguous input, unexpected shape, ...) so the caller
+        falls back to the default Triton/PyTorch path.
+
+        Layout assumption: num_v_heads // num_k_heads == 1 — then sglang's
+        MergedColumnParallelLinear sequential `[Q|K|V|Z]` layout and the
+        GQA-interleaved layout gdn_attention expects are bit-identical.
+        """
+        if not hasattr(torch.ops, "sgl_kernel") or not hasattr(
+            torch.ops.sgl_kernel, "gdn_attention"
+        ):
+            return None
+
+        # Pull the backend metadata the kernel needs. This mirrors
+        # GDNAttnBackend.forward_extend.
+        attn_backend = forward_batch.attn_backend
+        linear_backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
+        fwd_md = getattr(linear_backend, "forward_metadata", None)
+        if fwd_md is None:
+            return None
+
+        query_start_loc = fwd_md.query_start_loc
+        cache_indices = fwd_md.mamba_cache_indices
+        layer_id = self.layer_id
+        mamba_cache_params = linear_backend.req_to_token_pool.mamba2_layer_cache(
+            layer_id
+        )
+        # Layout adapter. sglang's MambaPool stores the conv state as
+        # (cache_batch, conv_dim, W-1) (see configs/mamba_utils.py:161 —
+        # Mamba2StateShape.conv_state_shape), but the sgl-kernel-xpu
+        # gdn_attention kernel expects (cache_batch, W-1, conv_dim) and
+        # asserts per-batch contiguity on it. A raw .transpose() on the pool
+        # view produces a non-contiguous tensor; .contiguous() would copy the
+        # whole pool and would NOT write the kernel's updates back to the
+        # real pool.
+        #
+        # Instead, gather the rows indexed by `cache_indices` into a small
+        # scratch tensor in the kernel layout, run the kernel (which writes
+        # into scratch), then scatter the (conv_dim, W-1)-laid-out updates
+        # back into the pool. Cost is O(bs * conv_dim * (W-1)) per call —
+        # negligible for bs=1 decode and still cheap for extend.
+        pool_conv = mamba_cache_params.conv[0]  # (cache, conv_dim, W-1)
+        pool_ssm = mamba_cache_params.temporal  # (cache, Hv, head_v, head_k)
+        scratch_conv = (
+            pool_conv.index_select(0, cache_indices).transpose(-1, -2).contiguous()
+        )  # (bs, W-1, conv_dim) — kernel layout
+        # ssm_state's layout already matches the kernel expectation, so just
+        # gather the active rows.
+        scratch_ssm = pool_ssm.index_select(0, cache_indices).contiguous()
+
+        # num_prefills / num_decodes. During pure extend it's bs/0; during
+        # pure decode it's 0/bs; we approximate by inspecting forward_mode.
+        batch_size = cache_indices.shape[0]
+        if forward_batch.forward_mode.is_decode():
+            num_prefills = 0
+            num_decodes = batch_size
+        else:
+            num_prefills = batch_size
+            num_decodes = 0
+
+        # has_initial_state: True for each seq whose ssm state was warmed up
+        # by a previous extend. During pure prefill all false; during decode
+        # all true; during mixed, check extend_prefix_lens.
+        extend_prefix_lens = forward_batch.extend_prefix_lens
+        if extend_prefix_lens is None:
+            has_initial_state = torch.ones(
+                batch_size, dtype=torch.bool, device=cache_indices.device
+            )
+        else:
+            has_initial_state = extend_prefix_lens > 0
+
+        num_actual_tokens = projected_states_qkvz.shape[0]
+
+        # Contiguity the kernel asserts on.
+        projected_states_qkvz = projected_states_qkvz.contiguous()
+        projected_states_ba = projected_states_ba.contiguous()
+
+        # Output buffers (kernel writes into these).
+        nv_tp = self.num_v_heads // self.attn_tp_size
+        core_attn_out = projected_states_qkvz.new_empty(
+            (num_actual_tokens, nv_tp, self.head_v_dim)
+        )
+        z = torch.empty_like(core_attn_out)
+
+        # The kernel takes `cache_indices` so it indexes into `conv_state` as
+        # `conv_state[cache_indices[b]]`. Our scratch is densely packed 0..bs-1,
+        # so pass an identity index vector to the kernel and scatter back
+        # using the real cache_indices afterwards.
+        scratch_indices = torch.arange(
+            batch_size, device=cache_indices.device, dtype=cache_indices.dtype
+        )
+
+        torch.ops.sgl_kernel.gdn_attention(
+            core_attn_out,
+            z,
+            projected_states_qkvz,
+            projected_states_ba,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            scratch_conv,
+            scratch_ssm,
+            self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            ),
+            self.conv1d.bias,
+            self.activation,
+            self.A_log,
+            self.dt_bias,
+            num_prefills,
+            num_decodes,
+            has_initial_state,
+            query_start_loc,
+            scratch_indices,
+            num_actual_tokens,
+            self.attn_tp_size,
+        )
+
+        # Scatter kernel writeback into the real MambaPool slots:
+        #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
+        #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
+        pool_conv.index_copy_(
+            0, cache_indices, scratch_conv.transpose(-1, -2).contiguous()
+        )
+        pool_ssm.index_copy_(0, cache_indices, scratch_ssm)
+
+        # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
+        # default path lines 504-519 below.
+        z_shape_og = z.shape
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        if core_attn_out.shape != z.shape:
+            core_attn_out_pad = torch.zeros_like(z)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -486,6 +638,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+
+        # --- XPU native conv1d+GDN fast path (sgl_kernel.gdn_attention) ---
+        # Cherry-picked from origin/dev 7680aecdd4. Env-gated; falls back to
+        # the default Triton path if the kernel isn't usable on this shape.
+        _ENABLE_XPU_FAST_PATH = os.environ.get(
+            "SGLANG_XPU_GDN_FAST_PATH", "0"
+        ) == "1"
+        if (
+            _ENABLE_XPU_FAST_PATH
+            and _is_xpu
+            and not forward_batch.forward_mode.is_target_verify()
+            and self.num_v_heads // self.num_k_heads == 1
+        ):
+            output = self._forward_xpu_fast_path(
+                projected_states_qkvz,
+                projected_states_ba,
+                forward_batch,
+            )
+            if output is not None:
+                return output
 
         if (
             self.num_v_heads // self.num_k_heads in [1, 2, 4]
