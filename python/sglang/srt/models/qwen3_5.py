@@ -604,10 +604,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Scatter kernel writeback into the real MambaPool slots:
         #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
         #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
+        cache_indices_long = cache_indices.to(torch.long)
         pool_conv.index_copy_(
-            0, cache_indices, scratch_conv.transpose(-1, -2).contiguous()
+            0, cache_indices_long, scratch_conv.transpose(-1, -2).contiguous()
         )
-        pool_ssm.index_copy_(0, cache_indices, scratch_ssm)
+        pool_ssm.index_copy_(0, cache_indices_long, scratch_ssm)
 
         # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
         # default path lines 504-519 below.
