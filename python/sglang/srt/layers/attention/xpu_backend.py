@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -497,24 +499,46 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                **kwargs,
-            )
+            # Prefill: SDPA fallback only when SGL_XPU_FA_FALLBACK=1.
+            # SGL_XPU_ESIMD_DECODE does NOT force prefill fallback — prefill
+            # keeps the native FMHA kernel.
+            if (
+                not use_cascade_attn
+                and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+            ):
+                result = self._sdpa_fallback(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    tp_q_head_num=layer.tp_q_head_num,
+                    tp_k_head_num=layer.tp_k_head_num,
+                    head_dim=layer.head_dim,
+                )
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -669,6 +693,248 @@ class XPUAttentionBackend(AttentionBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _sdpa_fallback(
+        self,
+        q: torch.Tensor,           # (total_q, num_q_heads, head_dim)
+        key_cache: torch.Tensor,   # (num_pages, page_size, num_kv_heads, head_dim)
+        value_cache: torch.Tensor, # (num_pages, page_size, num_kv_heads, head_dim)
+        page_table: torch.Tensor,  # (batch, max_pages_per_seq) int32
+        cache_seqlens: torch.Tensor,  # (batch,) int32 -- length of keys per batch
+        cu_seqlens_q: torch.Tensor,   # (batch+1,) int32 -- cumulative query offsets
+        softmax_scale: float,
+        causal: bool,
+        window_size,
+        tp_q_head_num: int,
+        tp_k_head_num: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """SDPA fallback for BOTH prefill and decode. Handles variable q length
+        per batch via cu_seqlens_q. Each batch b has q length
+        cu_seqlens_q[b+1] - cu_seqlens_q[b] and k length cache_seqlens[b]."""
+        batch_size = cache_seqlens.numel()
+        num_q_heads = tp_q_head_num
+        num_kv_heads = tp_k_head_num
+        page_size = key_cache.size(1)
+
+        cu_q_cpu = cu_seqlens_q.to("cpu", dtype=torch.int64).tolist()
+        seq_k_cpu = cache_seqlens.to("cpu", dtype=torch.int64).tolist()
+
+        outputs = []
+        for b in range(batch_size):
+            q_start = cu_q_cpu[b]
+            q_end = cu_q_cpu[b + 1]
+            q_len = q_end - q_start
+            if q_len == 0:
+                continue
+            k_len = seq_k_cpu[b]
+            if k_len == 0:
+                outputs.append(
+                    torch.zeros(q_len, num_q_heads, head_dim, device=q.device, dtype=q.dtype)
+                )
+                continue
+
+            # Gather this batch's KV pages.
+            num_pages_needed = (k_len + page_size - 1) // page_size
+            pages_b = page_table[b, :num_pages_needed].to(torch.long)
+            k_b = key_cache.index_select(0, pages_b).reshape(
+                -1, num_kv_heads, head_dim
+            )[:k_len]
+            v_b = value_cache.index_select(0, pages_b).reshape(
+                -1, num_kv_heads, head_dim
+            )[:k_len]
+
+            # Expand KV heads for GQA.
+            if num_kv_heads != num_q_heads:
+                group = num_q_heads // num_kv_heads
+                k_b = k_b.repeat_interleave(group, dim=1)
+                v_b = v_b.repeat_interleave(group, dim=1)
+
+            # (q_len, H, D) → (H, q_len, D); (k_len, H, D) → (H, k_len, D).
+            q_b = q[q_start:q_end].transpose(0, 1)
+            k_bh = k_b.transpose(0, 1)
+            v_bh = v_b.transpose(0, 1)
+
+            # Causal mask: q at position (k_len - q_len + i) attends to keys 0..(k_len - q_len + i).
+            if causal and q_len > 1:
+                row_idx = torch.arange(q_len, device=q.device).unsqueeze(1) + (k_len - q_len)
+                col_idx = torch.arange(k_len, device=q.device).unsqueeze(0)
+                attn_mask = col_idx <= row_idx  # (q_len, k_len)
+            else:
+                attn_mask = None
+
+            out_b = F.scaled_dot_product_attention(
+                q_b.unsqueeze(0),  # (1, H, q_len, D)
+                k_bh.unsqueeze(0),
+                v_bh.unsqueeze(0),
+                attn_mask=attn_mask.unsqueeze(0).unsqueeze(0) if attn_mask is not None else None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=softmax_scale,
+            ).squeeze(0).transpose(0, 1)  # (q_len, H, D)
+            outputs.append(out_b)
+
+        return torch.cat(outputs, dim=0)
+
+    def _esimd_fallback_decode(
+        self,
+        q: torch.Tensor,              # (total_q, num_q_heads, head_dim)
+        key_cache: torch.Tensor,      # (num_pages, page_size, num_kv_heads, head_dim)
+        value_cache: torch.Tensor,    # (num_pages, page_size, num_kv_heads, head_dim)
+        page_table: torch.Tensor,     # (batch, max_pages_per_seq) int32
+        cache_seqlens: torch.Tensor,  # (batch,) int32
+        max_seq_len: int,
+        tp_q_head_num: int,
+        tp_k_head_num: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """ESIMD page_attn_decode fallback (hardcoded headDim=256, gqaRatio=4).
+
+        ESIMD kernel requires:
+          - fp16 for q/kv_cache/out (we cast from bf16).
+          - Merged KV cache shape [2, num_pages, page_size, num_kv_heads, head_dim]
+            with stride[0] = 2 * stride[1]. We stack K and V along a new leading dim.
+          - page_size is power-of-2 in [64, 1024].
+          - num_q_heads / num_kv_heads must be a multiple of 4.
+        Qwen3.5-0.8B (HV=2, H=8, D=256, page_size=64) satisfies all.
+        """
+        # Lazy import so the sglang scheduler subprocess (spawned via fork+spawn)
+        # registers the eagle_ops torch.ops namespace.
+        if not getattr(self, "_esimd_loaded", False):
+            import custom_esimd_kernels_vllm  # noqa: F401 — registers torch.ops.eagle_ops
+            self._esimd_loaded = True
+        batch_size = cache_seqlens.numel()
+
+        q_fp16 = q.to(torch.float16).contiguous()  # (B, H, D)
+        # Gather only the pages this batch actually touches, then stack + cast.
+        # Avoids O(num_pages) copy (which was ~800MB/call for Qwen3.5) and
+        # produces a compact (2, batch*max_pages, page_size, H_kv, D) buffer.
+        # Remap page_table entries to the new compact pages index space.
+        pages = page_table.to(torch.long)  # (B, max_pages_per_seq)
+        flat = pages.reshape(-1)
+        # Deduplicate for gather, but remember original mapping for block_table.
+        unique_pages, inverse = torch.unique(flat, sorted=True, return_inverse=True)
+        # Gather K and V pages only for indices actually used.
+        k_sel = key_cache.index_select(0, unique_pages).to(torch.float16)
+        v_sel = value_cache.index_select(0, unique_pages).to(torch.float16)
+        kv_merged = torch.stack([k_sel, v_sel], dim=0).contiguous()
+        # New block_table with remapped indices into the compact buffer.
+        new_block_table = inverse.reshape(pages.shape).to(torch.int32).contiguous()
+        seq_lens_i32 = cache_seqlens.to(torch.int32).contiguous()
+
+        out_fp16 = torch.empty(
+            (batch_size, tp_q_head_num, head_dim),
+            device=q.device,
+            dtype=torch.float16,
+        )
+        torch.ops.eagle_ops.page_attn_decode(
+            q_fp16,
+            kv_merged,
+            new_block_table,
+            seq_lens_i32,
+            out_fp16,
+            1,            # max_query_len (decode: always 1)
+            max_seq_len,  # max_seq_len across batch (from metadata)
+        )
+        # Cast back to original dtype.
+        return out_fp16.to(q.dtype)
+
+    def _sdpa_fallback_decode(
+        self,
+        q: torch.Tensor,           # (total_q, num_q_heads, head_dim)
+        key_cache: torch.Tensor,   # (num_pages, page_size, num_kv_heads, head_dim)
+        value_cache: torch.Tensor, # (num_pages, page_size, num_kv_heads, head_dim)
+        page_table: torch.Tensor,  # (batch, max_pages_per_seq) int32
+        cache_seqlens: torch.Tensor,  # (batch,) int32
+        softmax_scale: float,
+        causal: bool,
+        window_size,
+        tp_q_head_num: int,
+        tp_k_head_num: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        """Gather the paged KV cache into contiguous tensors and delegate to
+        torch SDPA. Used to isolate the FMHA decode kernel hang on XPU.
+
+        Decode path only: assumes 1 query token per batch. Same-length batches
+        are processed together; uneven batches loop per-sequence.
+        """
+        batch_size = cache_seqlens.numel()
+        num_q_heads = tp_q_head_num
+        num_kv_heads = tp_k_head_num
+        page_size = key_cache.size(1)
+
+        # Reshape q to (batch, num_q_heads, head_dim) — decode has 1 q per batch.
+        q_bhd = q.view(batch_size, num_q_heads, head_dim)
+
+        # Pull cache_seqlens to CPU once for control flow.
+        seq_lens_cpu = cache_seqlens.to("cpu", dtype=torch.int64).tolist()
+        max_k = max(seq_lens_cpu) if seq_lens_cpu else 0
+        if max_k == 0:
+            return torch.zeros_like(q_bhd)
+
+        # Gather K/V per batch into a padded (B, max_k, H_kv, D) tensor.
+        num_pages_needed = (max_k + page_size - 1) // page_size
+        # page_table rows: (batch, max_pages_per_seq); use first num_pages_needed.
+        pages = page_table[:, :num_pages_needed].to(torch.long)
+        pages_flat = pages.reshape(-1).contiguous()  # (B*P,)
+        # key/value_cache: (num_pages, page_size, H_kv, D)
+        # Force key/value_cache to be contiguous before the gather; the pool
+        # tensor may carry a non-trivial stride that XPU index_select dislikes.
+        kc = key_cache.contiguous() if not key_cache.is_contiguous() else key_cache
+        vc = value_cache.contiguous() if not value_cache.is_contiguous() else value_cache
+        k_flat_pages = torch.index_select(kc, 0, pages_flat)
+        v_flat_pages = torch.index_select(vc, 0, pages_flat)
+        # k_flat_pages shape: (B*P, page_size, H_kv, D) → (B, P*page_size, H_kv, D)
+        k_flat = k_flat_pages.reshape(
+            batch_size, num_pages_needed * page_size, num_kv_heads, head_dim
+        )
+        v_flat = v_flat_pages.reshape(
+            batch_size, num_pages_needed * page_size, num_kv_heads, head_dim
+        )
+
+        # Expand KV heads for GQA before calling SDPA (SDPA's enable_gqa is
+        # newer-only; manual expand keeps compat).
+        if num_kv_heads != num_q_heads:
+            group = num_q_heads // num_kv_heads
+            k_flat = k_flat.repeat_interleave(group, dim=2)
+            v_flat = v_flat.repeat_interleave(group, dim=2)
+
+        # Build per-batch mask: True where key index < seqlen and within window.
+        dev = q.device
+        k_pos = torch.arange(k_flat.size(1), device=dev)
+        seqlens = cache_seqlens.to(dev, dtype=torch.int64).unsqueeze(1)  # (B, 1)
+        attn_mask = k_pos.unsqueeze(0) < seqlens  # (B, max_k_padded)
+        # Sliding window (left, right) — for decode q is at position seqlen-1,
+        # so a key at position p is allowed if (seqlen-1 - p) <= window_left.
+        wl, wr = window_size
+        if wl is not None and wl >= 0:
+            left_bound = seqlens - 1 - wl
+            attn_mask = attn_mask & (k_pos.unsqueeze(0) >= left_bound)
+        # Causal for decode reduces to: mask keys beyond seqlen-1, already handled above.
+        # window_right >= 0 doesn't affect decode (no future keys).
+
+        # SDPA expects (B, H, T, D). q_bhd is (B, H, D); add T=1 dim.
+        q_sdpa = q_bhd.unsqueeze(2).transpose(1, 2)  # (B, 1, H, D) -> (B, H, 1, D) via next transpose
+        # Actually want (B, H, 1, D):
+        q_sdpa = q_bhd.unsqueeze(2)  # (B, H, 1, D)
+        k_sdpa = k_flat.transpose(1, 2).contiguous()  # (B, H, max_k, D)
+        v_sdpa = v_flat.transpose(1, 2).contiguous()  # (B, H, max_k, D)
+
+        # attn_mask: (B, max_k) → broadcast to (B, 1, 1, max_k)
+        attn_mask_bf = attn_mask.unsqueeze(1).unsqueeze(1)
+
+        out = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask_bf,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=softmax_scale,
+        )  # (B, H, 1, D)
+        # Back to (total_q, num_q_heads, head_dim) with total_q == batch_size.
+        return out.squeeze(2)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -803,25 +1069,58 @@ class XPUAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    **kwargs,
-                )
+                if (
+                    not use_cascade_attn
+                    and os.environ.get("SGL_XPU_ESIMD_DECODE") == "1"
+                ):
+                    result = self._esimd_fallback_decode(
+                        q=q_reshaped,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        max_seq_len=int(metadata.max_seq_len_k),
+                        tp_q_head_num=layer.tp_q_head_num,
+                        tp_k_head_num=layer.tp_k_head_num,
+                        head_dim=layer.head_dim,
+                    )
+                elif (
+                    not use_cascade_attn
+                    and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+                ):
+                    result = self._sdpa_fallback_decode(
+                        q=q_reshaped,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        softmax_scale=layer.scaling,
+                        causal=causal,
+                        window_size=window_size,
+                        tp_q_head_num=layer.tp_q_head_num,
+                        tp_k_head_num=layer.tp_k_head_num,
+                        head_dim=layer.head_dim,
+                    )
+                else:
+                    # Default: single-token self-attention
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        cu_seqlens_k_new=cu_seqlens_k,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        **kwargs,
+                    )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
