@@ -1084,6 +1084,72 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
+        # Hard-coded requirements: head_dim=256, fp16, GemmaRMSNorm weight+1.0
+        # (matches Qwen3.5's q_norm/k_norm). Gate with env + shape checks.
+        if (
+            os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
+            and self.head_dim == 256
+            and hidden_states.dim() == 2
+        ):
+            try:
+                from custom_esimd_kernels_vllm import esimd_qkv_split_norm_rope
+            except ImportError:
+                esimd_qkv_split_norm_rope = None
+            if esimd_qkv_split_norm_rope is not None:
+                qkv, _ = self.qkv_proj(hidden_states)
+                nTokens = qkv.shape[0]
+                orig_dtype = qkv.dtype
+                qkv_fp16 = qkv.to(torch.float16).contiguous()
+                q_out = torch.empty(
+                    (nTokens, self.num_heads * 256),
+                    device=qkv.device, dtype=torch.float16,
+                )
+                gate_out = (
+                    torch.empty(
+                        (nTokens, self.num_heads * 256),
+                        device=qkv.device, dtype=torch.float16,
+                    )
+                    if self.attn_output_gate
+                    else torch.empty(0, device=qkv.device, dtype=torch.float16)
+                )
+                k_out = torch.empty(
+                    (nTokens, self.num_kv_heads * 256),
+                    device=qkv.device, dtype=torch.float16,
+                )
+                v_out = torch.empty(
+                    (nTokens, self.num_kv_heads * 256),
+                    device=qkv.device, dtype=torch.float16,
+                )
+                pos_i32 = positions.to(torch.int32).contiguous()
+                cs = self.rotary_emb.cos_sin_cache
+                if cs.dtype != torch.float16:
+                    cs = cs.to(torch.float16)
+                rotary_dim_arg = int(
+                    self.head_dim
+                    * getattr(self.config, "partial_rotary_factor", 1.0)
+                )
+                esimd_qkv_split_norm_rope(
+                    qkv_fp16,
+                    q_out, gate_out, k_out, v_out,
+                    self.q_norm.weight.to(torch.float16).contiguous(),
+                    self.k_norm.weight.to(torch.float16).contiguous(),
+                    pos_i32,
+                    self.num_heads, self.num_kv_heads,
+                    self.attn_output_gate,
+                    rotary_dim_arg, cs,
+                )
+                q = q_out.to(orig_dtype)
+                k = k_out.to(orig_dtype)
+                v = v_out.to(orig_dtype)
+                gate = gate_out.to(orig_dtype) if self.attn_output_gate else None
+                attn_output = self.attn(q, k, v, forward_batch)
+                if self.attn_output_gate:
+                    # ESIMD kernel already applies sigmoid; don't re-sigmoid.
+                    attn_output = attn_output * gate
+                output, _ = self.o_proj(attn_output)
+                return output
+
         if (
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
