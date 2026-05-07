@@ -287,30 +287,65 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            layer.conv_weights,
-            layer.bias,
-            layer.activation,
-            conv_state_indices=cache_indices,
-        )
+        import os as _os
+        _py_gdn = _os.environ.get("SGL_XPU_GDN_PY") == "1"
+
+        if _py_gdn:
+            from sglang.srt.layers.attention.xpu_gdn_pytorch_fallback import (
+                causal_conv1d_update_pytorch,
+                fused_recurrent_gated_delta_rule_packed_decode_pytorch,
+                fused_sigmoid_gating_delta_rule_update_pytorch,
+            )
+            mixed_qkv = causal_conv1d_update_pytorch(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                layer.conv_weights,
+                layer.bias,
+                layer.activation,
+                conv_state_indices=cache_indices,
+            )
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
         if self.kernel_dispatcher.supports_packed_decode:
-            core_attn_out = self.kernel_dispatcher.packed_decode(
-                mixed_qkv=mixed_qkv,
-                a=a,
-                b=b,
-                A_log=layer.A_log,
-                dt_bias=layer.dt_bias,
-                scale=layer.head_k_dim**-0.5,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                num_v_heads=layer.num_v_heads,
-                head_v_dim=layer.head_v_dim,
-            )
+            if _py_gdn:
+                B = mixed_qkv.shape[0]
+                out_py = mixed_qkv.new_empty(B, 1, layer.num_v_heads, layer.head_v_dim)
+                fused_recurrent_gated_delta_rule_packed_decode_pytorch(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    scale=layer.head_k_dim ** -0.5,
+                    initial_state=ssm_states,
+                    out=out_py,
+                    ssm_state_indices=cache_indices,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                core_attn_out = out_py.transpose(0, 1)
+            else:
+                core_attn_out = self.kernel_dispatcher.packed_decode(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=layer.A_log,
+                    dt_bias=layer.dt_bias,
+                    scale=layer.head_k_dim**-0.5,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    num_v_heads=layer.num_v_heads,
+                    head_v_dim=layer.head_v_dim,
+                )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
             )
