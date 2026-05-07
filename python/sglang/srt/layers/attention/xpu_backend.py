@@ -808,17 +808,19 @@ class XPUAttentionBackend(AttentionBackend):
         # Gather only the pages this batch actually touches, then stack + cast.
         # Avoids O(num_pages) copy (which was ~800MB/call for Qwen3.5) and
         # produces a compact (2, batch*max_pages, page_size, H_kv, D) buffer.
-        # Remap page_table entries to the new compact pages index space.
+        # bsz=1 decode: page_table has no duplicates — skip torch.unique() which
+        # costs ~2ms/call of CPU dispatch and dominates the decode path.
         pages = page_table.to(torch.long)  # (B, max_pages_per_seq)
         flat = pages.reshape(-1)
-        # Deduplicate for gather, but remember original mapping for block_table.
-        unique_pages, inverse = torch.unique(flat, sorted=True, return_inverse=True)
-        # Gather K and V pages only for indices actually used.
-        k_sel = key_cache.index_select(0, unique_pages).to(torch.float16)
-        v_sel = value_cache.index_select(0, unique_pages).to(torch.float16)
+        k_sel = key_cache.index_select(0, flat).to(torch.float16)
+        v_sel = value_cache.index_select(0, flat).to(torch.float16)
         kv_merged = torch.stack([k_sel, v_sel], dim=0).contiguous()
-        # New block_table with remapped indices into the compact buffer.
-        new_block_table = inverse.reshape(pages.shape).to(torch.int32).contiguous()
+        # Block table just maps each position to its own slot in the compact buffer.
+        new_block_table = (
+            torch.arange(flat.numel(), device=q.device, dtype=torch.int32)
+            .view(pages.shape)
+            .contiguous()
+        )
         seq_lens_i32 = cache_seqlens.to(torch.int32).contiguous()
 
         out_fp16 = torch.empty(
