@@ -534,8 +534,13 @@ def get_available_gpu_memory(
                 "which may cause useless memory allocation for torch XPU context.",
             )
 
+        # PTL iGPU workaround: torch.xpu.empty_cache() translates to a
+        # level-zero queueFinish which never returns on Panther Lake at
+        # init time. Skip it here; the caller only uses the result for
+        # memory-fraction accounting, where the caching allocator's current
+        # free count is close enough.
         if empty_cache:
-            torch.xpu.empty_cache()
+            pass
         used_memory = torch.xpu.memory_allocated()
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory

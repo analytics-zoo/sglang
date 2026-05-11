@@ -411,6 +411,14 @@ class XPUAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+                # Required on PTL iGPU: set_kv_buffer's scatter into the KV
+                # pool and the subsequent attention kernel's gather from the
+                # pool are not stream-ordered on XPU; without this sync the
+                # kernel reads stale/garbage KV entries. Env-gated so the
+                # default path (other GPUs) is unchanged.
+                if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
+                    import torch as _tt
+                    _tt.xpu.synchronize()
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -812,9 +820,17 @@ class XPUAttentionBackend(AttentionBackend):
         # costs ~2ms/call of CPU dispatch and dominates the decode path.
         pages = page_table.to(torch.long)  # (B, max_pages_per_seq)
         flat = pages.reshape(-1)
+        # Required on PTL iGPU: ensure preceding writes to key_cache /
+        # value_cache have landed before the index_select gather runs.
+        if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
+            import torch as _tt
+            _tt.xpu.synchronize()
         k_sel = key_cache.index_select(0, flat).to(torch.float16)
         v_sel = value_cache.index_select(0, flat).to(torch.float16)
         kv_merged = torch.stack([k_sel, v_sel], dim=0).contiguous()
+        if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
+            import torch as _tt
+            _tt.xpu.synchronize()
         # Block table just maps each position to its own slot in the compact buffer.
         new_block_table = (
             torch.arange(flat.numel(), device=q.device, dtype=torch.int32)
@@ -969,6 +985,10 @@ class XPUAttentionBackend(AttentionBackend):
                         k,
                         k_rope,
                     )
+                # Required on PTL iGPU: same rationale as forward_extend.
+                if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
+                    import torch as _tt
+                    _tt.xpu.synchronize()
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
