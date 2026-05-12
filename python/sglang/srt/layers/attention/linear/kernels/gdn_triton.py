@@ -154,6 +154,35 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # caller scatter it back (see gdn_backend.py::forward_extend).
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
+
+        # XPU fast path: use the ESIMD chunk_gated_delta_rule_extend kernel
+        # when conditions match (dense GDN with H_k == H_v and head_dim == 128,
+        # e.g. Qwen3.5). Env-gated so rollback is a one-liner.
+        import os as _os
+        if (
+            is_xpu()
+            and _os.environ.get("SGL_XPU_GDN_EXTEND_ESIMD") == "1"
+            and q.size(-1) == 128
+            and v.size(-1) == 128
+            and q.size(-2) == v.size(-2)  # H_k == H_v
+            and hasattr(torch.ops, "eagle_ops")
+            and hasattr(torch.ops.eagle_ops, "chunk_gated_delta_rule_extend")
+        ):
+            scale = float(q.size(-1)) ** -0.5
+            # Kernel contract: (q, k, v, g, beta, initial_state, cu_seqlens, scale)
+            # Returns (out [1, T, H_v, V], last_state [n_seqs, H_v, V, K]).
+            # g is fp32 log-space decay; kernel expects exactly that.
+            # initial_state is IN/OUT: kernel mutates it to last_state.
+            state_in = recurrent_state.contiguous()
+            out, last_state = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
+                q.contiguous(), k.contiguous(), v.contiguous(),
+                g.contiguous(), beta.contiguous(),
+                state_in, query_start_loc.to(torch.int32).contiguous(),
+                scale,
+            )
+            # Match chunk_gated_delta_rule_torch return: (o, last_recurrent_state, h_aux)
+            return out, last_state, None
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
