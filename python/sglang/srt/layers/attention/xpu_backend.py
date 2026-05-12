@@ -825,9 +825,30 @@ class XPUAttentionBackend(AttentionBackend):
         if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
             import torch as _tt
             _tt.xpu.synchronize()
-        k_sel = key_cache.index_select(0, flat).to(torch.float16)
-        v_sel = value_cache.index_select(0, flat).to(torch.float16)
-        kv_merged = torch.stack([k_sel, v_sel], dim=0).contiguous()
+        # PTL workaround: the ESIMD page_attn_decode kernel crashes the GPU
+        # when given a kv_cache tensor produced by
+        # `torch.stack([index_select(...), ...]).contiguous()` — even though
+        # the tensor is contiguous with the right shape/dtype. Isolated stress
+        # test (test_esimd_bisect.py `stack_only`) shows this is the only
+        # per-call op that triggers the crash. Using a persistent pre-allocated
+        # kv_merged buffer and `copy_`-ing each decode's gather into it is
+        # stable (`index_copy` mode passes 20+ repeated calls cleanly).
+        num_pages_sel = flat.numel()
+        H_kv, head_dim_kv = tp_k_head_num, head_dim
+        page_size = key_cache.size(1)
+        cache_key = (num_pages_sel, page_size, H_kv, head_dim_kv)
+        kv_merged_cache = getattr(self, "_kv_merged_cache", {})
+        kv_merged = kv_merged_cache.get(cache_key)
+        if kv_merged is None:
+            kv_merged = torch.empty(
+                (2, num_pages_sel, page_size, H_kv, head_dim_kv),
+                dtype=torch.float16, device=q.device,
+            )
+            kv_merged_cache[cache_key] = kv_merged
+            self._kv_merged_cache = kv_merged_cache
+        # index_select + cast → copy_ into the persistent buffer.
+        kv_merged[0].copy_(key_cache.index_select(0, flat).to(torch.float16))
+        kv_merged[1].copy_(value_cache.index_select(0, flat).to(torch.float16))
         if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
             import torch as _tt
             _tt.xpu.synchronize()
