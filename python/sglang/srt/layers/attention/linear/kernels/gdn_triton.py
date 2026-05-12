@@ -156,15 +156,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
             recurrent_state_indices_args = {}
 
         # XPU fast path: use the ESIMD chunk_gated_delta_rule_extend kernel
-        # when conditions match (dense GDN with H_k == H_v and head_dim == 128,
-        # e.g. Qwen3.5). Env-gated so rollback is a one-liner.
+        # when conditions match (head_dim == 128 and H_v % H_k == 0; covers
+        # Qwen3.5-0.8B dense GDN with H_k=H_v=16 and Qwen3.5-4B grouped-value
+        # GDN with H_k=16, H_v=32). Env-gated so rollback is a one-liner.
         import os as _os
         if (
             is_xpu()
             and _os.environ.get("SGL_XPU_GDN_EXTEND_ESIMD") == "1"
             and q.size(-1) == 128
             and v.size(-1) == 128
-            and q.size(-2) == v.size(-2)  # H_k == H_v
+            and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)
             and hasattr(torch.ops, "eagle_ops")
             and hasattr(torch.ops.eagle_ops, "chunk_gated_delta_rule_extend")
         ):
