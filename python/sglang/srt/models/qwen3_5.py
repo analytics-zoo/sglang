@@ -1032,35 +1032,79 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             if esimd_qkv_split_norm_rope is not None:
                 nTokens = qkv.shape[0]
                 orig_dtype = qkv.dtype
-                qkv_fp16 = qkv.to(torch.float16).contiguous()
-                q_out = torch.empty(
-                    (nTokens, self.num_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
+
+                # Persistent scratch buffers for XPUGraph capture stability.
+                # Without these, every forward pass allocates fresh temporaries
+                # and the captured graph references stale data_ptrs on replay,
+                # yielding garbage output. Scratch grows if a larger nTokens
+                # is seen; small replays slice into the prefix.
+                scratch = getattr(self, "_esimd_qkv_scratch", None)
+                need_resize = (
+                    scratch is None
+                    or scratch["nTokens"] < nTokens
+                    or scratch["qkv_in_dim"] != qkv.shape[1]
                 )
-                gate_out = (
-                    torch.empty(
-                        (nTokens, self.num_heads * 256),
-                        device=qkv.device, dtype=torch.float16,
-                    )
-                    if self.attn_output_gate
-                    else torch.empty(0, device=qkv.device, dtype=torch.float16)
-                )
-                k_out = torch.empty(
-                    (nTokens, self.num_kv_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
-                )
-                v_out = torch.empty(
-                    (nTokens, self.num_kv_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
-                )
+                if need_resize:
+                    scratch = {
+                        "nTokens": nTokens,
+                        "qkv_in_dim": qkv.shape[1],
+                        "qkv_fp16": torch.empty(
+                            (nTokens, qkv.shape[1]),
+                            device=qkv.device, dtype=torch.float16,
+                        ),
+                        "q_out": torch.empty(
+                            (nTokens, self.num_heads * 256),
+                            device=qkv.device, dtype=torch.float16,
+                        ),
+                        "gate_out": (
+                            torch.empty(
+                                (nTokens, self.num_heads * 256),
+                                device=qkv.device, dtype=torch.float16,
+                            )
+                            if self.attn_output_gate
+                            else torch.empty(
+                                0, device=qkv.device, dtype=torch.float16,
+                            )
+                        ),
+                        "k_out": torch.empty(
+                            (nTokens, self.num_kv_heads * 256),
+                            device=qkv.device, dtype=torch.float16,
+                        ),
+                        "v_out": torch.empty(
+                            (nTokens, self.num_kv_heads * 256),
+                            device=qkv.device, dtype=torch.float16,
+                        ),
+                        "q_norm_w_fp16": self.q_norm.weight.to(torch.float16).contiguous(),
+                        "k_norm_w_fp16": self.k_norm.weight.to(torch.float16).contiguous(),
+                    }
+                    # Pre-convert cos_sin_cache to fp16 once (attribute so
+                    # it's stable; rotary_emb is shared across layers).
+                    cs = self.rotary_emb.cos_sin_cache
+                    if cs.dtype != torch.float16:
+                        if not hasattr(self.rotary_emb, "_cos_sin_cache_fp16"):
+                            self.rotary_emb._cos_sin_cache_fp16 = cs.to(
+                                torch.float16
+                            ).contiguous()
+                        scratch["cs_fp16"] = self.rotary_emb._cos_sin_cache_fp16
+                    else:
+                        scratch["cs_fp16"] = cs
+                    self._esimd_qkv_scratch = scratch
+
+                # Fill persistent buffers in place so the captured graph
+                # picks up new values on each replay.
+                qkv_fp16 = scratch["qkv_fp16"][:nTokens]
+                qkv_fp16.copy_(qkv.to(torch.float16))
+                q_out = scratch["q_out"][:nTokens]
+                gate_out = scratch["gate_out"][:nTokens] if self.attn_output_gate else scratch["gate_out"]
+                k_out = scratch["k_out"][:nTokens]
+                v_out = scratch["v_out"][:nTokens]
+                # positions shape can be [nTokens] or [3, nTokens] (mrope).
+                # Keep the fresh cast here — it's only a few bytes and the
+                # int32 cast doesn't hurt graph stability (allocation happens
+                # in the graph pool and stays stable across replays because
+                # allocation order is deterministic).
                 pos_i32 = positions.to(torch.int32).contiguous()
-                # rotary_emb holds `cos_sin_cache` as [max_pos, rotary_dim] fp16.
-                # rotary_dim already reflects partial_rotary_factor (get_rope
-                # multiplies head_dim by partial_rotary_factor). For Qwen3.5:
-                # head_dim=256, partial_rotary_factor=0.25 → rotary_dim=64.
-                cs = self.rotary_emb.cos_sin_cache
-                if cs.dtype != torch.float16:
-                    cs = cs.to(torch.float16)
+
                 rotary_dim_arg = int(
                     self.head_dim
                     * getattr(self.config, "partial_rotary_factor", 1.0)
@@ -1068,12 +1112,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 esimd_qkv_split_norm_rope(
                     qkv_fp16,
                     q_out, gate_out, k_out, v_out,
-                    self.q_norm.weight.to(torch.float16).contiguous(),
-                    self.k_norm.weight.to(torch.float16).contiguous(),
+                    scratch["q_norm_w_fp16"],
+                    scratch["k_norm_w_fp16"],
                     pos_i32,
                     self.num_heads, self.num_kv_heads,
                     self.attn_output_gate,
-                    rotary_dim_arg, cs,
+                    rotary_dim_arg, scratch["cs_fp16"],
                 )
                 q = q_out.to(orig_dtype)
                 k = k_out.to(orig_dtype)

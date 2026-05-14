@@ -92,6 +92,144 @@ class XPUAttentionBackend(AttentionBackend):
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
+        # XPU graph capture/replay state. Populated by init_cuda_graph_state
+        # when the CudaGraphRunner is active. Each captured bs gets its own
+        # FlashAttentionMetadata object with slices of the pre-allocated
+        # buffers so the captured kernel launches see stable data_ptrs.
+        self._graph_state: dict = {}
+
+    # ------------------------------------------------------------------
+    # XPU graph capture/replay hooks (bsz=1 decode focus)
+    # ------------------------------------------------------------------
+
+    def get_cuda_graph_seq_len_fill_value(self) -> int:
+        return 1
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Pre-allocate stable device buffers for capture + replay.
+
+        All metadata the decode path reads (page_table, cache_seqlens_int32,
+        cu_seqlens_q, cu_seqlens_k) lives here with fixed data_ptrs.
+        """
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        device = self.device
+
+        self._graph_state = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
+            # For pure-decode, cu_seqlens_q is constant [0, 1, 2, ..., bs].
+            "cu_seqlens_q_decode": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=device
+            ),
+            "page_table": torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=device
+            ),
+            "strided_indices": torch.arange(
+                0, self.max_context_len, self.page_size, device=device
+            ),
+            "captured": {},
+        }
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+    ):
+        assert spec_info is None, "XPU graph capture with spec_info not supported yet"
+        assert forward_mode.is_decode_or_idle(), (
+            f"XPU graph capture only supports decode; got {forward_mode=}"
+        )
+        state = self._graph_state
+        metadata = FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = state["cache_seqlens"][:bs]
+        metadata.cu_seqlens_q = state["cu_seqlens_q_decode"][: bs + 1]
+        metadata.cu_seqlens_k = state["cu_seqlens_k"][: bs + 1]
+        metadata.page_table = state["page_table"][:bs, :]
+        metadata.max_seq_len_q = 1
+
+        # Populate cache_seqlens and cu_seqlens_k with the dummy seq_lens
+        # from the warmup _dummy_run, so the captured attention kernel
+        # launch exercises a non-trivial KV range. Without this, seq_lens
+        # stays at 0 during capture and replay produces garbage.
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        torch.cumsum(
+            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
+            out=metadata.cu_seqlens_k[1:],
+        )
+        metadata.max_seq_len_k = max(
+            1, int(seq_lens.max().item()) if seq_lens.numel() else 1,
+        )
+
+        # Populate page_table with real req_to_token pages so captured
+        # index_select reads from valid addresses.
+        max_seq_pages = (
+            metadata.max_seq_len_k + self.page_size - 1
+        ) // self.page_size
+        if max_seq_pages > 0:
+            strided_indices = state["strided_indices"][:max_seq_pages]
+            pt = (
+                self.req_to_token[
+                    req_pool_indices[:, None],
+                    strided_indices[None, :],
+                ]
+                // self.page_size
+            )
+            metadata.page_table[:bs, :max_seq_pages].copy_(pt)
+
+        state["captured"][bs] = metadata
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info,
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
+        assert spec_info is None, "XPU graph replay with spec_info not supported yet"
+        assert forward_mode.is_decode_or_idle()
+        state = self._graph_state
+        metadata = state["captured"][bs]
+
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+        req_pool_indices = req_pool_indices[:bs]
+
+        # Refresh per-request values in place.
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        torch.cumsum(
+            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
+            out=state["cu_seqlens_k"][1 : bs + 1],
+        )
+
+        max_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu is not None else int(seq_lens.max().item())
+        metadata.max_seq_len_k = max_len
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        strided_indices = state["strided_indices"][:max_seq_pages]
+        pt = (
+            self.req_to_token[
+                req_pool_indices[:, None],
+                strided_indices[None, :],
+            ]
+            // self.page_size
+        )
+        metadata.page_table[:bs, :max_seq_pages].copy_(pt)
+
+        self.forward_metadata = metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         metadata = FlashAttentionMetadata()
@@ -807,67 +945,122 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Keep kernel dtype matched to KV cache dtype to avoid per-decode casts.
         kernel_dtype = key_cache.dtype if key_cache.dtype in (torch.float16, torch.bfloat16) else torch.float16
-        q_kern = q.to(kernel_dtype).contiguous() if q.dtype != kernel_dtype else q.contiguous()
-        # Gather only the pages this batch actually touches, then stack + cast.
-        # Avoids O(num_pages) copy (which was ~800MB/call for Qwen3.5) and
-        # produces a compact (2, batch*max_pages, page_size, H_kv, D) buffer.
-        # bsz=1 decode: page_table has no duplicates — skip torch.unique() which
-        # costs ~2ms/call of CPU dispatch and dominates the decode path.
-        pages = page_table.to(torch.long)  # (B, max_pages_per_seq)
-        flat = pages.reshape(-1)
-        # PTL workaround: the ESIMD page_attn_decode kernel crashes the GPU
-        # when given a kv_cache tensor produced by
-        # `torch.stack([index_select(...), ...]).contiguous()` — even though
-        # the tensor is contiguous with the right shape/dtype. Isolated stress
-        # test (test_esimd_bisect.py `stack_only`) shows this is the only
-        # per-call op that triggers the crash. Using a persistent pre-allocated
-        # kv_merged buffer and `copy_`-ing each decode's gather into it is
-        # stable (`index_copy` mode passes 20+ repeated calls cleanly).
-        num_pages_sel = flat.numel()
         H_kv, head_dim_kv = tp_k_head_num, head_dim
         page_size = key_cache.size(1)
-        cache_key = (num_pages_sel, page_size, H_kv, head_dim_kv, kernel_dtype)
-        kv_merged_cache = getattr(self, "_kv_merged_cache", {})
-        kv_merged = kv_merged_cache.get(cache_key)
-        if kv_merged is None:
+
+        # Persistent scratch pool. Each (bs, kernel_dtype) gets its own
+        # worst-case-sized buffer set; these data_ptrs stay stable so an
+        # XPUGraph capture of this path replays correctly. The buffers are
+        # sized to the worst case (max_context_len) and the kernel reads
+        # cache_seqlens to know how far to actually look.
+        max_ctx = self.max_context_len
+        max_num_pages_total = batch_size * (
+            (max_ctx + page_size - 1) // page_size
+        )
+        cache_key = (batch_size, page_size, H_kv, head_dim_kv, kernel_dtype)
+        scratch = getattr(self, "_esimd_scratch", {})
+        buf = scratch.get(cache_key)
+        if buf is None:
             kv_merged = torch.empty(
-                (2, num_pages_sel, page_size, H_kv, head_dim_kv),
+                (2, max_num_pages_total, page_size, H_kv, head_dim_kv),
                 dtype=kernel_dtype, device=q.device,
             )
-            kv_merged_cache[cache_key] = kv_merged
-            self._kv_merged_cache = kv_merged_cache
-        # index_select into the persistent buffer. When KV cache dtype already
-        # matches kernel_dtype (bf16 model -> bf16 cache -> bf16 kernel), this
-        # is one contiguous copy with no intermediate cast.
-        if key_cache.dtype == kernel_dtype:
-            kv_merged[0].copy_(key_cache.index_select(0, flat))
-            kv_merged[1].copy_(value_cache.index_select(0, flat))
-        else:
-            kv_merged[0].copy_(key_cache.index_select(0, flat).to(kernel_dtype))
-            kv_merged[1].copy_(value_cache.index_select(0, flat).to(kernel_dtype))
-        # Block table just maps each position to its own slot in the compact buffer.
-        new_block_table = (
-            torch.arange(flat.numel(), device=q.device, dtype=torch.int32)
-            .view(pages.shape)
-            .contiguous()
-        )
-        seq_lens_i32 = cache_seqlens.to(torch.int32).contiguous()
+            # new_block_table: maps each position in the compact buffer back
+            # to itself (identity) — the page_attn_decode kernel uses this to
+            # walk kv_merged by page. Shape [bs, pages_per_bs].
+            pages_per_bs = max_num_pages_total // batch_size
+            new_block_table = (
+                torch.arange(
+                    max_num_pages_total, device=q.device, dtype=torch.int32,
+                )
+                .view(batch_size, pages_per_bs)
+                .contiguous()
+            )
+            from custom_esimd_kernels_vllm.ops import (
+                eagle_page_attn_decode_temp_size,
+            )
+            tp_size = eagle_page_attn_decode_temp_size(
+                batch_size, tp_q_head_num, H_kv, head_dim, max_ctx,
+            )
+            temp_p = torch.zeros(
+                (tp_size,), dtype=torch.float32, device=q.device,
+            )
+            out_kern = torch.empty(
+                (batch_size, tp_q_head_num, head_dim),
+                dtype=kernel_dtype, device=q.device,
+            )
+            seq_lens_i32_buf = torch.zeros(
+                (batch_size,), dtype=torch.int32, device=q.device,
+            )
+            q_kern_buf = torch.empty(
+                (batch_size, tp_q_head_num, head_dim),
+                dtype=kernel_dtype, device=q.device,
+            )
+            buf = {
+                "kv_merged": kv_merged,
+                "new_block_table": new_block_table,
+                "temp_p": temp_p,
+                "out_kern": out_kern,
+                "seq_lens_i32": seq_lens_i32_buf,
+                "q_kern": q_kern_buf,
+            }
+            scratch[cache_key] = buf
+            self._esimd_scratch = scratch
 
-        out_kern = torch.empty(
-            (batch_size, tp_q_head_num, head_dim),
-            device=q.device,
-            dtype=kernel_dtype,
-        )
+        kv_merged = buf["kv_merged"]
+        new_block_table = buf["new_block_table"]
+        temp_p = buf["temp_p"]
+        out_kern = buf["out_kern"]
+        seq_lens_i32 = buf["seq_lens_i32"]
+        q_kern = buf["q_kern"]
+
+        # Fill q and seq_lens in place.
+        q_reshaped = q.view(batch_size, tp_q_head_num, head_dim)
+        if q.dtype != kernel_dtype:
+            q_kern.copy_(q_reshaped.to(kernel_dtype))
+        else:
+            q_kern.copy_(q_reshaped)
+        seq_lens_i32.copy_(cache_seqlens.to(torch.int32))
+
+        # Gather pages into kv_merged. page_table shape is [bs, max_pages];
+        # match our captured new_block_table row size.
+        # Under graph capture, page_table is the metadata's pre-allocated
+        # tensor (same max_num_pages as our new_block_table rows), so the
+        # shapes align. In eager mode page_table may be smaller — broadcast
+        # by slicing to the actual shape passed in.
+        bs_pt, pages_per_pt = page_table.shape
+        # Expect bs_pt == batch_size and pages_per_pt <= pages_per_bs.
+        pages_per_bs = new_block_table.shape[1]
+        # For eager (non-graph) path, only need num pages actually populated;
+        # we just read all of page_table but bound kv_merged write to that.
+        pages_flat = page_table.reshape(-1).to(torch.long)
+        kv_write_rows = pages_flat.numel()
+
+        if key_cache.dtype == kernel_dtype:
+            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[0, :kv_write_rows].copy_(
+                key_cache.index_select(0, pages_flat)
+            )
+            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[1, :kv_write_rows].copy_(
+                value_cache.index_select(0, pages_flat)
+            )
+        else:
+            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[0, :kv_write_rows].copy_(
+                key_cache.index_select(0, pages_flat).to(kernel_dtype)
+            )
+            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[1, :kv_write_rows].copy_(
+                value_cache.index_select(0, pages_flat).to(kernel_dtype)
+            )
+
         torch.ops.eagle_ops.page_attn_decode(
             q_kern,
             kv_merged,
             new_block_table,
             seq_lens_i32,
             out_kern,
-            1,            # max_query_len (decode: always 1)
-            max_seq_len,  # max_seq_len across batch (from metadata)
+            1,             # max_query_len (decode: always 1)
+            max_seq_len,   # actual per-replay max_seq_len; bounds kernel read
+            temp_p,        # external scratch (stable data_ptr for graph replay)
         )
-        # Cast back to original dtype only when needed.
         return out_kern if out_kern.dtype == q.dtype else out_kern.to(q.dtype)
 
     def _sdpa_fallback_decode(
