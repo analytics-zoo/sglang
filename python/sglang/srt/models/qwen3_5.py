@@ -1075,16 +1075,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     self.attn_output_gate,
                     rotary_dim_arg, cs,
                 )
-                # Required on PTL iGPU: ESIMD kernel writes q/k/v/gate via
-                # block_store without torch-visible stream ordering, and the
-                # subsequent self.attn(...) immediately calls set_kv_buffer
-                # with k/v. Without this sync the KV pool can be written with
-                # stale/garbage values and decode reads back uninitialized
-                # memory. Gate with an env var so the default path (on GPUs
-                # with proper stream ordering) is unchanged.
-                if os.environ.get("SGLANG_XPU_FORCE_SYNC") == "1":
-                    import torch as _tt
-                    _tt.xpu.synchronize()
                 q = q_out.to(orig_dtype)
                 k = k_out.to(orig_dtype)
                 v = v_out.to(orig_dtype)
