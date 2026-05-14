@@ -927,14 +927,13 @@ class XPUAttentionBackend(AttentionBackend):
         """ESIMD page_attn_decode fallback (hardcoded headDim=256, gqaRatio=4).
 
         ESIMD kernel requires:
-          - fp16 OR bf16 for q/kv_cache/out. Keep the model's native dtype
-            when it's already bf16 so we skip an extra cast on the critical
-            path (saves ~6ms/tok on Qwen3.5-4B decode).
-          - Merged KV cache shape [2, num_pages, page_size, num_kv_heads, head_dim]
-            with stride[0] = 2 * stride[1]. We stack K and V along a new leading dim.
+          - fp16 OR bf16 for q/kv/out. Keep the model's native dtype when it's
+            already bf16 so we skip an extra cast on the critical path.
+          - K and V passed as two independent [num_pages, page_size, H_kv,
+            head_dim] tensors with identical shape and page stride — sglang's
+            native pool layout, no gather needed.
           - page_size is power-of-2 in [64, 1024].
           - num_q_heads / num_kv_heads must be a multiple of 4.
-        Qwen3.5-0.8B (HV=2, H=8, D=256, page_size=64) satisfies all.
         """
         # Lazy import so the sglang scheduler subprocess (spawned via fork+spawn)
         # registers the eagle_ops torch.ops namespace.
@@ -943,72 +942,42 @@ class XPUAttentionBackend(AttentionBackend):
             self._esimd_loaded = True
         batch_size = cache_seqlens.numel()
 
-        # Keep kernel dtype matched to KV cache dtype to avoid per-decode casts.
         kernel_dtype = key_cache.dtype if key_cache.dtype in (torch.float16, torch.bfloat16) else torch.float16
-        H_kv, head_dim_kv = tp_k_head_num, head_dim
         page_size = key_cache.size(1)
 
-        # Persistent scratch pool. Each (bs, kernel_dtype) gets its own
-        # worst-case-sized buffer set; these data_ptrs stay stable so an
-        # XPUGraph capture of this path replays correctly. The buffers are
-        # sized to the worst case (max_context_len) and the kernel reads
-        # cache_seqlens to know how far to actually look.
+        # Persistent per-bs scratch: temp_p (worst-case sized) + q_kern +
+        # seq_lens_i32 + out_kern. Kernel reads K/V directly from the pool,
+        # so no merged scratch buffer is needed anymore.
         max_ctx = self.max_context_len
-        max_num_pages_total = batch_size * (
-            (max_ctx + page_size - 1) // page_size
-        )
-        cache_key = (batch_size, page_size, H_kv, head_dim_kv, kernel_dtype)
+        cache_key = (batch_size, tp_q_head_num, head_dim, kernel_dtype)
         scratch = getattr(self, "_esimd_scratch", {})
         buf = scratch.get(cache_key)
         if buf is None:
-            kv_merged = torch.empty(
-                (2, max_num_pages_total, page_size, H_kv, head_dim_kv),
-                dtype=kernel_dtype, device=q.device,
-            )
-            # new_block_table: maps each position in the compact buffer back
-            # to itself (identity) — the page_attn_decode kernel uses this to
-            # walk kv_merged by page. Shape [bs, pages_per_bs].
-            pages_per_bs = max_num_pages_total // batch_size
-            new_block_table = (
-                torch.arange(
-                    max_num_pages_total, device=q.device, dtype=torch.int32,
-                )
-                .view(batch_size, pages_per_bs)
-                .contiguous()
-            )
             from custom_esimd_kernels_vllm.ops import (
                 eagle_page_attn_decode_temp_size,
             )
             tp_size = eagle_page_attn_decode_temp_size(
-                batch_size, tp_q_head_num, H_kv, head_dim, max_ctx,
-            )
-            temp_p = torch.zeros(
-                (tp_size,), dtype=torch.float32, device=q.device,
-            )
-            out_kern = torch.empty(
-                (batch_size, tp_q_head_num, head_dim),
-                dtype=kernel_dtype, device=q.device,
-            )
-            seq_lens_i32_buf = torch.zeros(
-                (batch_size,), dtype=torch.int32, device=q.device,
-            )
-            q_kern_buf = torch.empty(
-                (batch_size, tp_q_head_num, head_dim),
-                dtype=kernel_dtype, device=q.device,
+                batch_size, tp_q_head_num, tp_k_head_num, head_dim, max_ctx,
             )
             buf = {
-                "kv_merged": kv_merged,
-                "new_block_table": new_block_table,
-                "temp_p": temp_p,
-                "out_kern": out_kern,
-                "seq_lens_i32": seq_lens_i32_buf,
-                "q_kern": q_kern_buf,
+                "temp_p": torch.zeros(
+                    (tp_size,), dtype=torch.float32, device=q.device,
+                ),
+                "out_kern": torch.empty(
+                    (batch_size, tp_q_head_num, head_dim),
+                    dtype=kernel_dtype, device=q.device,
+                ),
+                "seq_lens_i32": torch.zeros(
+                    (batch_size,), dtype=torch.int32, device=q.device,
+                ),
+                "q_kern": torch.empty(
+                    (batch_size, tp_q_head_num, head_dim),
+                    dtype=kernel_dtype, device=q.device,
+                ),
             }
             scratch[cache_key] = buf
             self._esimd_scratch = scratch
 
-        kv_merged = buf["kv_merged"]
-        new_block_table = buf["new_block_table"]
         temp_p = buf["temp_p"]
         out_kern = buf["out_kern"]
         seq_lens_i32 = buf["seq_lens_i32"]
@@ -1022,39 +991,15 @@ class XPUAttentionBackend(AttentionBackend):
             q_kern.copy_(q_reshaped)
         seq_lens_i32.copy_(cache_seqlens.to(torch.int32))
 
-        # Gather pages into kv_merged. page_table shape is [bs, max_pages];
-        # match our captured new_block_table row size.
-        # Under graph capture, page_table is the metadata's pre-allocated
-        # tensor (same max_num_pages as our new_block_table rows), so the
-        # shapes align. In eager mode page_table may be smaller — broadcast
-        # by slicing to the actual shape passed in.
-        bs_pt, pages_per_pt = page_table.shape
-        # Expect bs_pt == batch_size and pages_per_pt <= pages_per_bs.
-        pages_per_bs = new_block_table.shape[1]
-        # For eager (non-graph) path, only need num pages actually populated;
-        # we just read all of page_table but bound kv_merged write to that.
-        pages_flat = page_table.reshape(-1).to(torch.long)
-        kv_write_rows = pages_flat.numel()
-
-        if key_cache.dtype == kernel_dtype:
-            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[0, :kv_write_rows].copy_(
-                key_cache.index_select(0, pages_flat)
-            )
-            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[1, :kv_write_rows].copy_(
-                value_cache.index_select(0, pages_flat)
-            )
-        else:
-            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[0, :kv_write_rows].copy_(
-                key_cache.index_select(0, pages_flat).to(kernel_dtype)
-            )
-            kv_merged.view(2, -1, page_size, H_kv, head_dim_kv)[1, :kv_write_rows].copy_(
-                value_cache.index_select(0, pages_flat).to(kernel_dtype)
-            )
-
+        # page_table is already the int32 [bs, max_pages] tensor from the
+        # forward metadata — pass it straight to the kernel. Under graph
+        # capture it's pre-allocated to the worst-case column width and
+        # refreshed in place per replay, so data_ptr stays stable.
         torch.ops.eagle_ops.page_attn_decode(
             q_kern,
-            kv_merged,
-            new_block_table,
+            key_cache,
+            value_cache,
+            page_table,
             seq_lens_i32,
             out_kern,
             1,             # max_query_len (decode: always 1)
