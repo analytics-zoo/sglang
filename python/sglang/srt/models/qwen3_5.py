@@ -1042,6 +1042,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 need_resize = (
                     scratch is None
                     or scratch["nTokens"] < nTokens
+                    or scratch["qkv_in_dim"] != qkv.shape[1]
                 )
                 if need_resize:
                     scratch = {
