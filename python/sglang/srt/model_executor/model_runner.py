@@ -745,6 +745,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
+        elif self.device == "xpu":
+            self.init_attention_backend()
+            # XPU device graph capture is opt-in via env var while the
+            # attention-backend capture/replay hooks and ESIMD kernel
+            # graph-stability (scratch-buffer externalization) are still
+            # in progress. torch.cuda.CUDAGraph / torch.cuda.graph are
+            # aliased onto torch.xpu equivalents in cuda_graph_runner at
+            # import time (see _xpu_patch_cuda_graph_apis).
+            #
+            # Known blocker as of 2026-05-14: Triton + some ESIMD kernels
+            # use SYCL work_group_scratch_memory which the SYCL Graph
+            # extension does not yet support; capture either fails with
+            # "sycl_ext_oneapi_work_group_scratch_memory feature is not
+            # yet available" or produces incorrect output on replay.
+            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
         elif current_platform.is_out_of_tree():
             self.init_attention_backend()
             if current_platform.support_cuda_graph():
