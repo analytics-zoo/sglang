@@ -21,11 +21,24 @@ from sglang.srt.utils import (
     device_context,
     is_cpu,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+_is_xpu = is_xpu()
+
+# Use the awq_fused_xpu fused-SYCL rmsnorm_gated when running the supported
+# config (is_rms_norm=True, group_size=None, norm_before_gate=True,
+# activation='swish', no bias). It avoids ~100us / call of Python +
+# autograd overhead vs the Triton path on PTL iGPU.
+_xpu_fused_rms_gated = None
+if _is_xpu:
+    try:
+        from awq_fused_xpu import rmsnorm_gated as _xpu_fused_rms_gated  # noqa: F401
+    except ImportError:
+        _xpu_fused_rms_gated = None
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
@@ -444,15 +457,36 @@ class RMSNorm(torch.nn.Module):
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
             )
-        else:
-            return layernorm_fn(
-                x,
-                self.weight,
-                self.bias,
-                z=z,
-                eps=self.eps,
-                group_size=self.group_size,
-                norm_before_gate=self.norm_before_gate,
-                is_rms_norm=True,
-                activation=self.activation,
-            )
+        if (
+            _xpu_fused_rms_gated is not None
+            and z is not None
+            and self.norm_before_gate
+            and self.group_size is None
+            and self.activation == "swish"
+            and self.bias is None
+            and x.is_xpu
+            and x.dtype == z.dtype
+        ):
+            # Qwen3.5 stores RMSNormGated weight in fp16 even when activations
+            # are bf16 (config.text_config.dtype != run dtype). Cache a
+            # correctly-typed copy on first call to avoid per-step casts.
+            w = self.weight
+            if w.dtype != x.dtype:
+                cache = getattr(self, "_xpu_w_cache", None)
+                if cache is None or cache.dtype != x.dtype or cache.data_ptr() == 0:
+                    w_cast = w.detach().to(x.dtype).contiguous()
+                    self._xpu_w_cache = w_cast
+                    cache = w_cast
+                w = cache
+            return _xpu_fused_rms_gated(x, z, w, self.eps)
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )

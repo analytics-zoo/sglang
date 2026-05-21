@@ -261,9 +261,15 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.activities = activities
 
     def start(self):
+        # On XPU map "GPU" → XPU activity so we record kernel-side time.
+        gpu_activity = (
+            torch.profiler.ProfilerActivity.XPU
+            if torch.xpu.is_available() and hasattr(torch.profiler.ProfilerActivity, "XPU")
+            else torch.profiler.ProfilerActivity.CUDA
+        )
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            "GPU": gpu_activity,
         }
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
