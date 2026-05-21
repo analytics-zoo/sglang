@@ -82,6 +82,11 @@ elif _is_hip:
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
+    try:
+        from awq_fused_xpu import awq_gemv_fused as _awq_gemv_fused_xpu
+    except ImportError:
+        _awq_gemv_fused_xpu = None
+
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
     warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
@@ -137,7 +142,9 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        if _is_npu or _is_xpu:
+            return [torch.float16, torch.bfloat16]
+        return [torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -455,8 +462,16 @@ class AWQLinearMethod(LinearMethodBase):
         pack_factor = self.quant_config.pack_factor
         out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
         reshaped_x = x.reshape(-1, x.shape[-1])
-        out = awq_dequantize(qweight, scales, qzeros)
-        out = torch.matmul(reshaped_x, out)
+        # XPU fast path: fused dequant+GEMV for batch == 1 (decode).
+        if (
+            _is_xpu
+            and _awq_gemv_fused_xpu is not None
+            and reshaped_x.shape[0] == 1
+        ):
+            out = _awq_gemv_fused_xpu(reshaped_x, qweight, scales, qzeros)
+        else:
+            out = awq_dequantize(qweight, scales, qzeros)
+            out = torch.matmul(reshaped_x, out)
 
         if bias is not None:
             out.add_(bias)
