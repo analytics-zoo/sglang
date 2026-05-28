@@ -938,7 +938,7 @@ class XPUAttentionBackend(AttentionBackend):
         # Lazy import so the sglang scheduler subprocess (spawned via fork+spawn)
         # registers the eagle_ops torch.ops namespace.
         if not getattr(self, "_esimd_loaded", False):
-            import custom_esimd_kernels_vllm  # noqa: F401 — registers torch.ops.eagle_ops
+            import custom_esimd_kernels_sglang  # noqa: F401 — registers torch.ops.eagle_ops
             self._esimd_loaded = True
         batch_size = cache_seqlens.numel()
 
@@ -953,7 +953,7 @@ class XPUAttentionBackend(AttentionBackend):
         scratch = getattr(self, "_esimd_scratch", {})
         buf = scratch.get(cache_key)
         if buf is None:
-            from custom_esimd_kernels_vllm.ops import (
+            from custom_esimd_kernels_sglang.ops import (
                 eagle_page_attn_decode_temp_size,
             )
             tp_size = eagle_page_attn_decode_temp_size(

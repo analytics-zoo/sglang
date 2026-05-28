@@ -1026,7 +1026,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             and hidden_states.dim() == 2
         ):
             try:
-                from custom_esimd_kernels_vllm import esimd_qkv_split_norm_rope
+                from custom_esimd_kernels_sglang import esimd_qkv_split_norm_rope
             except ImportError:
                 esimd_qkv_split_norm_rope = None
             if esimd_qkv_split_norm_rope is not None:
