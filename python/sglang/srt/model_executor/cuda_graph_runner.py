@@ -980,14 +980,12 @@ class CudaGraphRunner:
         else:
             captured_fn = run_once_fn
 
-        # torch.xpu.graph signature uses xpu_graph= keyword; torch.cuda.graph
-        # uses cuda_graph=. Branch by device.
-        if self.device == "xpu":
-            with graph_ctx(xpu_graph=graph, pool=pool, stream=stream):
-                out = captured_fn()
-        else:
-            with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-                out = captured_fn()
+        # On XPU, graph_ctx is _XpuGraphCtx (see _xpu_patch_cuda_graph_apis):
+        # it accepts cuda_graph= and forwards to torch.xpu.graph(xpu_graph=...).
+        # On CUDA, graph_ctx is the real torch.cuda.graph which also takes
+        # cuda_graph=. So both paths funnel through one call.
+        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+            out = captured_fn()
         return out
 
     def _create_device_graph(self):
