@@ -980,8 +980,14 @@ class CudaGraphRunner:
         else:
             captured_fn = run_once_fn
 
-        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-            out = captured_fn()
+        # torch.xpu.graph signature uses xpu_graph= keyword; torch.cuda.graph
+        # uses cuda_graph=. Branch by device.
+        if self.device == "xpu":
+            with graph_ctx(xpu_graph=graph, pool=pool, stream=stream):
+                out = captured_fn()
+        else:
+            with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+                out = captured_fn()
         return out
 
     def _create_device_graph(self):
@@ -989,6 +995,11 @@ class CudaGraphRunner:
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
             return BreakableCUDAGraph()
+        # XPU has its own graph type. torch.xpu.XPUGraph is the analogue of
+        # torch.cuda.CUDAGraph and supports the same capture/replay API used
+        # below (graph object passed into the device_module.graph() ctx).
+        if self.device == "xpu":
+            return torch.xpu.XPUGraph()
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(

@@ -396,6 +396,46 @@ class TopK(MultiPlatformOp):
             layer_id=self.layer_id,
         )
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        cfg = self.topk_config
+        # Fast path: scalar softmax + renorm top-K, no grouped/biased/correction.
+        # Covers Qwen3.5-MoE decode; the chain (softmax+topk+sum+div) is ~14 ms/step
+        # at decode due to per-launch overhead on (1, num_experts) tensors.
+        if (
+            not cfg.use_grouped_topk
+            and cfg.scoring_func == "softmax"
+            and cfg.correction_bias is None
+            and cfg.custom_routing_function is None
+            and cfg.routed_scaling_factor is None
+            and not cfg.apply_routed_scaling_factor_on_output
+            and cfg.num_fused_shared_experts == 0
+            and num_token_non_padded is None
+            and expert_location_dispatch_info is None
+            and router_logits.dim() == 2
+            and router_logits.shape[1] <= 256
+            and cfg.top_k <= 16
+        ):
+            topk_w, topk_i = torch.ops.awq_fused_xpu.moe_route_topk(
+                router_logits, cfg.top_k, cfg.renormalize
+            )
+            return StandardTopKOutput(topk_w, topk_i, router_logits)
+
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(

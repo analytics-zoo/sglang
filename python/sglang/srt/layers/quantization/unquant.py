@@ -157,6 +157,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
+        # XPU fast path: shape-specialized dense GEMV for batch=1 decode.
+        # Skips oneDNN dispatch on the 8 fixed shapes from Qwen3.5-MoE
+        # (linear_attn / self_attn / shared_expert / mlp.gate); other shapes
+        # fall through to F.linear via the generic fallback inside the kernel.
+        if (
+            x.is_xpu
+            and x.dim() == 2
+            and x.size(0) == 1
+            and bias is None
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.dtype == layer.weight.dtype
+        ):
+            return torch.ops.awq_fused_xpu.dense_gemv(x, layer.weight)
+
         return F.linear(x, layer.weight, bias)
 
 

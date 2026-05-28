@@ -87,6 +87,18 @@ elif _is_xpu:
     except ImportError:
         _awq_gemv_fused_xpu = None
 
+    try:
+        from awq_fused_xpu import awq_moe_gemv as _awq_moe_gemv_xpu
+    except ImportError:
+        _awq_moe_gemv_xpu = None
+
+    try:
+        from awq_fused_xpu import awq_moe_gated_gemv as _awq_moe_gated_gemv_xpu
+        from awq_fused_xpu import awq_moe_reduce_gemv as _awq_moe_reduce_gemv_xpu
+    except ImportError:
+        _awq_moe_gated_gemv_xpu = None
+        _awq_moe_reduce_gemv_xpu = None
+
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
     warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
@@ -193,6 +205,14 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
+        if _is_xpu and isinstance(layer, FusedMoE):
+            if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedFusedMoEMethod,
+                )
+
+                return UnquantizedFusedMoEMethod()
+            return AWQMoEXPUMethod(self)
         return None
 
 
@@ -969,6 +989,263 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+class AWQMoEXPUMethod(FusedMoEMethodBase):
+    """XPU AWQ FusedMoE method: per-expert dequant + matmul (functional baseline).
+
+    Storage matches AWQ on-disk layout (E, K, N/8) int32 packed; this avoids the
+    OOM that happens when MoE weights are loaded as dense fp16/bf16 because no
+    quant method was available on XPU.
+    """
+
+    def __init__(self, quant_config: AWQConfig):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        extra_weight_attrs.update(
+            {
+                "is_transposed": True,
+                "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+            }
+        )
+
+        pack_factor = self.quant_config.pack_factor
+        group_size = self.quant_config.group_size
+
+        w13_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                2 * intermediate_size_per_partition // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qweight", w13_qweight)
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+
+        w2_qweight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                intermediate_size_per_partition,
+                hidden_size // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qweight", w2_qweight)
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        num_groups_w13 = hidden_size // group_size
+        num_groups_w2 = intermediate_size_per_partition // group_size
+
+        w13_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_scales", w13_scales)
+        set_weight_attrs(w13_scales, extra_weight_attrs)
+
+        w2_scales = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_scales", w2_scales)
+        set_weight_attrs(w2_scales, extra_weight_attrs)
+
+        w13_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w13,
+                2 * intermediate_size_per_partition // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_qzeros", w13_qzeros)
+        set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+        w2_qzeros = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                num_groups_w2,
+                hidden_size // pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_qzeros", w2_qzeros)
+        set_weight_attrs(w2_qzeros, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Storage layout already matches what awq_dequantize expects per expert
+        # (sliced [e] gives (K, N/8) qweight, (K/group, N) scales, (K/group, N/8) zeros).
+        layer.w13_qweight = torch.nn.Parameter(
+            layer.w13_qweight.data, requires_grad=False
+        )
+        layer.w2_qweight = torch.nn.Parameter(
+            layer.w2_qweight.data, requires_grad=False
+        )
+        layer.w13_scales = torch.nn.Parameter(
+            layer.w13_scales.data, requires_grad=False
+        )
+        layer.w2_scales = torch.nn.Parameter(
+            layer.w2_scales.data, requires_grad=False
+        )
+        layer.w13_qzeros = torch.nn.Parameter(
+            layer.w13_qzeros.data, requires_grad=False
+        )
+        layer.w2_qzeros = torch.nn.Parameter(
+            layer.w2_qzeros.data, requires_grad=False
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        topk_weights = topk_weights.to(x.dtype)
+
+        num_tokens = x.shape[0]
+        if num_tokens == 0:
+            return StandardCombineInput(hidden_states=x)
+
+        out = torch.zeros_like(x)
+        top_k = topk_ids.shape[1]
+        hidden_size = x.shape[-1]
+
+        if (num_tokens == 1
+                and _awq_moe_gated_gemv_xpu is not None
+                and _awq_moe_reduce_gemv_xpu is not None):
+            # Decode SYCL fast path (v3 group-major + scaled-zero precompute).
+            ids_i32 = topk_ids[0].to(torch.int32)
+            ws = topk_weights[0]
+            x_t = x[0]
+            h = _awq_moe_gated_gemv_xpu(
+                x_t,
+                layer.w13_qweight,
+                layer.w13_scales,
+                layer.w13_qzeros,
+                ids_i32,
+            )  # (top_k, moe_inter)
+            out[0] = _awq_moe_reduce_gemv_xpu(
+                h,
+                layer.w2_qweight,
+                layer.w2_scales,
+                layer.w2_qzeros,
+                ids_i32,
+                ws,
+            )  # (hidden,)
+            return StandardCombineInput(hidden_states=out)
+        if num_tokens == 1 and _awq_moe_gemv_xpu is not None:
+            # Fallback: two batched GEMVs + Python silu/mul/sum.
+            ids_i32 = topk_ids[0].to(torch.int32)
+            ws = topk_weights[0]
+            x_t = x[0]
+            gu = _awq_moe_gemv_xpu(
+                x_t, layer.w13_qweight, layer.w13_scales, layer.w13_qzeros,
+                ids_i32,
+            )
+            gate, up = gu.chunk(2, dim=-1)
+            h = (torch.nn.functional.silu(gate) * up).contiguous()
+            d = _awq_moe_gemv_xpu(
+                h, layer.w2_qweight, layer.w2_scales, layer.w2_qzeros, ids_i32,
+            )
+            out[0] = (ws.unsqueeze(-1) * d).sum(dim=0)
+            return StandardCombineInput(hidden_states=out)
+        if num_tokens == 1 and _awq_gemv_fused_xpu is not None:
+            # Fallback: per-expert fused GEMV (still faster than dequant+matmul).
+            ids_xpu = topk_ids[0]
+            ws = topk_weights[0]
+            x_t = x[:1]
+            w13_qw_g = layer.w13_qweight.index_select(0, ids_xpu)
+            w13_sc_g = layer.w13_scales.index_select(0, ids_xpu)
+            w13_qz_g = layer.w13_qzeros.index_select(0, ids_xpu)
+            w2_qw_g = layer.w2_qweight.index_select(0, ids_xpu)
+            w2_sc_g = layer.w2_scales.index_select(0, ids_xpu)
+            w2_qz_g = layer.w2_qzeros.index_select(0, ids_xpu)
+            for j in range(top_k):
+                gu = _awq_gemv_fused_xpu(
+                    x_t, w13_qw_g[j], w13_sc_g[j], w13_qz_g[j]
+                )
+                gate, up = gu.chunk(2, dim=-1)
+                h = torch.nn.functional.silu(gate) * up
+                d = _awq_gemv_fused_xpu(
+                    h, w2_qw_g[j], w2_sc_g[j], w2_qz_g[j]
+                )
+                out[0] += ws[j] * d.reshape(hidden_size)
+            return StandardCombineInput(hidden_states=out)
+
+        # Prefill path: group tokens by expert so each unique expert
+        # dequantizes once and runs a single GEMM over all routed tokens.
+        flat_ids = topk_ids.reshape(-1)
+        flat_weights = topk_weights.reshape(-1)
+        token_idx = (
+            torch.arange(num_tokens, device=x.device)
+            .unsqueeze(1)
+            .expand(-1, top_k)
+            .reshape(-1)
+        )
+
+        unique_experts = torch.unique(flat_ids).tolist()
+        for e in unique_experts:
+            mask = flat_ids == e
+            sel_tokens = token_idx[mask]
+            sel_w = flat_weights[mask].to(x.dtype)
+            x_e = x.index_select(0, sel_tokens)
+
+            w13_w = awq_dequantize(
+                layer.w13_qweight[e].contiguous(),
+                layer.w13_scales[e].contiguous(),
+                layer.w13_qzeros[e].contiguous(),
+            )
+            gu = torch.matmul(x_e, w13_w)
+            gate, up = gu.chunk(2, dim=-1)
+            h = torch.nn.functional.silu(gate) * up
+
+            w2_w = awq_dequantize(
+                layer.w2_qweight[e].contiguous(),
+                layer.w2_scales[e].contiguous(),
+                layer.w2_qzeros[e].contiguous(),
+            )
+            contrib = torch.matmul(h, w2_w) * sel_w.unsqueeze(-1)
+            out.index_add_(0, sel_tokens, contrib)
+
+        return StandardCombineInput(hidden_states=out)
 
 
 # Register fake implementations for torch.compile support
