@@ -2,9 +2,9 @@
 we can bisect whether the Triton kernels are corrupting memory on XPU.
 
 Enable individual fallbacks via env vars:
-  SGL_XPU_GDN_PY_CONV1D=1      -> replace causal_conv1d_update
-  SGL_XPU_GDN_PY_PACKED=1      -> replace fused_recurrent_gated_delta_rule_packed_decode
-  SGL_XPU_GDN_PY_UPDATE=1      -> replace fused_sigmoid_gating_delta_rule_update (non-packed decode)
+  SGLANG_XPU_GDN_PY_CONV1D=1   -> replace causal_conv1d_update
+  SGLANG_XPU_GDN_PY_PACKED=1   -> replace fused_recurrent_gated_delta_rule_packed_decode
+  SGLANG_XPU_GDN_PY_UPDATE=1   -> replace fused_sigmoid_gating_delta_rule_update (non-packed decode)
 
 All three take effect in gdn_backend.py forward_decode. They are correctness
 references only, not performance-tuned — this is for debugging.

@@ -1021,7 +1021,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         # Hard-coded requirements: head_dim=256, fp16, GemmaRMSNorm weight+1.0
         # (matches Qwen3.5's q_norm/k_norm). Gate with env + shape checks.
         if (
-            os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
+            os.environ.get("SGLANG_XPU_FA_ESIMD_QKV") == "1"
             and self.head_dim == 256
             and hidden_states.dim() == 2
         ):

@@ -288,7 +288,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         assert isinstance(mixed_qkv, torch.Tensor)
         import os as _os
-        _py_gdn = _os.environ.get("SGL_XPU_GDN_PY") == "1"
+        _py_gdn = _os.environ.get("SGLANG_XPU_GDN_PY") == "1"
 
         if _py_gdn:
             from sglang.srt.layers.attention.xpu_gdn_pytorch_fallback import (

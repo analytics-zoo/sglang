@@ -636,12 +636,12 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            # Prefill: SDPA fallback only when SGL_XPU_FA_FALLBACK=1.
-            # SGL_XPU_ESIMD_DECODE does NOT force prefill fallback — prefill
-            # keeps the native FMHA kernel.
+            # Prefill: SDPA fallback only when SGLANG_XPU_FA_FALLBACK=1.
+            # SGLANG_XPU_ESIMD_DECODE does NOT force prefill fallback —
+            # prefill keeps the native FMHA kernel.
             if (
                 not use_cascade_attn
-                and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+                and os.environ.get("SGLANG_XPU_FA_FALLBACK") == "1"
             ):
                 result = self._sdpa_fallback(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -1241,7 +1241,7 @@ class XPUAttentionBackend(AttentionBackend):
 
                 if (
                     not use_cascade_attn
-                    and os.environ.get("SGL_XPU_ESIMD_DECODE") == "1"
+                    and os.environ.get("SGLANG_XPU_ESIMD_DECODE") == "1"
                 ):
                     result = self._esimd_fallback_decode(
                         q=q_reshaped,
@@ -1256,7 +1256,7 @@ class XPUAttentionBackend(AttentionBackend):
                     )
                 elif (
                     not use_cascade_attn
-                    and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+                    and os.environ.get("SGLANG_XPU_FA_FALLBACK") == "1"
                 ):
                     result = self._sdpa_fallback_decode(
                         q=q_reshaped,

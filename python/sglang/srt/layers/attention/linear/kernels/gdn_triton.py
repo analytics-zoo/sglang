@@ -162,7 +162,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         import os as _os
         if (
             is_xpu()
-            and _os.environ.get("SGL_XPU_GDN_EXTEND_ESIMD") == "1"
+            and _os.environ.get("SGLANG_XPU_GDN_EXTEND_ESIMD") == "1"
             and q.size(-1) == 128
             and v.size(-1) == 128
             and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)
