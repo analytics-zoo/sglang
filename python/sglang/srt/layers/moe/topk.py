@@ -73,6 +73,26 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+_moe_route_topk_available: Optional[bool] = None
+
+
+def _has_moe_route_topk() -> bool:
+    """Whether the optional awq_fused_xpu.moe_route_topk fused router op exists.
+
+    The XPU decode fast path in TopK.forward_xpu uses it, but the extension is
+    optional (absent on hosts without the awq_fused_xpu build, e.g. the GGUF-only
+    setup). Cache the probe and fall back to select_experts when missing."""
+    global _moe_route_topk_available
+    if _moe_route_topk_available is None:
+        try:
+            _moe_route_topk_available = hasattr(
+                torch.ops.awq_fused_xpu, "moe_route_topk"
+            )
+        except Exception:
+            _moe_route_topk_available = False
+    return _moe_route_topk_available
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -421,6 +441,7 @@ class TopK(MultiPlatformOp):
             and router_logits.dim() == 2
             and router_logits.shape[1] <= 256
             and cfg.top_k <= 16
+            and _has_moe_route_topk()
         ):
             topk_w, topk_i = torch.ops.awq_fused_xpu.moe_route_topk(
                 router_logits, cfg.top_k, cfg.renormalize
@@ -552,6 +573,22 @@ def fused_topk(
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
+
+    # XPU softmax-topk fallback: the sgl_kernel topk_softmax cutlass op only
+    # supports up to 128 experts, but Qwen3.5-MoE has 256. Use a pure-torch
+    # path (correct, sufficient for decode) when on XPU with >128 experts and
+    # no correction bias.
+    if (
+        is_xpu()
+        and scoring_func == "softmax"
+        and correction_bias is None
+        and gating_output.shape[-1] > 128
+    ):
+        probs = torch.softmax(gating_output.float(), dim=-1)
+        topk_weights, topk_ids = torch.topk(probs, topk, dim=-1)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device

@@ -2122,6 +2122,26 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 )
             return True
 
+        # --- GGUF load-path adaptations (mirror the dense Qwen3_5 load_weights) ---
+        # A GGUF checkpoint stores weights in llama.cpp conventions that differ
+        # from the HF safetensors the model code expects:
+        #   * GemmaRMSNorm weights are stored standard (~1.0), but GemmaRMSNorm
+        #     computes x*(1+w) so the param must be (standard-1) -> subtract 1.
+        #   * GDN linear_attn.* needs the value-head permute / A_log / dt_bias
+        #     transform (_gguf_gdn_transform), same as the dense path.
+        #   * shared_expert_gate is stored 1-D [hidden] but the param is
+        #     [1, hidden]; conv1d is stored 2-D but the param is 3-D.
+        _is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        _gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
@@ -2130,6 +2150,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+            if _is_gguf and (
+                name.endswith(_gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+            ):
+                loaded_weight = loaded_weight - 1.0
+            if _is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -2184,6 +2212,18 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                # GGUF fused GDN projections (in_proj_qkvz / in_proj_ba) register a
+                # quantized `.qweight` param. When the source shard is F32 (the 35B
+                # stores ssm_alpha/beta = in_proj_a/b as F32), the gguf weight iterator
+                # yields it under `.weight` (no quant rename). Redirect to `.qweight`
+                # so the shard lands in the fused param; qweight_type defaults to 0
+                # (F32) -> handled as the fp16 rep.
+                if (
+                    name.endswith(".weight")
+                    and name not in params_dict
+                    and name[: -len(".weight")] + ".qweight" in params_dict
+                ):
+                    name = name[: -len(".weight")] + ".qweight"
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2311,6 +2351,24 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                     if name in params_dict.keys():
                         param = params_dict[name]
+                        # GGUF stores conv1d 2-D [ch, kernel] but the param is
+                        # 3-D [ch, 1, kernel]; insert the singleton middle dim.
+                        if (
+                            _is_gguf
+                            and "conv1d.weight" in name
+                            and loaded_weight.dim() == 2
+                            and param.dim() == 3
+                        ):
+                            loaded_weight = loaded_weight.unsqueeze(1)
+                        # GGUF stores shared_expert_gate 1-D [hidden] but the
+                        # param is 2-D [1, hidden]; add the leading dim.
+                        if (
+                            _is_gguf
+                            and name.endswith("shared_expert_gate.weight")
+                            and loaded_weight.dim() == 1
+                            and param.dim() == 2
+                        ):
+                            loaded_weight = loaded_weight.unsqueeze(0)
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
@@ -2341,6 +2399,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
+
+
+# The MoE GGUF load path reuses the dense model's GDN value-head transform
+# (_gguf_gdn_transform / _perm_value_rows). Both reference only self.config, so
+# bind the dense implementations onto the MoE class rather than duplicating them.
+Qwen3_5MoeForConditionalGeneration._gguf_gdn_transform = (
+    Qwen3_5ForConditionalGeneration._gguf_gdn_transform
+)
+Qwen3_5MoeForConditionalGeneration._perm_value_rows = staticmethod(
+    Qwen3_5ForConditionalGeneration._perm_value_rows
+)
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

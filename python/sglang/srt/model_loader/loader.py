@@ -2116,7 +2116,13 @@ class GGUFModelLoader(BaseModelLoader):
             for sf in st_files:
                 with safe_open(sf, framework="pt") as fh:
                     hf_names.extend(fh.keys())
-        hf_names = [n for n in hf_names if n.startswith(mm_prefix)]
+        # Keep the language tower plus the top-level untied lm_head (the 35B-MoE
+        # has tie_word_embeddings=False, so `lm_head.*` lives outside the
+        # `model.language_model.` prefix and maps to the gguf `output` tensor).
+        hf_names = [
+            n for n in hf_names
+            if n.startswith(mm_prefix) or n.startswith("lm_head.")
+        ]
 
         def gdn_patch(text_name):
             # The GDN A_log / dt_bias params have no '.weight' suffix, so the
@@ -2136,9 +2142,27 @@ class GGUFModelLoader(BaseModelLoader):
 
         gguf_to_hf_name_map = {}
         for mm_name in hf_names:
-            # strip the multimodal 'language_model.' segment to query the
-            # text-level TensorNameMap, but keep mm_name as the load target.
-            text_name = "model." + mm_name[len(mm_prefix) :]
+            # The reference HF checkpoint may be pre-quantized (e.g. the sym_int4
+            # dir used as the 35B config/tokenizer source), so its param names end
+            # in `.qweight` / `.weight_scale` / `.input_scale`. A GGUF file always
+            # stores the weight tensor as `<name>.weight` (the quant type is
+            # separate metadata) and has NO standalone scale tensor. Normalize the
+            # HF name to its `.weight` form so both the GGUF map KEY (real gguf
+            # tensor name) and the VALUE (load target — the gguf weight iterator
+            # does name.replace("weight","qweight") downstream for quant types)
+            # are consistent; drop scale-only entries (gguf has none).
+            if mm_name.endswith((".weight_scale", ".weight_scale_inv", ".input_scale")):
+                continue
+            if mm_name.endswith(".qweight"):
+                mm_name = mm_name[: -len(".qweight")] + ".weight"
+            # Top-level untied lm_head (outside the language_model prefix) ->
+            # gguf `output`. Query the TensorNameMap with the bare name.
+            if mm_name.startswith("lm_head."):
+                text_name = mm_name
+            else:
+                # strip the multimodal 'language_model.' segment to query the
+                # text-level TensorNameMap, but keep mm_name as the load target.
+                text_name = "model." + mm_name[len(mm_prefix) :]
             # GDN bias/A_log first (no .weight suffix; rpartition would mis-base).
             gguf_full = gdn_patch(text_name)
             if gguf_full is None:

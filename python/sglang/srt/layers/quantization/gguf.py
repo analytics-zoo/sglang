@@ -149,6 +149,8 @@ class GGUFConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             if _is_npu:
                 return GGUFMoEAscendMethod(self)
+            if _is_xpu:
+                return GGUFMoEXPUMethod(self)
             return GGUFMoEMethod(self)
         return None
 
@@ -918,9 +920,18 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
     _force_dq = os.environ.get("SGLANG_GGUF_XPU_FORCE_DEQUANT") == "1"
     if qweight_type == _Q4_0_TYPE and esimd_gemv_q4_0 is not None and not _force_dq:
         packed, scale = _xpu_repack_q4_0(qweight)
+        # q4_0 is interleaved nibble [N,K/2]; a head_v_dim col-perm is not used
+        # by any q4_0 GDN layer in Qwen3.5/3.6 (out_proj is Q5_K/Q8_0). Guard.
+        assert col_perm is None, "q4_0 GDN out_proj col-perm unsupported"
         return ("q4_0", packed, scale)
     if qweight_type == _Q8_0_TYPE and esimd_gemv_q8_0 is not None and not _force_dq:
-        qs, scale = _xpu_repack_q8_0(qweight)
+        qs, scale = _xpu_repack_q8_0(qweight)  # qs [N,K] int8, scale [N,K/32] f16
+        if col_perm is not None and qs.numel() > 0:
+            # GDN out_proj (35B ssm_out is Q8_0): permute K (input) columns in
+            # element order, head_v_dim-granular; scale follows at hvd//32.
+            ratio, nk, hvd = col_perm
+            qs = _q5q6_col_perm_elems(qs, col_perm)
+            scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
         return ("q8_0", qs, scale)
     if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
         ql, scale, minv = _xpu_repack_q4_k(qweight)
@@ -1036,6 +1047,10 @@ def _xpu_permute_gdn_out_cols(rep, perm):
 
     kind = rep[0]
     if kind == "fp16":
+        # Empty / not-loaded weight (e.g. an out_proj param on a layer that has
+        # no ssm_out in this checkpoint): nothing to permute.
+        if rep[1].dim() < 2 or rep[1].numel() == 0:
+            return rep
         return ("fp16", _perm_last(rep[1], hvd), None)
     # Quant reps (q5_k/q6_k/...) apply col_perm INSIDE _xpu_repack_* in element
     # order before packing, so a quant rep must never reach here.
@@ -1078,7 +1093,10 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 ids = sorted(shard_id)
             for idx in ids:
                 start, end, offset = qweight.shard_offset_map[idx]
-                stype = layer.qweight_type.shard_weight_type[idx]
+                # F32 shards (e.g. the 35B's ssm_alpha/beta -> in_proj_a/b) carry
+                # no qweight_type from the gguf iterator; default to F32 (0) so
+                # _xpu_prepare_shard takes the unquantized fp16 path.
+                stype = layer.qweight_type.shard_weight_type.get(idx, 0)
                 w = qweight[start:end, :offset].contiguous()
                 reps[idx] = _xpu_prepare_shard(w, stype, self.params_dtype)
             layer._xpu_shard_order = ids
@@ -1225,6 +1243,188 @@ class GGUFMoEMethod(FusedMoEMethodBase):
             activation=moe_runner_config.activation,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+def _xpu_dequant_rep(rep, out_dtype=torch.float16):
+    """Dequant any resident rep (from _xpu_prepare_shard) -> dense [N, K]."""
+    kind = rep[0]
+    if kind == "q4_0":
+        return _xpu_dequant_q4_0_packed(rep[1], rep[2], out_dtype)
+    if kind == "q8_0":
+        return _xpu_dequant_q8_0(rep[1], rep[2], out_dtype)
+    if kind == "q4_k":
+        return _xpu_dequant_q4_k(rep[1], rep[2], rep[3], out_dtype)
+    if kind == "q5_k":
+        return _xpu_dequant_q5_k(rep[1], rep[2], rep[3], rep[4], out_dtype)
+    if kind == "q6_k":
+        return _xpu_dequant_q6_k(rep[1], rep[2], rep[3], out_dtype)
+    # fp16 dense
+    return rep[1].to(out_dtype)
+
+
+def _xpu_rep_gemv(x_row, rep):
+    """x_row [1,K] fp16 @ rep^T -> [1,N] fp16 via the matching ESIMD GEMV."""
+    kind = rep[0]
+    N = rep[1].shape[0]
+    out = torch.empty(1, N, dtype=torch.float16, device=x_row.device)
+    if kind == "q4_0":
+        esimd_gemv_q4_0(x_row, rep[1], rep[2], out)
+    elif kind == "q8_0":
+        esimd_gemv_q8_0(x_row, rep[1], rep[2], out)
+    elif kind == "q4_k":
+        esimd_gemv_q4_k(x_row, rep[1], rep[2], rep[3], out)
+    elif kind == "q5_k":
+        esimd_gemv_q5_k(x_row, rep[1], rep[2], rep[3], rep[4], out)
+    elif kind == "q6_k":
+        esimd_gemv_q6_k(x_row, rep[1], rep[2], rep[3], out)
+    else:  # fp16
+        return x_row.to(rep[1].dtype) @ rep[1].t()
+    return out
+
+
+class GGUFMoEXPUMethod(FusedMoEMethodBase):
+    """GGUF FusedMoE for Intel XPU (PTL Xe3).
+
+    Mirrors GGUFMoEMethod.create_weights (w13/w2 GGUFUninitializedParameter with
+    data_container), but in process_weights_after_loading repacks each expert's
+    gate/up (w13) and down (w2) GGUF bytes into the resident ESIMD k-quant rep
+    (Q4_K/Q5_K/Q6_K/Q8_0 — reuses _xpu_prepare_shard / _xpu_repack_*). apply
+    routes M=1 decode through per-expert ESIMD GEMV and M>1 prefill through
+    per-expert dequant + matmul (functional baseline, mirrors AWQMoEXPUMethod).
+
+    The shared expert (ffn_*_shexp) is a separate dense Linear handled by
+    GGUFLinearXPUMethod; only the routed experts come through here.
+    """
+
+    def __init__(self, quant_config: GGUFConfig):
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        self.params_dtype = params_dtype
+        # Mirror GGUFMoEMethod: w13 (gate+up fused) + w2 (down), GGUF-uninit.
+        tensor_shape = (num_experts, 2 * intermediate_size_per_partition, hidden_size)
+        w13_qweight = GGUFUninitializedParameter(requires_grad=False)
+        set_weight_attrs(
+            w13_qweight,
+            {"input_dim": 1, "output_dim": 0, "tensor_shape": tensor_shape,
+             "is_gguf_weight": True, "data_container": []},
+        )
+        set_weight_attrs(w13_qweight, extra_weight_attrs)
+        layer.register_parameter("w13_qweight", w13_qweight)
+        w13_qweight_type = Parameter(torch.empty(1, dtype=torch.uint8),
+                                     requires_grad=False)
+        set_weight_attrs(w13_qweight_type,
+                         {"is_gguf_weight_type": True, "weight_type": 0,
+                          "ignore_warning": True})
+        set_weight_attrs(w13_qweight_type, extra_weight_attrs)
+        layer.register_parameter("w13_qweight_type", w13_qweight_type)
+
+        tensor_shape = (num_experts, intermediate_size_per_partition, hidden_size)
+        w2_qweight = GGUFUninitializedParameter(requires_grad=False)
+        set_weight_attrs(
+            w2_qweight,
+            {"input_dim": 1, "output_dim": 0, "tensor_shape": tensor_shape,
+             "is_gguf_weight": True, "data_container": []},
+        )
+        set_weight_attrs(w2_qweight, extra_weight_attrs)
+        layer.register_parameter("w2_qweight", w2_qweight)
+        w2_qweight_type = Parameter(torch.empty(1, dtype=torch.uint8),
+                                    requires_grad=False)
+        set_weight_attrs(w2_qweight_type,
+                         {"is_gguf_weight_type": True, "weight_type": 0,
+                          "ignore_warning": True})
+        set_weight_attrs(w2_qweight_type, extra_weight_attrs)
+        layer.register_parameter("w2_qweight_type", w2_qweight_type)
+
+    def create_moe_runner(self, layer, moe_runner_config):
+        self.moe_runner_config = moe_runner_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # Materialize the per-expert GGUF byte tensors from data_container.
+        if hasattr(layer, "materialize_gguf_weights"):
+            layer.materialize_gguf_weights()
+        w13 = layer.w13_qweight            # [E, 2*inter_bytes_rows, hidden_bytes]
+        w2 = layer.w2_qweight              # [E, inter_rows, hidden_bytes]
+        w13_type = int(layer.w13_qweight_type.weight_type)
+        w2_type = int(layer.w2_qweight_type.weight_type)
+        E = w13.shape[0]
+        # w13 row dim = gate rows (N) followed by up rows (N); split at half.
+        n13 = w13.shape[1]
+        half = n13 // 2
+        # Per-expert repack -> resident k-quant reps. gate and up share dtype, so
+        # repack each [N, K_bytes] slice via _xpu_prepare_shard.
+        self.gate_reps, self.up_reps, self.down_reps = [], [], []
+        for e in range(E):
+            g = w13[e, :half, :].contiguous()
+            u = w13[e, half:, :].contiguous()
+            d = w2[e].contiguous()
+            self.gate_reps.append(_xpu_prepare_shard(g, w13_type, self.params_dtype))
+            self.up_reps.append(_xpu_prepare_shard(u, w13_type, self.params_dtype))
+            self.down_reps.append(_xpu_prepare_shard(d, w2_type, self.params_dtype))
+        layer._xpu_moe_ready = True
+        # free the raw GGUF bytes
+        del layer.w13_qweight
+        del layer.w2_qweight
+
+    def apply(self, layer: torch.nn.Module, dispatch_output) -> "CombineInput":
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert self.moe_runner_config.activation == "silu", \
+            "GGUFMoEXPUMethod only supports SiLU activation."
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+        x2 = x.reshape(-1, x.shape[-1])
+        M = x2.shape[0]
+        out = torch.zeros_like(x2)
+        if M == 0:
+            return StandardCombineInput(hidden_states=out.reshape_as(x))
+        top_k = topk_ids.shape[1]
+
+        if M == 1:
+            # Decode: per-expert ESIMD GEMV over the top_k routed experts.
+            xf = x2.to(torch.float16).contiguous()
+            ids = topk_ids[0].tolist()
+            ws = topk_weights[0].to(torch.float16)
+            acc = torch.zeros(1, x2.shape[-1], dtype=torch.float16, device=x2.device)
+            for j in range(top_k):
+                e = int(ids[j])
+                gate = _xpu_rep_gemv(xf, self.gate_reps[e])
+                up = _xpu_rep_gemv(xf, self.up_reps[e])
+                h = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.float16)
+                d = _xpu_rep_gemv(h.contiguous(), self.down_reps[e])
+                acc += ws[j] * d
+            out[0] = acc.to(out.dtype)
+            return StandardCombineInput(hidden_states=out.reshape_as(x))
+
+        # Prefill (M>1): group tokens by expert, dequant once per expert + matmul.
+        flat_ids = topk_ids.reshape(-1)
+        flat_w = topk_weights.reshape(-1).to(x2.dtype)
+        tok_idx = (torch.arange(M, device=x2.device).unsqueeze(1)
+                   .expand(-1, top_k).reshape(-1))
+        for e in torch.unique(flat_ids).tolist():
+            e = int(e)
+            mask = flat_ids == e
+            sel = tok_idx[mask]
+            sw = flat_w[mask]
+            x_e = x2.index_select(0, sel).to(torch.float16)
+            gw = _xpu_dequant_rep(self.gate_reps[e])       # [N, K]
+            uw = _xpu_dequant_rep(self.up_reps[e])
+            gate = x_e @ gw.t()
+            up = x_e @ uw.t()
+            h = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.float16)
+            dw = _xpu_dequant_rep(self.down_reps[e])       # [hidden, N]
+            d = h @ dw.t()
+            out.index_add_(0, sel, (sw.unsqueeze(-1) * d).to(out.dtype))
+        return StandardCombineInput(hidden_states=out.reshape_as(x))
 
 
 class GGUFEmbeddingMethod(GGUFLinearMethod):
