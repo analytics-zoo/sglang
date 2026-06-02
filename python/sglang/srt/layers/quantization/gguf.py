@@ -83,6 +83,16 @@ elif _is_xpu:
     except ImportError:
         esimd_gemv_q5_k = None
         esimd_gemv_q6_k = None
+    try:
+        from custom_esimd_kernels_vllm import (
+            esimd_moe_up_q4k,
+            esimd_moe_down_q5k,
+            esimd_moe_down_q6k,
+        )
+    except ImportError:
+        esimd_moe_up_q4k = None
+        esimd_moe_down_q5k = None
+        esimd_moe_down_q6k = None
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -1356,21 +1366,41 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         w13_type = int(layer.w13_qweight_type.weight_type)
         w2_type = int(layer.w2_qweight_type.weight_type)
         E = w13.shape[0]
-        # w13 row dim = gate rows (N) followed by up rows (N); split at half.
-        n13 = w13.shape[1]
-        half = n13 // 2
-        # Per-expert repack -> resident k-quant reps. gate and up share dtype, so
-        # repack each [N, K_bytes] slice via _xpu_prepare_shard.
-        self.gate_reps, self.up_reps, self.down_reps = [], [], []
+        half = w13.shape[1] // 2           # gate rows | up rows
+        # Per-expert repack to packed k-quant reps, then STACK into [E, ...]
+        # contiguous buffers for the fused MoE kernels (one launch over all
+        # routed pairs, vs the old per-expert Python GEMV loop). Q4_K gate/up;
+        # Q5_K/Q6_K down. Both packed -> zero extra resident memory.
+        self._w13_type, self._w2_type = w13_type, w2_type
+        assert w13_type == _Q4_K_TYPE, (
+            f"GGUFMoEXPUMethod fused path expects Q4_K gate/up, got {w13_type}")
+        assert w2_type in (_Q5_K_TYPE, _Q6_K_TYPE), (
+            f"GGUFMoEXPUMethod fused path expects Q5_K/Q6_K down, got {w2_type}")
+        gq, gs, gm, uq, us, um = [], [], [], [], [], []
+        dq, dh, ds, dm = [], [], [], []
+        self._down_is_q6 = (w2_type == _Q6_K_TYPE)
         for e in range(E):
-            g = w13[e, :half, :].contiguous()
-            u = w13[e, half:, :].contiguous()
-            d = w2[e].contiguous()
-            self.gate_reps.append(_xpu_prepare_shard(g, w13_type, self.params_dtype))
-            self.up_reps.append(_xpu_prepare_shard(u, w13_type, self.params_dtype))
-            self.down_reps.append(_xpu_prepare_shard(d, w2_type, self.params_dtype))
+            ql, sc, mn = _xpu_repack_q4_k(w13[e, :half, :].contiguous())
+            gq.append(ql); gs.append(sc); gm.append(mn)
+            ql, sc, mn = _xpu_repack_q4_k(w13[e, half:, :].contiguous())
+            uq.append(ql); us.append(sc); um.append(mn)
+            if self._down_is_q6:
+                ql, qh, sc = _xpu_repack_q6_k(w2[e].contiguous())
+                dq.append(ql); dh.append(qh); ds.append(sc)
+            else:
+                ql, qh, sc, mn = _xpu_repack_q5_k(w2[e].contiguous())
+                dq.append(ql); dh.append(qh); ds.append(sc); dm.append(mn)
+        dev = w13.device
+        self.gate_ql = torch.stack(gq).contiguous(); self.gate_sc = torch.stack(gs).contiguous(); self.gate_mn = torch.stack(gm).contiguous()
+        self.up_ql = torch.stack(uq).contiguous(); self.up_sc = torch.stack(us).contiguous(); self.up_mn = torch.stack(um).contiguous()
+        self.down_ql = torch.stack(dq).contiguous(); self.down_qh = torch.stack(dh).contiguous(); self.down_sc = torch.stack(ds).contiguous()
+        self.down_mn = (torch.stack(dm).contiguous() if not self._down_is_q6
+                        else torch.zeros(1, dtype=torch.float16, device=dev))
+        # dims: w13 gate rows = intermediate; hidden from gate K (=ql cols*2).
+        self.intermediate = half
+        self.hidden = self.gate_ql.shape[2] * 2
+        self.E = E
         layer._xpu_moe_ready = True
-        # free the raw GGUF bytes
         del layer.w13_qweight
         del layer.w2_qweight
 
@@ -1388,42 +1418,28 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         if M == 0:
             return StandardCombineInput(hidden_states=out.reshape_as(x))
         top_k = topk_ids.shape[1]
+        hidden, inter = self.hidden, self.intermediate
+        n_routed = M * top_k
+        xf = x2.to(torch.float16).contiguous()
+        sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
+        tw = topk_weights.reshape(-1).to(torch.float16).contiguous()
 
-        if M == 1:
-            # Decode: per-expert ESIMD GEMV over the top_k routed experts.
-            xf = x2.to(torch.float16).contiguous()
-            ids = topk_ids[0].tolist()
-            ws = topk_weights[0].to(torch.float16)
-            acc = torch.zeros(1, x2.shape[-1], dtype=torch.float16, device=x2.device)
-            for j in range(top_k):
-                e = int(ids[j])
-                gate = _xpu_rep_gemv(xf, self.gate_reps[e])
-                up = _xpu_rep_gemv(xf, self.up_reps[e])
-                h = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.float16)
-                d = _xpu_rep_gemv(h.contiguous(), self.down_reps[e])
-                acc += ws[j] * d
-            out[0] = acc.to(out.dtype)
-            return StandardCombineInput(hidden_states=out.reshape_as(x))
-
-        # Prefill (M>1): group tokens by expert, dequant once per expert + matmul.
-        flat_ids = topk_ids.reshape(-1)
-        flat_w = topk_weights.reshape(-1).to(x2.dtype)
-        tok_idx = (torch.arange(M, device=x2.device).unsqueeze(1)
-                   .expand(-1, top_k).reshape(-1))
-        for e in torch.unique(flat_ids).tolist():
-            e = int(e)
-            mask = flat_ids == e
-            sel = tok_idx[mask]
-            sw = flat_w[mask]
-            x_e = x2.index_select(0, sel).to(torch.float16)
-            gw = _xpu_dequant_rep(self.gate_reps[e])       # [N, K]
-            uw = _xpu_dequant_rep(self.up_reps[e])
-            gate = x_e @ gw.t()
-            up = x_e @ uw.t()
-            h = (torch.nn.functional.silu(gate.float()) * up.float()).to(torch.float16)
-            dw = _xpu_dequant_rep(self.down_reps[e])       # [hidden, N]
-            d = h @ dw.t()
-            out.index_add_(0, sel, (sw.unsqueeze(-1) * d).to(out.dtype))
+        # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
+        # weighted) over ALL routed pairs, then sum the top_k partials. Replaces
+        # the old top_k*3-GEMV-per-token Python loop (launch-bound at decode).
+        inter_buf = torch.empty(n_routed, inter, dtype=torch.float16, device=x2.device)
+        esimd_moe_up_q4k(xf, self.gate_ql, self.gate_sc, self.gate_mn,
+                         self.up_ql, self.up_sc, self.up_mn, sel, inter_buf,
+                         M, hidden, inter, top_k)
+        out_partial = torch.empty(n_routed, hidden, dtype=torch.float16, device=x2.device)
+        if self._down_is_q6:
+            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+                               sel, tw, out_partial, M, hidden, inter, top_k)
+        else:
+            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+                               self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
+        # sum the top_k per-route partials back to per-token output (one op).
+        out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
         return StandardCombineInput(hidden_states=out.reshape_as(x))
 
 
