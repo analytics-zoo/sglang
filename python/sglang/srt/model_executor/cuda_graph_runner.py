@@ -105,11 +105,18 @@ def _xpu_patch_cuda_graph_apis() -> None:
     torch.cuda.CUDAGraph = torch.xpu.XPUGraph  # type: ignore[assignment]
 
     class _XpuGraphCtx:
-        """Mimic torch.cuda.graph signature but forward to torch.xpu.graph."""
+        """Mimic torch.cuda.graph signature but forward to torch.xpu.graph.
 
-        def __init__(self, cuda_graph, pool=None, stream=None, capture_error_mode="global"):
+        Accepts the graph as the first positional arg, as cuda_graph=
+        (CUDA-style callers), or as xpu_graph= (the XPU branch in
+        capture_one_batch_size passes the latter).
+        """
+
+        def __init__(self, cuda_graph=None, pool=None, stream=None,
+                     capture_error_mode="global", xpu_graph=None):
             # capture_error_mode is a CUDA-only arg; ignore on XPU.
-            self._ctx = torch.xpu.graph(xpu_graph=cuda_graph, pool=pool, stream=stream)
+            graph = cuda_graph if cuda_graph is not None else xpu_graph
+            self._ctx = torch.xpu.graph(xpu_graph=graph, pool=pool, stream=stream)
 
         def __enter__(self):
             return self._ctx.__enter__()

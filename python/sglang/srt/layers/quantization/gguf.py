@@ -60,8 +60,8 @@ elif _is_musa:
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
 elif _is_xpu:
-    # XPU GGUF: q4_0 linear runs on the ESIMD q4_0 GEMV/GEMM (INT4 resident,
-    # bandwidth-optimal); every other quant type (Q4_1/Q5_K/Q6_K/Q8_0/...) is
+    # XPU GGUF: q4_0 + q8_0 linear run on ESIMD GEMV (quant resident,
+    # bandwidth-optimal at decode); remaining types (Q4_1/Q5_K/Q6_K/...) are
     # CPU-dequantized once to fp16 at load via the gguf lib and kept resident.
     from gguf import dequantize as gguf_dequantize
 
@@ -70,6 +70,19 @@ elif _is_xpu:
     except ImportError:
         esimd_gemv_q4_0 = None
         esimd_gemm_q4_0 = None
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_q8_0
+    except ImportError:
+        esimd_gemv_q8_0 = None
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_q4_k
+    except ImportError:
+        esimd_gemv_q4_k = None
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_q5_k, esimd_gemv_q6_k
+    except ImportError:
+        esimd_gemv_q5_k = None
+        esimd_gemv_q6_k = None
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -613,14 +626,291 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         return out
 
 
-# GGML q4_0 enum value (avoid importing the enum at call sites).
+# GGML quant enum values (avoid importing the enum at call sites).
 _Q4_0_TYPE = int(WeightType.Q4_0)
+_Q8_0_TYPE = int(WeightType.Q8_0)
+_Q4_K_TYPE = int(WeightType.Q4_K)
+
+_Q4_K_SB = 256          # q4_K super-block elements
+_Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
+
+
+def _xpu_repack_q4_k(qweight: torch.Tensor):
+    """GGUF q4_K super-blocks -> ESIMD interleaved (ql [N,K/2] u8, scale + min
+    [N,K/32] f16, pre-computed from the 6-bit sub-fields). Same interleaved
+    nibble layout as q4_0 so the GEMV deinterleave is identical.
+
+    GGML block_q4_K = {half2 dm(dall,dmin); u8 scales[12]; u8 qs[128]}, 8
+    sub-blocks of 32. get_scale_min_k4 unpacks the 6-bit sub-scale/min; scale =
+    dall*sc6, min = dmin*mn6 (skill Stage 1, zero extra memory). dequant on GPU:
+    w = scale*nibble - min. Validated vs gguf-lib (q4_k_repack_ref.py, ~2.5e-4).
+    """
+    N = qweight.shape[0]
+    nsb = qweight.shape[1] // _Q4_K_BYTES
+    buf = qweight.reshape(N, nsb, _Q4_K_BYTES)
+    dm = buf[:, :, 0:4].contiguous().view(torch.float16).view(N, nsb, 2)
+    dall = dm[:, :, 0].float()                       # [N, nsb]
+    dmin = dm[:, :, 1].float()
+    sc12 = buf[:, :, 4:16].to(torch.int32)           # [N, nsb, 12]
+    qs = buf[:, :, 16:144]                           # [N, nsb, 128] uint8
+
+    # get_scale_min_k4 vectorized over j=0..7
+    sc6 = torch.empty(N, nsb, 8, dtype=torch.int32, device=qweight.device)
+    mn6 = torch.empty_like(sc6)
+    for j in range(8):
+        if j < 4:
+            sc6[:, :, j] = sc12[:, :, j] & 63
+            mn6[:, :, j] = sc12[:, :, j + 4] & 63
+        else:
+            sc6[:, :, j] = (sc12[:, :, j + 4] & 0xF) | ((sc12[:, :, j - 4] >> 6) << 4)
+            mn6[:, :, j] = (sc12[:, :, j + 4] >> 4) | ((sc12[:, :, j] >> 6) << 4)
+    scale = (dall[:, :, None] * sc6.float()).to(torch.float16)   # [N,nsb,8]
+    minv = (dmin[:, :, None] * mn6.float()).to(torch.float16)
+
+    # element-order nibbles: group il (0..3): elem 64il+p (p<32) = qs[32il+p]&0xF,
+    # +32 = >>4. Then interleave into ql[N,K/2].
+    K = nsb * _Q4_K_SB
+    nib = torch.empty(N, nsb, _Q4_K_SB, dtype=torch.uint8, device=qweight.device)
+    for il in range(4):
+        qg = qs[:, :, 32 * il:32 * il + 32]
+        nib[:, :, 64 * il:64 * il + 32] = qg & 0x0F
+        nib[:, :, 64 * il + 32:64 * il + 64] = qg >> 4
+    nib = nib.view(N, K)
+    even = nib[:, 0::2]
+    odd = nib[:, 1::2]
+    ql = (even | (odd << 4)).to(torch.uint8)
+    return (ql.contiguous(),
+            scale.view(N, K // 32).contiguous(),
+            minv.view(N, K // 32).contiguous())
+
+
+def _xpu_dequant_q4_k(ql: torch.Tensor, scale: torch.Tensor, minv: torch.Tensor,
+                      out_dtype: torch.dtype) -> torch.Tensor:
+    """Dequant the interleaved q4_K rep -> dense [N, K]. w = scale*nibble - min."""
+    N, half = ql.shape
+    K = half * 2
+    nb = scale.shape[1]
+    even = (ql & 0x0F).to(torch.int16)
+    odd = ((ql >> 4) & 0x0F).to(torch.int16)
+    nib = torch.stack([even, odd], dim=2).view(N, K).to(out_dtype)
+    w = (nib.view(N, nb, 32) * scale.to(out_dtype).unsqueeze(-1)
+         - minv.to(out_dtype).unsqueeze(-1))
+    return w.view(N, K).contiguous()
+
+
+_Q5_K_TYPE = int(WeightType.Q5_K)
+_Q6_K_TYPE = int(WeightType.Q6_K)
+_Q5_K_BYTES = 2 + 2 + 12 + 32 + 128   # dm + scales[12] + qh[32] + qs[128] = 176
+_Q6_K_BYTES = 128 + 64 + 16 + 2       # ql[128] + qh[64] + scales[16] + d = 210
+
+
+_Q5Q6_VL = 512  # K-tile matching the ESIMD kernel + host pre-shuffle chunk
+
+
+def _q5q6_col_perm_elems(t, perm):
+    """Permute the K (last) dim of an element-order tensor [N,K] from GGUF
+    [ratio,num_k] value-head order to HF [num_k,ratio], head_v_dim-granular."""
+    ratio, nk, hvd = perm
+    N, K = t.shape
+    return t.reshape(N, ratio, nk, hvd).transpose(1, 2).reshape(N, K).contiguous()
+
+
+def _pack_nibble_interleaved(u_elem):
+    """element-order low-nibble [N,K] (0..15) -> packed [N,K/2] (low->2j, high->2j+1)."""
+    even = u_elem[:, 0::2] & 0x0F
+    odd = u_elem[:, 1::2] & 0x0F
+    return ((even | (odd << 4)).to(torch.uint8)).contiguous()
+
+
+def _preshuffle_qh1(high, K):
+    """1-bit high [N,K] (0/1) -> pre-shuffled qh [N,K/8]. Per 512-tile: bit b of
+    shuffled byte t holds element b*64+t (so the GPU stride-1 add works)."""
+    N = high.shape[0]
+    VL, VL8 = _Q5Q6_VL, _Q5Q6_VL // 8       # 512, 64
+    ntile = K // VL
+    h = high.to(torch.int32).view(N, ntile, 8, VL8)   # [N,tile,b,t] = elem tile*512+b*64+t
+    byte = torch.zeros(N, ntile, VL8, dtype=torch.int32, device=high.device)
+    for b in range(8):
+        byte |= (h[:, :, b, :] & 1) << b
+    return byte.to(torch.uint8).view(N, K // 8).contiguous()
+
+
+def _preshuffle_qh2(high, K):
+    """2-bit high [N,K] (0..3) -> pre-shuffled qh [N,K/4]. Per 512-tile: field p
+    of shuffled byte t holds element p*128+t."""
+    N = high.shape[0]
+    VL, VLQ = _Q5Q6_VL, _Q5Q6_VL // 4       # 512, 128
+    ntile = K // VL
+    h = high.to(torch.int32).view(N, ntile, 4, VLQ)   # [N,tile,p,t] = elem tile*512+p*128+t
+    byte = torch.zeros(N, ntile, VLQ, dtype=torch.int32, device=high.device)
+    for p in range(4):
+        byte |= (h[:, :, p, :] & 3) << (2 * p)
+    return byte.to(torch.uint8).view(N, K // 4).contiguous()
+
+
+def _xpu_q5_k_elem(qweight):
+    """GGUF q5_K -> element-order val5 [N,K] (0..31) + scale,min [N,K/32] f16."""
+    N = qweight.shape[0]
+    nsb = qweight.shape[1] // _Q5_K_BYTES
+    buf = qweight.reshape(N, nsb, _Q5_K_BYTES)
+    dm = buf[:, :, 0:4].contiguous().view(torch.float16).view(N, nsb, 2)
+    dall = dm[:, :, 0].float(); dmin = dm[:, :, 1].float()
+    sc12 = buf[:, :, 4:16].to(torch.int32)
+    qh = buf[:, :, 16:48].to(torch.int32)
+    qs = buf[:, :, 48:176].to(torch.int32)
+    sc6 = torch.empty(N, nsb, 8, dtype=torch.int32, device=qweight.device)
+    mn6 = torch.empty_like(sc6)
+    for j in range(8):
+        if j < 4:
+            sc6[:, :, j] = sc12[:, :, j] & 63
+            mn6[:, :, j] = sc12[:, :, j + 4] & 63
+        else:
+            sc6[:, :, j] = (sc12[:, :, j + 4] & 0xF) | ((sc12[:, :, j - 4] >> 6) << 4)
+            mn6[:, :, j] = (sc12[:, :, j + 4] >> 4) | ((sc12[:, :, j] >> 6) << 4)
+    scale = (dall[:, :, None] * sc6.float()).to(torch.float16)
+    minv = (dmin[:, :, None] * mn6.float()).to(torch.float16)
+    K = nsb * _Q4_K_SB
+    u5 = torch.empty(N, nsb, _Q4_K_SB, dtype=torch.int32, device=qweight.device)
+    for il in range(4):
+        hm0 = 1 << (2 * il); hm1 = hm0 << 1
+        ql0 = qs[:, :, 32 * il + 0:32 * il + 32:2]
+        ql1 = qs[:, :, 32 * il + 1:32 * il + 32:2]
+        h0 = qh[:, :, 0:32:2]; h1 = qh[:, :, 1:32:2]
+        u5[:, :, 64 * il + 0:64 * il + 32:2] = (ql0 & 0xF) + ((h0 & hm0) > 0).to(torch.int32) * 16
+        u5[:, :, 64 * il + 1:64 * il + 32:2] = (ql1 & 0xF) + ((h1 & hm0) > 0).to(torch.int32) * 16
+        u5[:, :, 64 * il + 32:64 * il + 64:2] = (ql0 >> 4) + ((h0 & hm1) > 0).to(torch.int32) * 16
+        u5[:, :, 64 * il + 33:64 * il + 64:2] = (ql1 >> 4) + ((h1 & hm1) > 0).to(torch.int32) * 16
+    return u5.view(N, K), scale.view(N, K // 32), minv.view(N, K // 32)
+
+
+def _xpu_repack_q5_k(qweight: torch.Tensor, col_perm=None):
+    """GGUF q5_K -> PACKED (ql [N,K/2] nibble + pre-shuffled qh [N,K/8] + scale,
+    min [N,K/32] f16). Zero extra memory. Optional col_perm (GDN out_proj) applied
+    in element order before packing. Validated vs gguf-lib (q5q6_packed_repack_ref.py)."""
+    u5, scale, minv = _xpu_q5_k_elem(qweight)
+    N, K = u5.shape
+    if col_perm is not None:
+        u5 = _q5q6_col_perm_elems(u5, col_perm)
+        g = col_perm[2] // 32
+        scale = _q5q6_col_perm_elems(scale, (col_perm[0], col_perm[1], g))
+        minv = _q5q6_col_perm_elems(minv, (col_perm[0], col_perm[1], g))
+    ql = _pack_nibble_interleaved(u5)
+    qh = _preshuffle_qh1((u5 >> 4) & 1, K)
+    return ql, qh, scale.contiguous(), minv.contiguous()
+
+
+def _xpu_dequant_q5_k(ql, qh, scale, minv, out_dtype):
+    """Dequant packed q5_K -> dense [N,K] (for prefill M>1). Mirrors the kernel."""
+    N = ql.shape[0]; K = ql.shape[1] * 2
+    even = (ql & 0x0F).to(torch.int16); odd = ((ql >> 4) & 0x0F).to(torch.int16)
+    v = torch.stack([even, odd], dim=2).view(N, K).to(torch.int32)
+    # add 5th bit by inverting the pre-shuffle: shuffled byte t bit b -> elem b*64+t
+    VL, VL8 = _Q5Q6_VL, _Q5Q6_VL // 8
+    ntile = K // VL
+    qhb = qh.to(torch.int32).view(N, ntile, VL8)
+    high = torch.zeros(N, ntile, 8, VL8, dtype=torch.int32, device=ql.device)
+    for b in range(8):
+        high[:, :, b, :] = (qhb >> b) & 1
+    v = v.view(N, ntile, VL) + (high.view(N, ntile, VL) << 4)
+    v = v.view(N, K)
+    nb = scale.shape[1]
+    w = (v.to(out_dtype).view(N, nb, 32) * scale.to(out_dtype).unsqueeze(-1)
+         - minv.to(out_dtype).unsqueeze(-1))
+    return w.view(N, K).contiguous()
+
+
+def _xpu_q6_k_elem(qweight):
+    """GGUF q6_K -> element-order val6 [N,K] (0..63) + scale [N,K/16] f16 (sym)."""
+    N = qweight.shape[0]
+    nsb = qweight.shape[1] // _Q6_K_BYTES
+    buf = qweight.reshape(N, nsb, _Q6_K_BYTES)
+    ql = buf[:, :, 0:128].to(torch.int32)
+    qh = buf[:, :, 128:192].to(torch.int32)
+    sc = buf[:, :, 192:208].contiguous().view(torch.int8).float()
+    d = buf[:, :, 208:210].contiguous().view(torch.float16).view(N, nsb).float()
+    K = nsb * _Q4_K_SB
+    u6 = torch.empty(N, nsb, _Q4_K_SB, dtype=torch.int32, device=qweight.device)
+    for ip in range(2):
+        q0 = ql[:, :, 64 * ip + 0:64 * ip + 32]
+        q32 = ql[:, :, 64 * ip + 32:64 * ip + 64]
+        h = qh[:, :, 32 * ip:32 * ip + 32]
+        u6[:, :, 128 * ip + 0:128 * ip + 32] = (q0 & 0xF) | (((h >> 0) & 3) << 4)
+        u6[:, :, 128 * ip + 32:128 * ip + 64] = (q32 & 0xF) | (((h >> 2) & 3) << 4)
+        u6[:, :, 128 * ip + 64:128 * ip + 96] = (q0 >> 4) | (((h >> 4) & 3) << 4)
+        u6[:, :, 128 * ip + 96:128 * ip + 128] = (q32 >> 4) | (((h >> 6) & 3) << 4)
+    scale16 = (d[:, :, None] * sc).to(torch.float16)
+    return u6.view(N, K), scale16.view(N, K // 16)
+
+
+def _xpu_repack_q6_k(qweight: torch.Tensor, col_perm=None):
+    """GGUF q6_K -> PACKED (ql [N,K/2] nibble + pre-shuffled qh [N,K/4] + scale
+    [N,K/16] f16, symmetric). Zero extra memory. Optional col_perm in elem order."""
+    u6, scale = _xpu_q6_k_elem(qweight)
+    N, K = u6.shape
+    if col_perm is not None:
+        u6 = _q5q6_col_perm_elems(u6, col_perm)
+        g = col_perm[2] // 16
+        scale = _q5q6_col_perm_elems(scale, (col_perm[0], col_perm[1], g))
+    ql = _pack_nibble_interleaved(u6)
+    qh = _preshuffle_qh2((u6 >> 4) & 3, K)
+    return ql, qh, scale.contiguous()
+
+
+def _xpu_dequant_q6_k(ql, qh, scale16, out_dtype):
+    """Dequant packed q6_K -> dense [N,K] (prefill M>1). Symmetric w=scale*(v6-32)."""
+    N = ql.shape[0]; K = ql.shape[1] * 2
+    even = (ql & 0x0F).to(torch.int16); odd = ((ql >> 4) & 0x0F).to(torch.int16)
+    v = torch.stack([even, odd], dim=2).view(N, K).to(torch.int32)
+    VL, VLQ = _Q5Q6_VL, _Q5Q6_VL // 4
+    ntile = K // VL
+    qhb = qh.to(torch.int32).view(N, ntile, VLQ)
+    high = torch.zeros(N, ntile, 4, VLQ, dtype=torch.int32, device=ql.device)
+    for p in range(4):
+        high[:, :, p, :] = (qhb >> (2 * p)) & 3
+    v = v.view(N, ntile, VL) + (high.view(N, ntile, VL) << 4)
+    v = v.view(N, K)
+    nb = scale16.shape[1]
+    w = (v.to(out_dtype).view(N, nb, 16) - 32) * scale16.to(out_dtype).unsqueeze(-1)
+    return w.view(N, K).contiguous()
+
+
+_Q8_0_BLOCK_BYTES = 34  # GGML q8_0: {fp16 d; int8 qs[32]} per 32 elements
+
+
+def _xpu_repack_q8_0(qweight: torch.Tensor):
+    """GGUF q8_0 raw blocks -> ESIMD split buffer (qs [N,K] int8, scale [N,K/32] f16).
+
+    qweight in: [N, blocks*34] uint8 (per-output-row, K/32 contiguous 34-byte
+    q8_0 blocks: {fp16 d; int8 qs[32]}). GGML q8_0 is symmetric: w = d * qs,
+    qs signed int8, no min. Bit-exact repack (validated in
+    cc_workspace/tools/q8_0_repack_ref.py vs gguf-lib).
+    """
+    N = qweight.shape[0]
+    blocks = qweight.shape[1] // _Q8_0_BLOCK_BYTES
+    buf = qweight.reshape(N, blocks, _Q8_0_BLOCK_BYTES)
+    scale = buf[:, :, 0:2].contiguous().view(torch.float16).view(N, blocks)
+    qs = buf[:, :, 2:34].contiguous().view(torch.int8).view(N, blocks * 32)  # [N,K]
+    return qs.contiguous(), scale.contiguous()
+
+
+def _xpu_dequant_q8_0(qs: torch.Tensor, scale: torch.Tensor,
+                      out_dtype: torch.dtype) -> torch.Tensor:
+    """Dequant the q8_0 split rep -> dense [N, K]. w = scale[k/32] * qs."""
+    N, K = qs.shape
+    blocks = scale.shape[1]
+    vals = qs.to(out_dtype).view(N, blocks, -1) * scale.to(out_dtype).unsqueeze(-1)
+    return vals.view(N, K).contiguous()
 
 
 def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
-                       params_dtype: torch.dtype):
+                       params_dtype: torch.dtype, col_perm=None):
     """Return a resident per-shard rep: q4_0 -> ('q4_0', packed_u8, scale_f16),
-    other quant -> ('fp16', dense_w[N,K], None), unquantized -> ('fp16', w, None).
+    q5_k/q6_k -> packed (ql, qh, scale[, min]), other quant -> ('fp16', dense),
+    unquantized -> ('fp16', w, None).
+
+    col_perm (GDN out_proj value-head reorder) is applied INSIDE the quant repack
+    in element order before packing (so it never splits a packed block); for the
+    fp16 rep it is applied by _xpu_permute_gdn_out_cols at the call site.
     """
     # Debug switch: force q4_0 through the CPU gguf-lib dequant -> fp16 dense
     # path (bypassing the ESIMD kernels) to isolate kernel numerics from the
@@ -629,9 +919,29 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
     if qweight_type == _Q4_0_TYPE and esimd_gemv_q4_0 is not None and not _force_dq:
         packed, scale = _xpu_repack_q4_0(qweight)
         return ("q4_0", packed, scale)
+    if qweight_type == _Q8_0_TYPE and esimd_gemv_q8_0 is not None and not _force_dq:
+        qs, scale = _xpu_repack_q8_0(qweight)
+        return ("q8_0", qs, scale)
+    if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
+        ql, scale, minv = _xpu_repack_q4_k(qweight)
+        return ("q4_k", ql, scale, minv)
+    _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
+    _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
+    if (qweight_type == _Q5_K_TYPE and esimd_gemv_q5_k is not None
+            and not _force_dq and not _no_q5):
+        ql, qh, scale, minv = _xpu_repack_q5_k(qweight, col_perm=col_perm)
+        return ("q5_k", ql, qh, scale, minv)
+    if (qweight_type == _Q6_K_TYPE and esimd_gemv_q6_k is not None
+            and not _force_dq and not _no_q6):
+        ql, qh, scale = _xpu_repack_q6_k(qweight, col_perm=col_perm)
+        return ("q6_k", ql, qh, scale)
     if qweight_type in UNQUANTIZED_TYPES:
-        return ("fp16", qweight.to(params_dtype), None)
-    return ("fp16", _xpu_dequant_to_fp16(qweight, qweight_type, params_dtype), None)
+        rep = ("fp16", qweight.to(params_dtype), None)
+    else:
+        rep = ("fp16", _xpu_dequant_to_fp16(qweight, qweight_type, params_dtype), None)
+    if col_perm is not None:
+        rep = _xpu_permute_gdn_out_cols(rep, col_perm)
+    return rep
 
 
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
@@ -653,9 +963,85 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         # to fp16 once and use a single dense matmul instead.
         w = _xpu_dequant_q4_0_packed(packed, scale, torch.float16)  # [N, K]
         return xf @ w.t()
+    if kind == "q8_0":
+        _, qs, scale = rep
+        N = qs.shape[0]
+        M = x.shape[0]
+        xf = x.to(torch.float16).contiguous()
+        if M == 1:
+            # Decode: ESIMD q8_0 GEMV (int8 resident, bandwidth-optimal).
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+            esimd_gemv_q8_0(xf, qs, scale, out)
+            return out
+        # Prefill (M>1): dequant int8 -> fp16 once + dense matmul.
+        w = _xpu_dequant_q8_0(qs, scale, torch.float16)  # [N, K]
+        return xf @ w.t()
+    if kind == "q4_k":
+        _, ql, scale, minv = rep
+        N = ql.shape[0]
+        M = x.shape[0]
+        xf = x.to(torch.float16).contiguous()
+        if M == 1:
+            # Decode: ESIMD q4_K GEMV (4.5-bit resident, asymmetric scale+min).
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+            esimd_gemv_q4_k(xf, ql, scale, minv, out)
+            return out
+        # Prefill (M>1): dequant 4-bit -> fp16 once + dense matmul.
+        w = _xpu_dequant_q4_k(ql, scale, minv, torch.float16)  # [N, K]
+        return xf @ w.t()
+    if kind == "q5_k":
+        _, ql, qh, scale, minv = rep
+        N = ql.shape[0]
+        M = x.shape[0]
+        xf = x.to(torch.float16).contiguous()
+        if M == 1:
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+            esimd_gemv_q5_k(xf, ql, qh, scale, minv, out)
+            return out
+        w = _xpu_dequant_q5_k(ql, qh, scale, minv, torch.float16)  # [N, K]
+        return xf @ w.t()
+    if kind == "q6_k":
+        _, ql, qh, scale = rep
+        N = ql.shape[0]
+        M = x.shape[0]
+        xf = x.to(torch.float16).contiguous()
+        if M == 1:
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+            esimd_gemv_q6_k(xf, ql, qh, scale, out)
+            return out
+        w = _xpu_dequant_q6_k(ql, qh, scale, torch.float16)  # [N, K]
+        return xf @ w.t()
     # fp16-resident dense weight [N, K]
     _, w, _ = rep
     return x.to(w.dtype) @ w.t()
+
+
+def _xpu_permute_gdn_out_cols(rep, perm):
+    """Permute the K (input/value-head) columns of a GDN out_proj rep from GGUF
+    [ratio, num_k] order to HF [num_k, ratio], head_v_dim-granular.
+
+    Applies to whatever resident rep _xpu_prepare_shard produced. The permute
+    moves contiguous head_v_dim-element column blocks, so for the quant reps the
+    per-group scale/min tensors are permuted at head_v_dim//group granularity.
+    Requires head_v_dim % group == 0 (asserted) so a block is never split.
+    """
+    ratio, nk, hvd = perm
+
+    def _perm_last(t, blk):
+        # t [N, C], reorder C in blocks of `blk` as [ratio,nk]->[nk,ratio]
+        N, C = t.shape
+        assert C == ratio * nk * blk, (
+            f"GDN col-perm shape mismatch: C={C} != {ratio}*{nk}*{blk}")
+        return t.reshape(N, ratio, nk, blk).transpose(1, 2).reshape(N, C).contiguous()
+
+    kind = rep[0]
+    if kind == "fp16":
+        return ("fp16", _perm_last(rep[1], hvd), None)
+    # Quant reps (q5_k/q6_k/...) apply col_perm INSIDE _xpu_repack_* in element
+    # order before packing, so a quant rep must never reach here.
+    raise NotImplementedError(
+        f"GDN out_proj col-perm reached for non-fp16 rep '{kind}'; quant col-perm "
+        f"is done in _xpu_repack_* (pass col_perm to _xpu_prepare_shard instead).")
 
 
 class GGUFLinearXPUMethod(GGUFLinearMethod):
@@ -697,25 +1083,15 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 reps[idx] = _xpu_prepare_shard(w, stype, self.params_dtype)
             layer._xpu_shard_order = ids
         else:
-            rep = _xpu_prepare_shard(
-                qweight.data, qweight_type, self.params_dtype
-            )
             # GDN out_proj: permute the input (value-head) columns from GGUF
-            # [ratio, num_k] order to HF [num_k, ratio]. Done here post-dequant
-            # because a column permute would break quant blocks on raw bytes.
-            # out_proj is Q5_K -> always the fp16-dense rep, so this is safe.
+            # [ratio, num_k] order to HF [num_k, ratio]. For quant reps this is
+            # applied inside _xpu_repack_* in element order before packing (so it
+            # never splits a packed block); for fp16 it is applied post-dequant.
+            # The permute is head_v_dim-granular along K (the input dim).
             perm = getattr(layer, "_gguf_gdn_col_perm", None)
-            if perm is not None and rep[0] == "fp16":
-                ratio, nk, head_v_dim = perm
-                w = rep[1]  # [hidden, vdim]
-                hid, vdim = w.shape
-                w = (
-                    w.reshape(hid, ratio, nk, head_v_dim)
-                    .transpose(1, 2)
-                    .reshape(hid, vdim)
-                    .contiguous()
-                )
-                rep = ("fp16", w, None)
+            rep = _xpu_prepare_shard(
+                qweight.data, qweight_type, self.params_dtype, col_perm=perm
+            )
             reps["_single"] = rep
             layer._xpu_shard_order = ["_single"]
         layer._xpu_reps = reps
