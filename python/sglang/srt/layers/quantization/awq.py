@@ -80,7 +80,13 @@ elif _is_hip:
     )
 
 elif _is_xpu:
-    from sgl_kernel import awq_dequantize
+    # awq_dequantize comes from sgl-kernel-xpu. Make it optional so the
+    # quantization package (and other methods like GGUF) can import even
+    # when sgl_kernel is absent — AWQ apply will only fail if actually used.
+    try:
+        from sgl_kernel import awq_dequantize
+    except ImportError:
+        awq_dequantize = None
 
     try:
         from awq_fused_xpu import awq_gemv_fused as _awq_gemv_fused_xpu

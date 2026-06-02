@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import warnings
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -58,6 +59,17 @@ elif _is_musa:
     )
 elif _is_npu:
     from gguf import dequantize as gguf_dequantize
+elif _is_xpu:
+    # XPU GGUF: q4_0 linear runs on the ESIMD q4_0 GEMV/GEMM (INT4 resident,
+    # bandwidth-optimal); every other quant type (Q4_1/Q5_K/Q6_K/Q8_0/...) is
+    # CPU-dequantized once to fp16 at load via the gguf lib and kept resident.
+    from gguf import dequantize as gguf_dequantize
+
+    try:
+        from custom_esimd_kernels_vllm import esimd_gemv_q4_0, esimd_gemm_q4_0
+    except ImportError:
+        esimd_gemv_q4_0 = None
+        esimd_gemm_q4_0 = None
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -112,10 +124,14 @@ class GGUFConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             if _is_npu:
                 return GGUFLinearAscendMethod(self)
+            if _is_xpu:
+                return GGUFLinearXPUMethod(self)
             return GGUFLinearMethod(self)
         elif isinstance(layer, VocabParallelEmbedding):
             if _is_npu:
                 return GGUFEmbeddingAscendMethod(self)
+            if _is_xpu:
+                return GGUFEmbeddingXPUMethod(self)
             return GGUFEmbeddingMethod(self)
         elif isinstance(layer, FusedMoE):
             if _is_npu:
@@ -453,6 +469,252 @@ class GGUFLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
         return out
+
+
+# =============================================================================
+# XPU (Intel PTL Xe3) GGUF: q4_0 on ESIMD kernel, everything else fp16-resident
+# =============================================================================
+_Q4_0_BLOCK_BYTES = 18  # GGML q4_0: {fp16 d; uint8 qs[16]} per 32 elements
+
+
+def _xpu_repack_q4_0(qweight: torch.Tensor):
+    """GGUF q4_0 raw blocks -> ESIMD interleaved (qweight [N,K/2] u8, scale [N,K/32] f16).
+
+    qweight in: [N, blocks*18] uint8 (per-output-row, K/32 contiguous 18-byte
+    q4_0 blocks). GGML packs split-half (byte j: low->elem j, high->elem j+16);
+    the ESIMD kernel wants interleaved (byte j: low->2j, high->2j+1). The repack
+    is a value-preserving nibble permutation (bit-exact, validated in
+    custom-esimd-kernels-vllm/tests/test_q4_0_repack.py).
+    """
+    N = qweight.shape[0]
+    blocks = qweight.shape[1] // _Q4_0_BLOCK_BYTES
+    buf = qweight.reshape(N, blocks, _Q4_0_BLOCK_BYTES)
+    scale = buf[:, :, 0:2].contiguous().view(torch.float16).view(N, blocks)
+    qs = buf[:, :, 2:18].contiguous()                 # [N, blocks, 16] uint8
+    lo = qs & 0x0F                                    # nib of elems 0..15
+    hi = (qs >> 4) & 0x0F                             # nib of elems 16..31
+    nib = torch.cat([lo, hi], dim=2)                  # [N, blocks, 32], nib[...,i]=elem i
+    even = nib[:, :, 0::2]                            # elems 0,2,...,30
+    odd = nib[:, :, 1::2]                             # elems 1,3,...,31
+    packed = (even | (odd << 4)).to(torch.uint8).view(N, blocks * 16)  # [N, K/2]
+    return packed.contiguous(), scale.contiguous()
+
+
+def _xpu_dequant_to_fp16(qweight: torch.Tensor, qweight_type: int,
+                         params_dtype: torch.dtype) -> torch.Tensor:
+    """CPU-dequantize a non-q4_0 GGUF weight to a dense [N, K] tensor on XPU."""
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    rows = qweight.shape[0]
+    cols = qweight.shape[1] // type_size * block_size
+    dq = gguf_dequantize(qweight.cpu().numpy(), qweight_type)
+    return (
+        torch.from_numpy(dq)
+        .to(dtype=params_dtype, device=qweight.device)
+        .reshape(rows, cols)
+    )
+
+
+def apply_gguf_embedding_xpu(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_type: int,
+    hidden_size: int,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Row-level GGUF embedding lookup for XPU.
+
+    Mirrors apply_gguf_embedding but uses the gguf library (CPU) instead of the
+    CUDA-only ggml_dequantize, which is not imported on XPU. Only the rows for
+    the actual token ids are dequantized, so the quantized table stays resident
+    (no full-table fp16 copy). The selected quant rows are gathered, moved to
+    CPU, dequantized by the gguf lib, then returned on the original device.
+    """
+    if qweight_type in UNQUANTIZED_TYPES:
+        return torch.embedding(qweight, x)
+    if qweight_type not in DEQUANT_TYPES:
+        raise NotImplementedError(
+            f"Unsupported GGUF embedding quant type {WeightType(qweight_type)} on XPU."
+        )
+    block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
+    assert hidden_size == qweight.shape[1] // type_size * block_size
+    x_flat = x.flatten()
+    quant = torch.index_select(qweight, dim=0, index=x_flat)
+    dq = gguf_dequantize(quant.cpu().numpy(), qweight_type)
+    dequant = (
+        torch.from_numpy(dq)
+        .to(dtype=dtype or torch.float16, device=qweight.device)
+        .reshape(x_flat.shape[0], hidden_size)
+    )
+    return dequant.view(*x.shape, hidden_size)
+
+
+class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
+    """GGUF embedding for Intel XPU (PTL Xe3).
+
+    The base GGUFEmbeddingMethod calls ggml_dequantize (a CUDA/MUSA-only sgl
+    kernel) which is absent on XPU, so embedding lookups silently break and the
+    model emits garbage. This method routes through apply_gguf_embedding_xpu
+    (gguf-lib row dequant) instead.
+    """
+
+    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        qweight = layer.qweight
+        qweight_type = layer.qweight_type.weight_type
+        hidden_size = qweight.tensor_shape[1]
+        return apply_gguf_embedding_xpu(
+            x, qweight, qweight_type, hidden_size, dtype=self.params_dtype
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute logits for a tied lm_head (lm_head IS this embedding module).
+
+        _compute_lm_head routes here because a GGUF embedding has no dense
+        .weight. The base GGUFLinearMethod.apply would call fused_mul_mat_gguf ->
+        ggml_dequantize (CUDA-only, undefined on XPU). Instead dequantize the
+        vocab table once via the gguf lib (cached on the layer) and matmul.
+        """
+        w = getattr(layer, "_xpu_lmhead_dense", None)
+        if w is None:
+            qweight = layer.qweight
+            qweight_type = layer.qweight_type.weight_type
+            if qweight_type in UNQUANTIZED_TYPES:
+                w = qweight.to(self.params_dtype)
+            else:
+                w = _xpu_dequant_to_fp16(qweight, qweight_type, self.params_dtype)
+            layer._xpu_lmhead_dense = w  # [vocab, hidden] resident dense
+        out = x.to(w.dtype) @ w.t()
+        if bias is not None:
+            out = out + bias
+        return out
+
+
+# GGML q4_0 enum value (avoid importing the enum at call sites).
+_Q4_0_TYPE = int(WeightType.Q4_0)
+
+
+def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
+                       params_dtype: torch.dtype):
+    """Return a resident per-shard rep: q4_0 -> ('q4_0', packed_u8, scale_f16),
+    other quant -> ('fp16', dense_w[N,K], None), unquantized -> ('fp16', w, None).
+    """
+    # Debug switch: force q4_0 through the CPU gguf-lib dequant -> fp16 dense
+    # path (bypassing the ESIMD kernels) to isolate kernel numerics from the
+    # rest of the GGUF integration.
+    _force_dq = os.environ.get("SGLANG_GGUF_XPU_FORCE_DEQUANT") == "1"
+    if qweight_type == _Q4_0_TYPE and esimd_gemv_q4_0 is not None and not _force_dq:
+        packed, scale = _xpu_repack_q4_0(qweight)
+        return ("q4_0", packed, scale)
+    if qweight_type in UNQUANTIZED_TYPES:
+        return ("fp16", qweight.to(params_dtype), None)
+    return ("fp16", _xpu_dequant_to_fp16(qweight, qweight_type, params_dtype), None)
+
+
+def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
+    """x [M,K] fp16 @ shard^T -> [M,N] fp16. rep from _xpu_prepare_shard."""
+    kind = rep[0]
+    if kind == "q4_0":
+        _, packed, scale = rep
+        N = packed.shape[0]
+        M = x.shape[0]
+        xf = x.to(torch.float16).contiguous()
+        out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+        if M == 1:
+            esimd_gemv_q4_0(xf, packed, scale, out)
+        else:
+            esimd_gemm_q4_0(xf, packed, scale, out)
+        return out
+    # fp16-resident dense weight [N, K]
+    _, w, _ = rep
+    return x.to(w.dtype) @ w.t()
+
+
+class GGUFLinearXPUMethod(GGUFLinearMethod):
+    """GGUF linear for Intel XPU (PTL Xe3).
+
+    Mirrors GGUFLinearMethod's create_weights / padded-weight handling, but in
+    process_weights_after_loading converts every (shard of every) weight to a
+    resident representation: q4_0 -> repacked INT4 (ESIMD kernel), other types
+    -> fp16 dense. apply then dispatches per shard with no per-call branching on
+    raw GGUF bytes.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        qweight_type = layer.qweight_type.weight_type
+        if not (qweight_type in UNQUANTIZED_TYPES or qweight_type in DEQUANT_TYPES):
+            raise ValueError(
+                f"Unsupported GGUF quantization type {WeightType(qweight_type)} on XPU."
+            )
+        self._create_padded_weight_param(layer)
+
+        qweight = layer.qweight
+        shard_id = getattr(qweight, "shard_id", None)
+        reps = {}
+        if shard_id and hasattr(qweight, "shard_offset_map"):
+            # shard_id is in checkpoint *load* (yield) order, which for GGUF is
+            # the file's tensor order — NOT the fused parameter's logical order.
+            # The fused output must be concatenated by ascending shard index
+            # (q,k,v / 0,1,2,3), else e.g. in_proj_ba comes out as [a,b] instead
+            # of [b,a] (ssm_alpha is yielded before ssm_beta) and the GDN
+            # recurrence gets a<->b swapped. Sort to the logical order here.
+            if "q" in shard_id:
+                ids = ["q", "k", "v"]
+            else:
+                ids = sorted(shard_id)
+            for idx in ids:
+                start, end, offset = qweight.shard_offset_map[idx]
+                stype = layer.qweight_type.shard_weight_type[idx]
+                w = qweight[start:end, :offset].contiguous()
+                reps[idx] = _xpu_prepare_shard(w, stype, self.params_dtype)
+            layer._xpu_shard_order = ids
+        else:
+            rep = _xpu_prepare_shard(
+                qweight.data, qweight_type, self.params_dtype
+            )
+            # GDN out_proj: permute the input (value-head) columns from GGUF
+            # [ratio, num_k] order to HF [num_k, ratio]. Done here post-dequant
+            # because a column permute would break quant blocks on raw bytes.
+            # out_proj is Q5_K -> always the fp16-dense rep, so this is safe.
+            perm = getattr(layer, "_gguf_gdn_col_perm", None)
+            if perm is not None and rep[0] == "fp16":
+                ratio, nk, head_v_dim = perm
+                w = rep[1]  # [hidden, vdim]
+                hid, vdim = w.shape
+                w = (
+                    w.reshape(hid, ratio, nk, head_v_dim)
+                    .transpose(1, 2)
+                    .reshape(hid, vdim)
+                    .contiguous()
+                )
+                rep = ("fp16", w, None)
+            reps["_single"] = rep
+            layer._xpu_shard_order = ["_single"]
+        layer._xpu_reps = reps
+        # free the raw GGUF bytes
+        if hasattr(layer, "qweight"):
+            del layer.qweight
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x2 = x.reshape(-1, x.shape[-1])
+        parts = [_xpu_shard_matmul(x2, layer._xpu_reps[idx])
+                 for idx in layer._xpu_shard_order]
+        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+        # The q4_0 ESIMD kernels are fp16-only (PTL has no bf16 ESIMD), so a
+        # bf16 network would otherwise get an fp16 tensor back here. Cast the
+        # result to the input activation dtype to keep the graph type-consistent.
+        out = out.to(x.dtype)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class GGUFMoEMethod(FusedMoEMethodBase):

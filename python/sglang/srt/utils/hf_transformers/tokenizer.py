@@ -35,6 +35,7 @@ from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
+    gguf_hf_config_redirect,
 )
 from .mistral_utils import (
     _MISTRAL_TOKENIZER_REDIRECTS,
@@ -449,6 +450,13 @@ def get_tokenizer(
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
         return TiktokenTokenizer(tokenizer_name)
+
+    # XPU/qwen35 GGUF: load the tokenizer from the sibling HF dir (transformers
+    # cannot parse the qwen35 GGUF's embedded tokenizer). Must precede
+    # _resolve_tokenizer_name, which would otherwise set gguf_file=.
+    _hf_redirect = gguf_hf_config_redirect(tokenizer_name)
+    if _hf_redirect is not None:
+        tokenizer_name = _hf_redirect
 
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):

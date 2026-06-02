@@ -149,6 +149,27 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     return header == b"GGUF"
 
 
+def gguf_hf_config_redirect(name: str) -> Optional[str]:
+    """For the XPU/qwen35 GGUF bypass, redirect a .gguf path to its sibling HF
+    checkpoint dir (config.json + tokenizer) named by SGLANG_GGUF_HF_CONFIG_DIR.
+
+    transformers 5.5.4 rejects the "qwen35" GGUF arch, so config / tokenizer /
+    processor loaders must read from the HF dir instead of handing transformers
+    a gguf_file= kwarg. Returns the HF dir when the redirect applies, else None
+    (caller keeps its normal path). Only fires for an actual .gguf input so
+    non-GGUF runs are untouched.
+    """
+    hf_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+    if not hf_dir:
+        return None
+    try:
+        if not check_gguf_file(name):
+            return None
+    except (TypeError, OSError):
+        return None
+    return hf_dir
+
+
 # ---------------------------------------------------------------------------
 # Rope / text config helpers
 # ---------------------------------------------------------------------------

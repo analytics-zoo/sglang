@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -58,9 +59,29 @@ def get_config(
 ):
     is_gguf = check_gguf_file(model)
     if is_gguf:
-        _ensure_gguf_version()
-        kwargs["gguf_file"] = model
-        model = Path(model).parent
+        # XPU/qwen35 bypass: transformers' GGUF parser (load_gguf_checkpoint)
+        # rejects arch "qwen35" ("not supported yet"). When SGLANG_GGUF_HF_CONFIG_DIR
+        # points at a sibling HF checkpoint dir (config.json + tokenizer), read the
+        # config straight from there and never hand transformers a gguf_file= kwarg.
+        # The gguf weights themselves are still loaded by GGUFModelLoader; only the
+        # *config* is sourced from HF here. See _get_gguf_weights_map for the
+        # matching name-map bypass.
+        hf_cfg_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if hf_cfg_dir:
+            logger.info(
+                "GGUF: reading HF config from SGLANG_GGUF_HF_CONFIG_DIR=%s "
+                "(bypassing transformers GGUF config parser)",
+                hf_cfg_dir,
+            )
+            model = hf_cfg_dir
+            gguf_hf_config_bypass = True
+        else:
+            _ensure_gguf_version()
+            kwargs["gguf_file"] = model
+            model = Path(model).parent
+            gguf_hf_config_bypass = False
+    else:
+        gguf_hf_config_bypass = False
 
     if is_runai_obj_uri(model):
         model = ObjectStorageModel.get_path(model)
@@ -204,9 +225,13 @@ def get_config(
     if model_override_args:
         config.update(model_override_args)
 
-    if is_gguf:
+    if is_gguf and not gguf_hf_config_bypass:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
+    # When bypassing (XPU/qwen35), keep the HF config.json architectures as-is
+    # (e.g. Qwen3_5ForConditionalGeneration) so sglang's ModelRegistry resolves
+    # it — the transformers MODEL_FOR_CAUSAL_LM mapping would rewrite it to
+    # Qwen3_5ForCausalLM, which sglang's registry does not register.
 
     return config

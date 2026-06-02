@@ -35,6 +35,7 @@ from .common import (
     attach_additional_stop_token_ids,
     download_from_hf,
     get_tokenizer_from_processor,
+    gguf_hf_config_redirect,
 )
 from .mistral_utils import (
     is_mistral_model,
@@ -144,6 +145,11 @@ def get_processor(
     **kwargs,
 ):
     revision = kwargs.pop("revision", tokenizer_revision)
+    # XPU/qwen35 GGUF: load processor + config from the sibling HF dir, since
+    # transformers can't parse the qwen35 GGUF itself.
+    _hf_redirect = gguf_hf_config_redirect(tokenizer_name)
+    if _hf_redirect is not None:
+        tokenizer_name = _hf_redirect
     if is_mistral_model(tokenizer_name):
         config = load_mistral_config(
             tokenizer_name,

@@ -253,6 +253,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+        # GGUF stores out_proj's input (value-head) columns in [ratio, num_k]
+        # order; HF expects [num_k, ratio]. This is an INPUT-dim permute that
+        # would break q-blocks if done on raw quantized bytes, so the GGUF XPU
+        # method applies it post-dequant. Tag the layer with the perm params.
+        if (
+            quant_config is not None
+            and getattr(quant_config, "get_name", lambda: "")() == "gguf"
+            and self.num_v_heads % self.num_k_heads == 0
+            and self.num_v_heads // self.num_k_heads > 1
+        ):
+            self.out_proj._gguf_gdn_col_perm = (
+                self.num_v_heads // self.num_k_heads,  # ratio
+                self.num_k_heads,
+                self.head_v_dim,
+            )
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -278,7 +293,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _bind_packed_weight_loaders(self, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        # "qweight" / "qweight_type" cover the GGUF path: its merged params are
+        # named qweight (not weight), and its native weight_loader only accepts
+        # int shard ids. The packed wrapper splits a fused checkpoint tensor
+        # (e.g. GGUF attn_qkv = q|k|v) by the tuple shard id (0,1,2) into int
+        # shards before delegating, so GGUF GDN projections load correctly.
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "qweight",
+            "qweight_type",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
@@ -324,12 +351,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
 
                 if len(loaded_weight.shape) == 0:
-                    # Scalar only makes sense for a single logical shard.
-                    assert len(split_sizes) == 1 and split_sizes[0] == 1, (
-                        f"Unexpected scalar for tuple shard load: "
-                        f"{loaded_shard_id=}, {split_sizes=}"
-                    )
-                    chunks = [loaded_weight.reshape(1)]
+                    # Scalar shard payload. Two cases:
+                    #  - single logical shard: load as-is (original behavior).
+                    #  - GGUF qweight_type: one scalar quant-type for the whole
+                    #    fused tensor, replicated to each int shard so the GGUF
+                    #    loader records the type per shard slot.
+                    if len(split_sizes) == 1 and split_sizes[0] == 1:
+                        chunks = [loaded_weight.reshape(1)]
+                    else:
+                        chunks = [loaded_weight for _ in loaded_shard_id]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
                     if _is_cpu:
@@ -1250,6 +1280,12 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.hidden_size,
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
+                # Pass quant_config so a GGUF checkpoint routes embed_tokens
+                # through the GGUF embedding method; without it the layer is
+                # Unquantized and its dense .weight is never filled by the GGUF
+                # loader (which provides qweight), yielding all-zero embeddings.
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -1714,6 +1750,89 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def _gguf_gdn_transform(
+        self, name: str, w: torch.Tensor
+    ) -> torch.Tensor:
+        """Convert a GGUF GDN linear_attn weight to HF layout.
+
+        GGUF orders the value-head dimension as [ratio, num_k_heads] whereas HF
+        expects [num_k_heads, ratio] (ratio = num_v_heads // num_k_heads), so the
+        value-head axis is re-permuted via reshape(ratio, num_k, ...).transpose.
+        GGUF also stores the SSM decay as A (= -exp(A_log)); HF stores A_log.
+
+        This runs on the GGUF tensor as delivered by the weight iterator, which
+        is RAW QUANTIZED BYTES for quantized layers (name ends in ``.qweight``,
+        shape ``[out_rows, block_bytes]``) and the real F32 values otherwise.
+        Permuting whole *rows* (dim 0) is bit-identical on quantized bytes since
+        GGUF packs each output row contiguously (verified: dequant∘rowperm ==
+        rowperm∘dequant, max diff 0). Therefore every transform here is a dim-0
+        row permutation only. ``out_proj`` needs an INPUT-dim (column) permute
+        that would break q-blocks, so it is handled post-dequant in the XPU
+        method (see GGUFLinearXPUMethod), not here. The key-head q/k slices of
+        in_proj_qkv / conv1d are NOT permuted. (notes §3.6.)
+        """
+        # The weight iterator also yields per-tensor ``qweight_type`` scalars
+        # (0-dim) for quantized layers; those carry no head layout and must pass
+        # through untouched.
+        if w.dim() == 0:
+            return w
+        tc = getattr(self.config, "text_config", self.config)
+        nk = tc.linear_num_key_heads
+        nv = tc.linear_num_value_heads
+        if nv % nk != 0:
+            return w
+        ratio = nv // nk
+        # A_log is F32 (no .qweight); GGUF stores A, HF stores log(-A).
+        if name.endswith("linear_attn.A_log"):
+            w = torch.log(-w)
+            return self._perm_value_rows(w, ratio, nk) if ratio > 1 else w
+        if ratio == 1:
+            return w  # value/key head layouts coincide; nothing else to do
+
+        if name.endswith("linear_attn.dt_bias"):
+            return self._perm_value_rows(w, ratio, nk)
+        # in_proj_a / in_proj_b: value-head rows. Match both quantized
+        # (.qweight) and unquantized (.weight) deliveries.
+        if (
+            ".linear_attn.in_proj_a." in name
+            or ".linear_attn.in_proj_b." in name
+        ):
+            return self._perm_value_rows(w, ratio, nk)
+        if ".linear_attn.in_proj_z." in name:
+            return self._perm_value_rows(w, ratio, nk)
+        # in_proj_qkv: rows are [q | k | v] output dims; only the v block (the
+        # value heads) permutes. q/k are key heads (no ratio).
+        if ".linear_attn.in_proj_qkv." in name:
+            kdim = nk * tc.linear_key_head_dim
+            vdim = nv * tc.linear_value_head_dim
+            q, k, v = torch.split(w, [kdim, kdim, vdim], dim=0)
+            return torch.cat(
+                [q, k, self._perm_value_rows(v, ratio, nk)], dim=0
+            ).contiguous()
+        # conv1d (F32): same [q | k | v] row layout on dim 0.
+        if name.endswith("linear_attn.conv1d.weight"):
+            kdim = nk * tc.linear_key_head_dim
+            vdim = nv * tc.linear_value_head_dim
+            q, k, v = torch.split(w, [kdim, kdim, vdim], dim=0)
+            return torch.cat(
+                [q, k, self._perm_value_rows(v, ratio, nk)], dim=0
+            ).contiguous()
+        return w
+
+    @staticmethod
+    def _perm_value_rows(t: torch.Tensor, ratio: int, nk: int) -> torch.Tensor:
+        """Reorder the value-head axis (dim 0) from GGUF [ratio, nk, per_head]
+        to HF [nk, ratio, per_head]. Works on real values and on raw quantized
+        bytes alike (whole-row permutation)."""
+        nv = ratio * nk
+        per_head = t.shape[0] // nv
+        return (
+            t.reshape(ratio, nk, per_head, *t.shape[1:])
+            .transpose(0, 1)
+            .reshape(t.shape)
+            .contiguous()
+        )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1729,6 +1848,23 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             ("in_proj_ba.", "in_proj_a.", 1),
         ]
 
+        # GGUF stores Gemma-style RMSNorm weights in the standard (≈1.0)
+        # convention, but Qwen3.5 uses GemmaRMSNorm which computes x*(1+w) and
+        # therefore expects the checkpoint weight to be (standard-1). HF
+        # safetensors already store (standard-1); a GGUF checkpoint does not, so
+        # subtract 1 from every GemmaRMSNorm weight on the GGUF load path. The
+        # GDN linear_attn.norm uses plain RMSNormGated (no offset) — exclude it.
+        _is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        _gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
+
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
@@ -1736,6 +1872,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+            if _is_gguf and (
+                name.endswith(_gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+            ):
+                loaded_weight = loaded_weight - 1.0
+            if _is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -1793,6 +1937,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
+
+                # GGUF stores the depthwise conv1d weight 2D [channels, kernel],
+                # but the model param (and mamba_v2_sharded_weight_loader) expect
+                # 3D [channels, 1, kernel] like the safetensors checkpoint. Insert
+                # the singleton middle dim for the GGUF case; no-op when already 3D.
+                if (
+                    "conv1d.weight" in name
+                    and loaded_weight.dim() == 2
+                    and getattr(param, "dim", lambda: 0)() == 3
+                ):
+                    loaded_weight = loaded_weight.unsqueeze(1)
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)

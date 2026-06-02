@@ -67,6 +67,27 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
+_AWQ_DENSE_GEMV = None
+
+
+def _has_awq_dense_gemv() -> bool:
+    """True only if the awq_fused_xpu.dense_gemv op is actually registered.
+
+    The XPU fast path in UnquantizedLinearMethod.apply uses
+    torch.ops.awq_fused_xpu.dense_gemv. That extension is optional; when it
+    is absent, torch.ops.awq_fused_xpu still resolves to an empty namespace,
+    so a bare attribute access raises AttributeError instead of falling back.
+    Check once and cache.
+    """
+    global _AWQ_DENSE_GEMV
+    if _AWQ_DENSE_GEMV is None:
+        try:
+            _AWQ_DENSE_GEMV = hasattr(torch.ops.awq_fused_xpu, "dense_gemv")
+        except Exception:
+            _AWQ_DENSE_GEMV = False
+    return _AWQ_DENSE_GEMV
+
+
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -163,6 +184,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         # fall through to F.linear via the generic fallback inside the kernel.
         if (
             x.is_xpu
+            and _has_awq_dense_gemv()
             and x.dim() == 2
             and x.size(0) == 1
             and bias is None
