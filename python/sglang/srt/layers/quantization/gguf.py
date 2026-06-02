@@ -500,6 +500,26 @@ def _xpu_repack_q4_0(qweight: torch.Tensor):
     return packed.contiguous(), scale.contiguous()
 
 
+def _xpu_dequant_q4_0_packed(packed: torch.Tensor, scale: torch.Tensor,
+                             out_dtype: torch.dtype) -> torch.Tensor:
+    """Dequantize the interleaved q4_0 rep back to a dense [N, K] tensor on XPU.
+
+    Inverse of _xpu_repack_q4_0's nibble interleaving: packed[N, K/2] holds the
+    even element in the low nibble and the odd element in the high nibble;
+    scale[N, K/32] is one fp16 scale per 32-element block. value = (nibble-8)*d.
+    Used for the prefill (M>1) path, where one dequant + a dense matmul is far
+    cheaper than the per-row ESIMD GEMM (which degrades ~linearly in M).
+    """
+    N, half = packed.shape
+    blocks = scale.shape[1]
+    even = (packed & 0x0F).to(torch.int16)            # [N, K/2] -> elems 0,2,...
+    odd = ((packed >> 4) & 0x0F).to(torch.int16)      # elems 1,3,...
+    nib = torch.stack([even, odd], dim=2).view(N, half * 2)  # interleave back
+    vals = (nib - 8).to(out_dtype)                    # [N, K]
+    vals = vals.view(N, blocks, -1) * scale.to(out_dtype).unsqueeze(-1)
+    return vals.view(N, half * 2).contiguous()
+
+
 def _xpu_dequant_to_fp16(qweight: torch.Tensor, qweight_type: int,
                          params_dtype: torch.dtype) -> torch.Tensor:
     """CPU-dequantize a non-q4_0 GGUF weight to a dense [N, K] tensor on XPU."""
@@ -622,12 +642,17 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         N = packed.shape[0]
         M = x.shape[0]
         xf = x.to(torch.float16).contiguous()
-        out = torch.empty(M, N, dtype=torch.float16, device=x.device)
         if M == 1:
+            # Decode: the ESIMD GEMV is bandwidth-optimal (~3x faster than a
+            # dense fp16 matmul at M=1).
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q4_0(xf, packed, scale, out)
-        else:
-            esimd_gemm_q4_0(xf, packed, scale, out)
-        return out
+            return out
+        # Prefill (M>1): the per-row ESIMD GEMM degrades ~linearly in M
+        # (131x slower than dense matmul at M=1024), so dequant the INT4 weight
+        # to fp16 once and use a single dense matmul instead.
+        w = _xpu_dequant_q4_0_packed(packed, scale, torch.float16)  # [N, K]
+        return xf @ w.t()
     # fp16-resident dense weight [N, K]
     _, w, _ = rep
     return x.to(w.dtype) @ w.t()
