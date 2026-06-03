@@ -1243,13 +1243,32 @@ class XPUAttentionBackend(AttentionBackend):
                     not use_cascade_attn
                     and os.environ.get("SGL_XPU_ESIMD_DECODE") == "1"
                 ):
+                    # ESIMD page_attn_decode's `max_seq_len` arg sizes the
+                    # host-side launch grid (groupV = ceil(max_seq_len/64));
+                    # the device kernel early-exits work groups past the real
+                    # per-sequence kvSeqLen, so over-sizing the grid is safe.
+                    # Under xpu-graph CAPTURE the grid is baked once and replayed
+                    # verbatim — and capture runs with the dummy seq_len=1
+                    # (get_cuda_graph_seq_len_fill_value), which would freeze
+                    # groupV=1 and truncate every later replay to the first 64
+                    # KV tokens (loses the prompt -> repetition). So during
+                    # capture we must size the grid for the worst case
+                    # (max_context_len); at eager/replay-prep time the real
+                    # max_seq_len_k is correct.
+                    from sglang.srt.model_executor.cuda_graph_runner import (
+                        get_is_capture_mode,
+                    )
+
+                    esimd_max_seq_len = int(metadata.max_seq_len_k)
+                    if get_is_capture_mode():
+                        esimd_max_seq_len = self.max_context_len
                     result = self._esimd_fallback_decode(
                         q=q_reshaped,
                         key_cache=key_cache,
                         value_cache=value_cache,
                         page_table=page_table,
                         cache_seqlens=cache_seqlens,
-                        max_seq_len=int(metadata.max_seq_len_k),
+                        max_seq_len=esimd_max_seq_len,
                         tp_q_head_num=layer.tp_q_head_num,
                         tp_k_head_num=layer.tp_k_head_num,
                         head_dim=layer.head_dim,
