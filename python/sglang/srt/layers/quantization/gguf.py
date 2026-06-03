@@ -70,6 +70,16 @@ elif _is_xpu:
     except ImportError:
         esimd_gemv_q4_0 = None
         esimd_gemm_q4_0 = None
+    # oneDNN u4 fused-dequant matmul for q4_0 PREFILL (M>1): keeps the weight in
+    # int4, no fp16 DRAM round-trip. ~6x faster than dequant+matmul and 3.7x over
+    # the hand-written DPAS GEMM on PTL (notes §10v). Bit-exact for q4_0 because
+    # GGUF q4_0 is offset-binary (value=nibble-8) == oneDNN u4 with zp=8.
+    try:
+        import onednn_gguf_xpu as _onednn_gguf
+        if os.environ.get("SGLANG_GGUF_XPU_NO_ONEDNN") == "1":
+            _onednn_gguf = None  # debug toggle: force dequant+matmul baseline
+    except ImportError:
+        _onednn_gguf = None
     try:
         from custom_esimd_kernels_vllm import esimd_gemv_q8_0
     except ImportError:
@@ -1067,6 +1077,21 @@ def _xpu_dequant_rep_to_fp16(rep, out_dtype: torch.dtype) -> torch.Tensor:
     raise NotImplementedError(f"GGUF rep '{kind}' -> dense on XPU")
 
 
+# Cache of per-group scales transposed to oneDNN's [num_groups, N] layout,
+# keyed by the q4_0 scale tensor's data_ptr (one-time transpose per shard).
+_onednn_scale_cache = {}
+
+
+def _onednn_q4_0_scale_t(scale: torch.Tensor) -> torch.Tensor:
+    """GGUF q4_0 scale [N, K/32] f16 -> oneDNN [num_groups=K/32, N] f16 (cached)."""
+    key = scale.data_ptr()
+    st = _onednn_scale_cache.get(key)
+    if st is None or st.shape[1] != scale.shape[0]:
+        st = scale.t().contiguous()
+        _onednn_scale_cache[key] = st
+    return st
+
+
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
     """x [M,K] fp16 @ shard^T -> [M,N] fp16. rep from _xpu_prepare_shard."""
     kind = rep[0]
@@ -1081,9 +1106,13 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q4_0(xf, packed, scale, out)
             return out
-        # Prefill (M>1): the per-row ESIMD GEMM degrades ~linearly in M
-        # (131x slower than dense matmul at M=1024), so dequant the INT4 weight
-        # to fp16 once and use a single dense matmul instead.
+        # Prefill (M>1): oneDNN u4 fused-dequant matmul — keeps the weight int4
+        # (no fp16 DRAM round-trip), ~6x faster than dequant+matmul (notes §10v).
+        # The ESIMD packed rep ([N,K/2] interleaved low=2j/high=2j+1) IS the u4
+        # layout oneDNN wants; GGUF offset-binary nibble n == u4 with zp=8 so the
+        # result is bit-exact. Falls back to dequant+matmul if the ext is absent.
+        if _onednn_gguf is not None:
+            return _onednn_gguf.onednn_q4_gemm(xf, packed, _onednn_q4_0_scale_t(scale))
         w = _xpu_dequant_q4_0_packed(packed, scale, torch.float16)  # [N, K]
         return xf @ w.t()
     if kind == "q8_0":
