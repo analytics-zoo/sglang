@@ -80,6 +80,15 @@ elif _is_xpu:
             _onednn_gguf = None  # debug toggle: force dequant+matmul baseline
     except ImportError:
         _onednn_gguf = None
+    # Grouped Q4_K/Q5_K MoE prefill GGEMV (doubleGRF DPAS): replaces the per-route
+    # GEMV at prefill (M>1), which is ~161x off the compute floor (notes §10x).
+    # ~17x faster (§10ad). Falls back to per-route GEMV if absent / SGLANG_GGUF_XPU_NO_GROUPED_MOE=1.
+    try:
+        import moe_grouped_gguf_xpu as _moe_grouped
+        if os.environ.get("SGLANG_GGUF_XPU_NO_GROUPED_MOE") == "1":
+            _moe_grouped = None
+    except ImportError:
+        _moe_grouped = None
     try:
         from custom_esimd_kernels_vllm import esimd_gemv_q8_0
     except ImportError:
@@ -901,6 +910,66 @@ def _xpu_repack_q5_k(qweight: torch.Tensor, col_perm=None):
     return ql, qh, scale.contiguous(), minv.contiguous()
 
 
+def _xpu_repack_q5_k_plain(qweight: torch.Tensor):
+    """Q5_K rep for the GROUPED prefill down kernel: ql [N,K/2] interleaved nibble
+    + PLAIN element-order qh [N,K/8] (byte j bit b = elem 8j+b) + scale,min [N,K/32].
+    Differs from _xpu_repack_q5_k only in qh layout (no 512-tile pre-shuffle), so the
+    grouped DPAS down kernel can index the 5th bit with simple per-element arithmetic.
+    """
+    u5, scale, minv = _xpu_q5_k_elem(qweight)
+    N, K = u5.shape
+    ql = _pack_nibble_interleaved(u5)
+    hbit = ((u5 >> 4) & 1).to(torch.uint8).view(N, K // 8, 8)
+    weights = (1 << torch.arange(8, dtype=torch.int32, device=u5.device))
+    qh = (hbit.to(torch.int32) * weights).sum(dim=2).to(torch.uint8)   # [N, K/8]
+    return ql.contiguous(), qh.contiguous(), scale.contiguous(), minv.contiguous()
+
+
+def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
+                             gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
+                             d_ql, d_qh, d_sc, d_mn):
+    """Grouped MoE prefill: sort tokens by expert -> Q4_K up GGEMV -> silu*mul ->
+    Q5_K down GGEMV -> weighted accumulate. Returns out [M, hidden] fp32.
+    xf [M, hidden] fp16; topk_ids/weights [M, top_k]. (notes §10ad-§10af)."""
+    dev = xf.device
+    M, top_k = topk_ids.shape
+    flat_exp = topk_ids.reshape(-1).to(torch.int64)
+    route_tok = torch.arange(M, device=dev).repeat_interleave(top_k)
+    order = torch.argsort(flat_exp)
+    exp_sorted = flat_exp[order]
+    tok_sorted = route_tok[order].to(torch.int64)
+    n_route = M * top_k
+    es = xf.index_select(0, tok_sorted).contiguous()
+    counts = torch.bincount(exp_sorted, minlength=E)
+    offs = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), counts.cumsum(0)]).cpu().tolist()
+    # The GGEMV kernel processes at most MAX_M=64 tokens per chunk (hardcoded
+    # tiling); split any expert with >64 routed tokens into contiguous ≤64
+    # sub-chunks, else tokens beyond 64 are silently dropped (wrong output).
+    MAX_M = 64
+    chunks = []
+    for e in range(E):
+        s, n = offs[e], offs[e + 1] - offs[e]
+        while n > 0:
+            c = min(MAX_M, n)
+            chunks.append([e, s, c])
+            s += c; n -= c
+    chunks_t = torch.tensor(chunks, dtype=torch.int32, device=dev)
+    gate_buf = torch.zeros(n_route, 2 * inter, dtype=torch.float16, device=dev)
+    _moe_grouped.moe_up_q4k_ggemv(es, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
+                                  gate_buf, chunks_t, hidden, inter)
+    g = gate_buf[:, :inter].float()
+    u = gate_buf[:, inter:].float()
+    inter_states = (torch.nn.functional.silu(g) * u).to(torch.float16).contiguous()
+    out_route = torch.zeros(n_route, hidden, dtype=torch.float16, device=dev)
+    _moe_grouped.moe_down_q5k_ggemv(inter_states, d_ql, d_qh, d_sc, d_mn, out_route,
+                                    chunks_t, inter, hidden)
+    w_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
+    contrib = out_route.float() * w_sorted.unsqueeze(1)
+    out = torch.zeros(M, hidden, dtype=torch.float32, device=dev)
+    out.index_add_(0, tok_sorted, contrib)
+    return out
+
+
 def _xpu_dequant_q5_k(ql, qh, scale, minv, out_dtype):
     """Dequant packed q5_K -> dense [N,K] (for prefill M>1). Mirrors the kernel."""
     N = ql.shape[0]; K = ql.shape[1] * 2
@@ -1536,6 +1605,20 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         self.intermediate = half
         self.hidden = self.gate_ql.shape[2] * 2
         self.E = E
+
+        # Grouped prefill (M>1): reuse the decode reps with ZERO extra resident
+        # memory. The up GGEMV takes gate_ql/up_ql separately (no [E,2*inter,...]
+        # concat copy). The down GGEMV reuses down_ql/down_sc/down_mn and only
+        # needs a small PLAIN element-order qh (K/8 bytes; the decode qh is 512-tile
+        # pre-shuffled and can't be reused). Only Q5_K down (kernel is Q5_K-only).
+        self._grouped_ok = (_moe_grouped is not None) and (not self._down_is_q6)
+        if self._grouped_ok:
+            dh2 = []
+            for e in range(E):
+                _, qh_plain, _, _ = _xpu_repack_q5_k_plain(w2[e].contiguous())
+                dh2.append(qh_plain)
+            self.down_qh_plain = torch.stack(dh2).contiguous()  # [E, hidden, inter/8]
+
         layer._xpu_moe_ready = True
         del layer.w13_qweight
         del layer.w2_qweight
@@ -1559,6 +1642,18 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         xf = x2.to(torch.float16).contiguous()
         sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
         tw = topk_weights.reshape(-1).to(torch.float16).contiguous()
+
+        # Prefill (M>1): grouped GGEMV (sort tokens by expert -> one DPAS GEMM per
+        # expert group). ~17x over per-route GEMV which is 161x off the compute
+        # floor at prefill (notes §10x/§10ad). M==1 decode keeps the per-route
+        # fused GEMV below (BW-bound, GEMV is optimal there).
+        if M > 1 and getattr(self, "_grouped_ok", False):
+            out_g = _xpu_moe_grouped_prefill(
+                xf, topk_ids, topk_weights, self.E, hidden, inter,
+                self.gate_ql, self.gate_sc, self.gate_mn,
+                self.up_ql, self.up_sc, self.up_mn,
+                self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn)
+            return StandardCombineInput(hidden_states=out_g.to(out.dtype).reshape_as(x))
 
         # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
         # weighted) over ALL routed pairs, then sum the top_k partials. Replaces
