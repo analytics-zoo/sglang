@@ -602,6 +602,116 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _forward_xpu_gdn_seq_decode(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Decode-only fast path that fuses conv1d_update + GDN recurrent
+        update into a single ESIMD kernel via
+        torch.ops.custom_esimd_kernels_sglang.esimd_gdn_conv_fused_seq.
+
+        Replaces three separate kernels:
+          - fused_qkvzba_split_reshape_cat_contiguous (layout conversion)
+          - causal_conv1d_update (Triton)
+          - fused_recurrent_gated_delta_rule_packed_decode (Triton)
+        Returns None to fall back to the default path on any unsupported
+        configuration (kernel only handles K=V=128 + sequential qkvz layout).
+        """
+        try:
+            ops_ns = torch.ops.custom_esimd_kernels_sglang
+            esimd_op = ops_ns.esimd_gdn_conv_fused_seq
+        except (AttributeError, RuntimeError):
+            return None
+
+        attn_backend = forward_batch.attn_backend
+        linear_backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
+        fwd_md = getattr(linear_backend, "forward_metadata", None)
+        if fwd_md is None:
+            return None
+
+        cache_indices = fwd_md.mamba_cache_indices
+        layer_id = self.layer_id
+        mamba_cache_params = linear_backend.req_to_token_pool.mamba2_layer_cache(
+            layer_id
+        )
+        # MambaPool layout (sglang native — read directly, no transpose):
+        #   conv: (cache, conv_dim, W-1) — kernel reads via per-(d,t)
+        #         block_load<T,192> with select<64,3>.
+        #   ssm:  (cache, HV, V, K) — already matches kernel layout.
+        pool_conv = mamba_cache_params.conv[0]
+        pool_ssm = mamba_cache_params.temporal
+
+        bs = cache_indices.shape[0]
+        nv_tp = self.num_v_heads // self.attn_tp_size
+        nk_tp = self.num_k_heads // self.attn_tp_size
+        H = nk_tp
+        HV = nv_tp
+        K = self.head_k_dim
+        V = self.head_v_dim
+
+        scale = float(K) ** -0.5
+        projected_states_qkvz = projected_states_qkvz.contiguous()
+        projected_states_ba = projected_states_ba.contiguous()
+
+        core_attn_out = projected_states_qkvz.new_empty((bs, HV, V))
+        z = torch.empty_like(core_attn_out)
+
+        # conv_weight in the model is stored as (conv_dim, 1, W); the kernel
+        # wants (conv_dim, W). Pass that view directly.
+        conv_weight = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        conv_bias = self.conv1d.bias
+        if conv_bias is None:
+            conv_bias = torch.zeros(
+                conv_weight.size(0),
+                dtype=projected_states_qkvz.dtype,
+                device=projected_states_qkvz.device,
+            )
+
+        # Cast A_log / dt_bias to qkvz dtype if needed (kernel reads them
+        # as the same dtype as the activations).
+        a_log = self.A_log.to(projected_states_qkvz.dtype)
+        dt_bias = self.dt_bias.to(projected_states_qkvz.dtype)
+
+        cache_indices_i32 = cache_indices.to(torch.int32)
+        esimd_op(
+            projected_states_qkvz,
+            pool_conv,
+            conv_weight,
+            conv_bias,
+            cache_indices_i32,
+            a_log,
+            dt_bias,
+            projected_states_ba,
+            pool_ssm,
+            cache_indices_i32,
+            core_attn_out,
+            z,
+            bs, H, HV, K, V, scale,
+        )
+
+        # Mirror the prefix-caching state tracking that GDNAttnBackend.forward_decode does.
+        if hasattr(linear_backend, "_track_mamba_state_decode"):
+            linear_backend._track_mamba_state_decode(
+                forward_batch, pool_conv, pool_ssm, cache_indices
+            )
+
+        z_shape_og = z.shape
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        if core_attn_out.shape != z.shape:
+            core_attn_out_pad = torch.zeros_like(z)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -633,6 +743,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and self.num_v_heads // self.num_k_heads == 1
         ):
             output = self._forward_xpu_fast_path(
+                projected_states_qkvz,
+                projected_states_ba,
+                forward_batch,
+            )
+            if output is not None:
+                return output
+
+        # --- XPU ESIMD GDN decode fast path (custom_esimd_kernels_sglang) ---
+        # Replaces fused_qkvzba_split_reshape_cat + causal_conv1d_update +
+        # fused_recurrent_packed_decode (3 kernels, 3 launches each layer)
+        # with a single fused ESIMD kernel that consumes the raw qkvz/ba
+        # GEMV outputs in sequential layout. Decode-only.
+        _ENABLE_GDN_SEQ_PATH = os.environ.get(
+            "SGLANG_XPU_GDN_SEQ_PATH", "1"
+        ) == "1"
+        if (
+            _ENABLE_GDN_SEQ_PATH
+            and _is_xpu
+            and forward_batch.forward_mode.is_decode()
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and projected_states_qkvz.dtype in (torch.bfloat16, torch.float16)
+        ):
+            output = self._forward_xpu_gdn_seq_decode(
                 projected_states_qkvz,
                 projected_states_ba,
                 forward_batch,
@@ -1018,12 +1152,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
 
         # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
-        # Hard-coded requirements: head_dim=256, fp16, GemmaRMSNorm weight+1.0
-        # (matches Qwen3.5's q_norm/k_norm). Gate with env + shape checks.
+        # Hard-coded requirements: head_dim=256, fp16/bf16, GemmaRMSNorm
+        # weight+1.0 (matches Qwen3.5's q_norm/k_norm). Gate with env + shape
+        # checks.
         if (
             os.environ.get("SGLANG_XPU_FA_ESIMD_QKV") == "1"
             and self.head_dim == 256
             and hidden_states.dim() == 2
+            and qkv.dtype in (torch.bfloat16, torch.float16)
         ):
             try:
                 from custom_esimd_kernels_sglang import esimd_qkv_split_norm_rope
@@ -1031,7 +1167,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 esimd_qkv_split_norm_rope = None
             if esimd_qkv_split_norm_rope is not None:
                 nTokens = qkv.shape[0]
-                orig_dtype = qkv.dtype
+                kdtype = qkv.dtype  # native dtype passes through, no cast
 
                 # Persistent scratch buffers for XPUGraph capture stability.
                 # Without these, every forward pass allocates fresh temporaries
@@ -1043,57 +1179,69 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     scratch is None
                     or scratch["nTokens"] < nTokens
                     or scratch["qkv_in_dim"] != qkv.shape[1]
+                    or scratch["dtype"] != kdtype
                 )
                 if need_resize:
                     scratch = {
                         "nTokens": nTokens,
                         "qkv_in_dim": qkv.shape[1],
-                        "qkv_fp16": torch.empty(
+                        "dtype": kdtype,
+                        # Persistent scratch for QKV input. Required for
+                        # XPUGraph capture: qkv (qkv_proj output) has a fresh
+                        # data_ptr each forward, but graph capture snapshots
+                        # data_ptrs at capture time. Copy into persistent
+                        # buffer keeps replay correct.
+                        "qkv_in": torch.empty(
                             (nTokens, qkv.shape[1]),
-                            device=qkv.device, dtype=torch.float16,
+                            device=qkv.device, dtype=kdtype,
                         ),
                         "q_out": torch.empty(
                             (nTokens, self.num_heads * 256),
-                            device=qkv.device, dtype=torch.float16,
+                            device=qkv.device, dtype=kdtype,
                         ),
                         "gate_out": (
                             torch.empty(
                                 (nTokens, self.num_heads * 256),
-                                device=qkv.device, dtype=torch.float16,
+                                device=qkv.device, dtype=kdtype,
                             )
                             if self.attn_output_gate
                             else torch.empty(
-                                0, device=qkv.device, dtype=torch.float16,
+                                0, device=qkv.device, dtype=kdtype,
                             )
                         ),
                         "k_out": torch.empty(
                             (nTokens, self.num_kv_heads * 256),
-                            device=qkv.device, dtype=torch.float16,
+                            device=qkv.device, dtype=kdtype,
                         ),
                         "v_out": torch.empty(
                             (nTokens, self.num_kv_heads * 256),
-                            device=qkv.device, dtype=torch.float16,
+                            device=qkv.device, dtype=kdtype,
                         ),
-                        "q_norm_w_fp16": self.q_norm.weight.to(torch.float16).contiguous(),
-                        "k_norm_w_fp16": self.k_norm.weight.to(torch.float16).contiguous(),
+                        "q_norm_w": self.q_norm.weight.to(kdtype).contiguous(),
+                        "k_norm_w": self.k_norm.weight.to(kdtype).contiguous(),
                     }
-                    # Pre-convert cos_sin_cache to fp16 once (attribute so
-                    # it's stable; rotary_emb is shared across layers).
+                    # Pre-convert cos_sin_cache to kdtype once (cached on
+                    # rotary_emb so it's stable across layers sharing the
+                    # rotary_emb module).
                     cs = self.rotary_emb.cos_sin_cache
-                    if cs.dtype != torch.float16:
-                        if not hasattr(self.rotary_emb, "_cos_sin_cache_fp16"):
-                            self.rotary_emb._cos_sin_cache_fp16 = cs.to(
-                                torch.float16
-                            ).contiguous()
-                        scratch["cs_fp16"] = self.rotary_emb._cos_sin_cache_fp16
+                    cs_attr = f"_cos_sin_cache_{str(kdtype).split('.')[-1]}"
+                    if cs.dtype != kdtype:
+                        if not hasattr(self.rotary_emb, cs_attr):
+                            setattr(
+                                self.rotary_emb, cs_attr,
+                                cs.to(kdtype).contiguous(),
+                            )
+                        scratch["cs_typed"] = getattr(self.rotary_emb, cs_attr)
                     else:
-                        scratch["cs_fp16"] = cs
+                        scratch["cs_typed"] = cs
                     self._esimd_qkv_scratch = scratch
 
-                # Fill persistent buffers in place so the captured graph
-                # picks up new values on each replay.
-                qkv_fp16 = scratch["qkv_fp16"][:nTokens]
-                qkv_fp16.copy_(qkv.to(torch.float16))
+                # Copy qkv into persistent scratch (graph-replay stability).
+                # Same dtype as qkv → no cast cost, just a memcpy. This still
+                # saves vs the old fp16 path which had the same memcpy *plus*
+                # a bf16→fp16 cast.
+                qkv_in = scratch["qkv_in"][:nTokens]
+                qkv_in.copy_(qkv)
                 q_out = scratch["q_out"][:nTokens]
                 gate_out = scratch["gate_out"][:nTokens] if self.attn_output_gate else scratch["gate_out"]
                 k_out = scratch["k_out"][:nTokens]
@@ -1110,21 +1258,20 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     * getattr(self.config, "partial_rotary_factor", 1.0)
                 )
                 esimd_qkv_split_norm_rope(
-                    qkv_fp16,
+                    qkv_in,
                     q_out, gate_out, k_out, v_out,
-                    scratch["q_norm_w_fp16"],
-                    scratch["k_norm_w_fp16"],
+                    scratch["q_norm_w"],
+                    scratch["k_norm_w"],
                     pos_i32,
                     self.num_heads, self.num_kv_heads,
                     self.attn_output_gate,
-                    rotary_dim_arg, scratch["cs_fp16"],
+                    rotary_dim_arg, scratch["cs_typed"],
                 )
-                q = q_out.to(orig_dtype)
-                k = k_out.to(orig_dtype)
-                v = v_out.to(orig_dtype)
+                # Outputs are already in native dtype; no cast needed.
+                q, k, v = q_out, k_out, v_out
                 # ESIMD kernel already applies sigmoid to gate_out (see
                 # qkv_split_norm_rope.h:159), so don't re-sigmoid here.
-                gate = gate_out.to(orig_dtype) if self.attn_output_gate else None
+                gate = gate_out if self.attn_output_gate else None
                 attn_output = self.attn(q, k, v, forward_batch)
                 if self.attn_output_gate:
                     attn_output = attn_output * gate

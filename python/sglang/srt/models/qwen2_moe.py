@@ -293,16 +293,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        if _is_cpu and _is_cpu_amx_available:
-            self.shared_expert_gate = ReplicatedLinear(
-                config.hidden_size,
-                1,
-                bias=False,
-                quant_config=None,
-                prefix=add_prefix("shared_expert_gate", prefix),
-            )
-        else:
-            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        # Use ReplicatedLinear instead of vanilla nn.Linear: on XPU the
+        # quant_method dispatch lets a small (2048→1) GEMV go through
+        # awq_fused_xpu::dense_gemv (~50us/call) instead of oneDNN GEMM
+        # (~178us/call), saving ~5ms/step over 40 layers.
+        # CPU AMX path was already using ReplicatedLinear; we just unify.
+        self.shared_expert_gate = ReplicatedLinear(
+            config.hidden_size,
+            1,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("shared_expert_gate", prefix),
+        )
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
@@ -374,10 +376,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         shared_output,
                     )
                 else:
-                    shared_output = (
-                        F.sigmoid(self.shared_expert_gate(hidden_states))
-                        * shared_output
-                    )
+                    gate_out = self.shared_expert_gate(hidden_states)
+                    # ReplicatedLinear returns (out, bias); nn.Linear returns out.
+                    gate_logits = gate_out[0] if isinstance(gate_out, tuple) else gate_out
+                    shared_output = F.sigmoid(gate_logits) * shared_output
 
         return shared_output
 
