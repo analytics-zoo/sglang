@@ -597,18 +597,70 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
     """GGUF embedding for Intel XPU (PTL Xe3).
 
     The base GGUFEmbeddingMethod calls ggml_dequantize (a CUDA/MUSA-only sgl
-    kernel) which is absent on XPU, so embedding lookups silently break and the
-    model emits garbage. This method routes through apply_gguf_embedding_xpu
-    (gguf-lib row dequant) instead.
+    kernel) which is absent on XPU. Earlier this routed through
+    apply_gguf_embedding_xpu, but that does a per-step .cpu() gguf-lib dequant
+    which is illegal under XPUGraph capture ("wait method cannot be used for an
+    event associated with a command graph"). This method instead repacks the
+    table once into the resident packed k-quant rep (zero extra memory, same as
+    the linear layers) and gathers + dequants the looked-up rows entirely on-XPU
+    (graph-capturable, no host sync).
     """
 
-    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        qweight = layer.qweight
+    def process_weights_after_loading(self, layer: torch.nn.Module):
         qweight_type = layer.qweight_type.weight_type
-        hidden_size = qweight.tensor_shape[1]
-        return apply_gguf_embedding_xpu(
-            x, qweight, qweight_type, hidden_size, dtype=self.params_dtype
+        if qweight_type in UNQUANTIZED_TYPES:
+            layer._xpu_emb_rep = ("fp16", layer.qweight.to(self.params_dtype), None)
+            return
+        # Repack the [vocab, K] GGUF table to the resident packed rep (q6_k /
+        # q8_0 / q4_k ...). _xpu_prepare_shard handles every supported type and
+        # keeps the weight quantized (no fp16 full-table copy).
+        layer._xpu_emb_rep = _xpu_prepare_shard(
+            layer.qweight.data, int(qweight_type), self.params_dtype
         )
+        if hasattr(layer, "qweight"):
+            del layer.qweight
+
+    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        rep = getattr(layer, "_xpu_emb_rep", None)
+        if rep is None:  # not yet processed (shouldn't happen post-load)
+            qweight = layer.qweight
+            return apply_gguf_embedding_xpu(
+                x, qweight, layer.qweight_type.weight_type,
+                qweight.tensor_shape[1], dtype=self.params_dtype)
+        kind = rep[0]
+        x_flat = x.flatten()
+        # Gather the looked-up rows of the packed rep (index_select is graph-safe
+        # on XPU), then dequant ONLY those rows fully on-device — no .cpu().
+        if kind == "fp16":
+            out = torch.nn.functional.embedding(x_flat, rep[1].to(self.params_dtype))
+            return out.view(*x.shape, rep[1].shape[1])
+        if kind == "q6_k":
+            ql, qh, sc = rep[1], rep[2], rep[3]
+            g = _xpu_dequant_q6_k(ql.index_select(0, x_flat),
+                                  qh.index_select(0, x_flat),
+                                  sc.index_select(0, x_flat), self.params_dtype)
+        elif kind == "q8_0":
+            qs, sc = rep[1], rep[2]
+            g = _xpu_dequant_q8_0(qs.index_select(0, x_flat),
+                                  sc.index_select(0, x_flat), self.params_dtype)
+        elif kind == "q5_k":
+            ql, qh, sc, mn = rep[1], rep[2], rep[3], rep[4]
+            g = _xpu_dequant_q5_k(ql.index_select(0, x_flat),
+                                  qh.index_select(0, x_flat),
+                                  sc.index_select(0, x_flat),
+                                  mn.index_select(0, x_flat), self.params_dtype)
+        elif kind == "q4_k":
+            ql, sc, mn = rep[1], rep[2], rep[3]
+            g = _xpu_dequant_q4_k(ql.index_select(0, x_flat),
+                                  sc.index_select(0, x_flat),
+                                  mn.index_select(0, x_flat), self.params_dtype)
+        elif kind == "q4_0":
+            packed, sc = rep[1], rep[2]
+            g = _xpu_dequant_q4_0_packed(packed.index_select(0, x_flat),
+                                         sc.index_select(0, x_flat), self.params_dtype)
+        else:
+            raise NotImplementedError(f"GGUF embedding rep '{kind}' on XPU")
+        return g.view(*x.shape, g.shape[-1])
 
     def apply(
         self,
@@ -625,12 +677,20 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         """
         w = getattr(layer, "_xpu_lmhead_dense", None)
         if w is None:
-            qweight = layer.qweight
-            qweight_type = layer.qweight_type.weight_type
-            if qweight_type in UNQUANTIZED_TYPES:
-                w = qweight.to(self.params_dtype)
+            # process_weights_after_loading deletes layer.qweight and keeps the
+            # packed rep; rebuild the dense vocab table from the rep (the tied
+            # lm_head needs a full [vocab, hidden] matmul). Falls back to qweight
+            # if the rep is somehow absent (pre-process call).
+            rep = getattr(layer, "_xpu_emb_rep", None)
+            if rep is not None:
+                w = _xpu_dequant_rep_to_fp16(rep, self.params_dtype)
             else:
-                w = _xpu_dequant_to_fp16(qweight, qweight_type, self.params_dtype)
+                qweight = layer.qweight
+                qweight_type = layer.qweight_type.weight_type
+                if qweight_type in UNQUANTIZED_TYPES:
+                    w = qweight.to(self.params_dtype)
+                else:
+                    w = _xpu_dequant_to_fp16(qweight, qweight_type, self.params_dtype)
             layer._xpu_lmhead_dense = w  # [vocab, hidden] resident dense
         out = x.to(w.dtype) @ w.t()
         if bias is not None:
@@ -963,6 +1023,28 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
     if col_perm is not None:
         rep = _xpu_permute_gdn_out_cols(rep, col_perm)
     return rep
+
+
+def _xpu_dequant_rep_to_fp16(rep, out_dtype: torch.dtype) -> torch.Tensor:
+    """Dense [N, K] from a packed rep tuple (inverse of _xpu_prepare_shard).
+
+    Used by the tied lm_head path, which needs a full vocab matmul after
+    process_weights_after_loading has discarded the raw qweight.
+    """
+    kind = rep[0]
+    if kind == "fp16":
+        return rep[1].to(out_dtype)
+    if kind == "q8_0":
+        return _xpu_dequant_q8_0(rep[1], rep[2], out_dtype)
+    if kind == "q4_k":
+        return _xpu_dequant_q4_k(rep[1], rep[2], rep[3], out_dtype)
+    if kind == "q5_k":
+        return _xpu_dequant_q5_k(rep[1], rep[2], rep[3], rep[4], out_dtype)
+    if kind == "q6_k":
+        return _xpu_dequant_q6_k(rep[1], rep[2], rep[3], out_dtype)
+    if kind == "q4_0":
+        return _xpu_dequant_q4_0_packed(rep[1], rep[2], out_dtype)
+    raise NotImplementedError(f"GGUF rep '{kind}' -> dense on XPU")
 
 
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
