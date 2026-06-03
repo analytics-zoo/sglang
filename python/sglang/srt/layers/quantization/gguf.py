@@ -1082,7 +1082,7 @@ def _xpu_dequant_rep_to_fp16(rep, out_dtype: torch.dtype) -> torch.Tensor:
 _onednn_scale_cache = {}
 
 
-def _onednn_q4_0_scale_t(scale: torch.Tensor) -> torch.Tensor:
+def _onednn_scale_t(scale: torch.Tensor) -> torch.Tensor:
     """GGUF q4_0 scale [N, K/32] f16 -> oneDNN [num_groups=K/32, N] f16 (cached)."""
     key = scale.data_ptr()
     st = _onednn_scale_cache.get(key)
@@ -1112,7 +1112,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         # layout oneDNN wants; GGUF offset-binary nibble n == u4 with zp=8 so the
         # result is bit-exact. Falls back to dequant+matmul if the ext is absent.
         if _onednn_gguf is not None:
-            return _onednn_gguf.onednn_q4_gemm(xf, packed, _onednn_q4_0_scale_t(scale))
+            return _onednn_gguf.onednn_q4_gemm(xf, packed, _onednn_scale_t(scale))
         w = _xpu_dequant_q4_0_packed(packed, scale, torch.float16)  # [N, K]
         return xf @ w.t()
     if kind == "q8_0":
@@ -1125,7 +1125,12 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q8_0(xf, qs, scale, out)
             return out
-        # Prefill (M>1): dequant int8 -> fp16 once + dense matmul.
+        # Prefill (M>1): oneDNN s8 fused-dequant matmul (symmetric, no zero-point;
+        # qs [N,K] int8 IS the s8 weight, scale transposed to [K/32,N]). Keeps the
+        # weight int8, no fp16 DRAM round-trip. Covers 35B dense prefill (notes
+        # §10x). Falls back to dequant+matmul if the ext is absent.
+        if _onednn_gguf is not None:
+            return _onednn_gguf.onednn_q8_gemm(xf, qs, _onednn_scale_t(scale))
         w = _xpu_dequant_q8_0(qs, scale, torch.float16)  # [N, K]
         return xf @ w.t()
     if kind == "q4_k":
