@@ -675,13 +675,33 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         ggml_dequantize (CUDA-only, undefined on XPU). Instead dequantize the
         vocab table once via the gguf lib (cached on the layer) and matmul.
         """
+        rep = getattr(layer, "_xpu_emb_rep", None)
+        x2 = x.reshape(-1, x.shape[-1])
+        M = x2.shape[0]
+        # Hot path: single-token decode. Run the packed k-quant GEMV directly
+        # over the full vocab (lm_head was 23.6% of 35B graph decode — it had
+        # been dequantizing the Q6_K output.weight to a ~1GB fp16 table and
+        # doing a full-vocab fp16 GEMM every step; see notes §10q). The GEMV
+        # reads the resident packed rep, so no fp16 table and no dense matmul.
+        # esimd_gemv_* require M==1; M>1 (prefill last-token logits, rare) falls
+        # through to the dense path below.
+        if (
+            rep is not None
+            and M == 1
+            and rep[0] in ("q6_k", "q5_k", "q4_k", "q8_0", "q4_0")
+        ):
+            xf = x2.to(torch.float16).contiguous()
+            out = _xpu_rep_gemv(xf, rep).to(x.dtype)  # [1, vocab]
+            if bias is not None:
+                out = out + bias
+            return out.reshape(*x.shape[:-1], out.shape[-1])
+
         w = getattr(layer, "_xpu_lmhead_dense", None)
         if w is None:
             # process_weights_after_loading deletes layer.qweight and keeps the
-            # packed rep; rebuild the dense vocab table from the rep (the tied
-            # lm_head needs a full [vocab, hidden] matmul). Falls back to qweight
-            # if the rep is somehow absent (pre-process call).
-            rep = getattr(layer, "_xpu_emb_rep", None)
+            # packed rep; rebuild the dense vocab table from the rep (the M>1
+            # prefill-logits path needs a full [vocab, hidden] matmul). Falls
+            # back to qweight if the rep is somehow absent (pre-process call).
             if rep is not None:
                 w = _xpu_dequant_rep_to_fp16(rep, self.params_dtype)
             else:
