@@ -925,9 +925,23 @@ def _xpu_repack_q5_k_plain(qweight: torch.Tensor):
     return ql.contiguous(), qh.contiguous(), scale.contiguous(), minv.contiguous()
 
 
+def _xpu_repack_q6_k_plain(qweight: torch.Tensor):
+    """Q6_K rep for the GROUPED prefill down kernel: ql [N,K/2] interleaved nibble
+    + PLAIN element-order 2-bit qh [N,K/4] (byte j = elems 4j..4j+3, 2 bits each) +
+    scale [N,K/16]. Symmetric (w = scale*(v6-32), no min). Mirrors moe_q6k_down_ggemv.h.
+    """
+    u6, scale = _xpu_q6_k_elem(qweight)
+    N, K = u6.shape
+    ql = _pack_nibble_interleaved(u6)
+    h2 = ((u6 >> 4) & 3).to(torch.int32).view(N, K // 4, 4)
+    shifts = (2 * torch.arange(4, dtype=torch.int32, device=u6.device))
+    qh = (h2 << shifts).sum(dim=2).to(torch.uint8)   # [N, K/4]
+    return ql.contiguous(), qh.contiguous(), scale.contiguous()
+
+
 def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
                              gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
-                             d_ql, d_qh, d_sc, d_mn):
+                             d_ql, d_qh, d_sc, d_mn, down_is_q6=False):
     """Grouped MoE prefill: sort tokens by expert -> Q4_K up GGEMV -> silu*mul ->
     Q5_K down GGEMV -> weighted accumulate. Returns out [M, hidden] fp32.
     xf [M, hidden] fp16; topk_ids/weights [M, top_k]. (notes §10ad-§10af)."""
@@ -961,8 +975,12 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     u = gate_buf[:, inter:].float()
     inter_states = (torch.nn.functional.silu(g) * u).to(torch.float16).contiguous()
     out_route = torch.zeros(n_route, hidden, dtype=torch.float16, device=dev)
-    _moe_grouped.moe_down_q5k_ggemv(inter_states, d_ql, d_qh, d_sc, d_mn, out_route,
-                                    chunks_t, inter, hidden)
+    if down_is_q6:
+        _moe_grouped.moe_down_q6k_ggemv(inter_states, d_ql, d_qh, d_sc, out_route,
+                                        chunks_t, inter, hidden)
+    else:
+        _moe_grouped.moe_down_q5k_ggemv(inter_states, d_ql, d_qh, d_sc, d_mn, out_route,
+                                        chunks_t, inter, hidden)
     w_sorted = topk_weights.reshape(-1)[order].to(torch.float32)
     contrib = out_route.float() * w_sorted.unsqueeze(1)
     out = torch.zeros(M, hidden, dtype=torch.float32, device=dev)
@@ -1609,15 +1627,18 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         # Grouped prefill (M>1): reuse the decode reps with ZERO extra resident
         # memory. The up GGEMV takes gate_ql/up_ql separately (no [E,2*inter,...]
         # concat copy). The down GGEMV reuses down_ql/down_sc/down_mn and only
-        # needs a small PLAIN element-order qh (K/8 bytes; the decode qh is 512-tile
-        # pre-shuffled and can't be reused). Only Q5_K down (kernel is Q5_K-only).
-        self._grouped_ok = (_moe_grouped is not None) and (not self._down_is_q6)
+        # needs a small PLAIN element-order qh (the decode qh is pre-shuffled and
+        # can't be reused). Both Q5_K (1-bit qh) and Q6_K (2-bit qh) down supported.
+        self._grouped_ok = _moe_grouped is not None
         if self._grouped_ok:
             dh2 = []
             for e in range(E):
-                _, qh_plain, _, _ = _xpu_repack_q5_k_plain(w2[e].contiguous())
+                if self._down_is_q6:
+                    _, qh_plain, _ = _xpu_repack_q6_k_plain(w2[e].contiguous())
+                else:
+                    _, qh_plain, _, _ = _xpu_repack_q5_k_plain(w2[e].contiguous())
                 dh2.append(qh_plain)
-            self.down_qh_plain = torch.stack(dh2).contiguous()  # [E, hidden, inter/8]
+            self.down_qh_plain = torch.stack(dh2).contiguous()
 
         layer._xpu_moe_ready = True
         del layer.w13_qweight
@@ -1652,7 +1673,8 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
                 xf, topk_ids, topk_weights, self.E, hidden, inter,
                 self.gate_ql, self.gate_sc, self.gate_mn,
                 self.up_ql, self.up_sc, self.up_mn,
-                self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn)
+                self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn,
+                down_is_q6=self._down_is_q6)
             return StandardCombineInput(hidden_states=out_g.to(out.dtype).reshape_as(x))
 
         # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
