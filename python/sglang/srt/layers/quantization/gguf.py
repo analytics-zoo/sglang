@@ -65,11 +65,28 @@ elif _is_xpu:
     # CPU-dequantized once to fp16 at load via the gguf lib and kept resident.
     from gguf import dequantize as gguf_dequantize
 
-    try:
-        from custom_esimd_kernels_vllm import esimd_gemv_q4_0, esimd_gemm_q4_0
-    except ImportError:
-        esimd_gemv_q4_0 = None
-        esimd_gemm_q4_0 = None
+    # SGL-OWNED kernel package (custom_esimd_kernels_sglang) — a full rename-copy
+    # of custom-esimd-kernels-vllm living at llm-scaler/vllm/custom-esimd-kernels-sglang,
+    # so sglang can evolve these kernels (e.g. the D1 small-N q8_0 BW opt) without
+    # touching the vllm-shared package. Every GGUF kernel import below prefers the
+    # sgl package and falls back to the vllm package if the sgl .so is absent.
+    # Toggle SGLANG_GGUF_XPU_USE_VLLM_KERNELS=1 to force the legacy vllm package.
+    # (notes §10bg/§10bh/§10bi)
+    _force_vllm_k = os.environ.get("SGLANG_GGUF_XPU_USE_VLLM_KERNELS") == "1"
+
+    def _imp_kernels(names):
+        """Import `names` from the sgl package, else the vllm package, else Nones."""
+        mods = ("custom_esimd_kernels_vllm",) if _force_vllm_k else (
+            "custom_esimd_kernels_sglang", "custom_esimd_kernels_vllm")
+        for mod in mods:
+            try:
+                m = __import__(mod, fromlist=list(names))
+                return [getattr(m, n) for n in names]
+            except (ImportError, AttributeError):
+                continue
+        return [None] * len(names)
+
+    esimd_gemv_q4_0, esimd_gemm_q4_0 = _imp_kernels(("esimd_gemv_q4_0", "esimd_gemm_q4_0"))
     # oneDNN u4 fused-dequant matmul for q4_0 PREFILL (M>1): keeps the weight in
     # int4, no fp16 DRAM round-trip. ~6x faster than dequant+matmul and 3.7x over
     # the hand-written DPAS GEMM on PTL (notes §10v). Bit-exact for q4_0 because
@@ -89,29 +106,11 @@ elif _is_xpu:
             _moe_grouped = None
     except ImportError:
         _moe_grouped = None
-    try:
-        from custom_esimd_kernels_vllm import esimd_gemv_q8_0
-    except ImportError:
-        esimd_gemv_q8_0 = None
-    try:
-        from custom_esimd_kernels_vllm import esimd_gemv_q4_k
-    except ImportError:
-        esimd_gemv_q4_k = None
-    try:
-        from custom_esimd_kernels_vllm import esimd_gemv_q5_k, esimd_gemv_q6_k
-    except ImportError:
-        esimd_gemv_q5_k = None
-        esimd_gemv_q6_k = None
-    try:
-        from custom_esimd_kernels_vllm import (
-            esimd_moe_up_q4k,
-            esimd_moe_down_q5k,
-            esimd_moe_down_q6k,
-        )
-    except ImportError:
-        esimd_moe_up_q4k = None
-        esimd_moe_down_q5k = None
-        esimd_moe_down_q6k = None
+    (esimd_gemv_q8_0,) = _imp_kernels(("esimd_gemv_q8_0",))
+    (esimd_gemv_q4_k,) = _imp_kernels(("esimd_gemv_q4_k",))
+    esimd_gemv_q5_k, esimd_gemv_q6_k = _imp_kernels(("esimd_gemv_q5_k", "esimd_gemv_q6_k"))
+    esimd_moe_up_q4k, esimd_moe_down_q5k, esimd_moe_down_q6k = _imp_kernels(
+        ("esimd_moe_up_q4k", "esimd_moe_down_q5k", "esimd_moe_down_q6k"))
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -953,7 +952,11 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     exp_sorted = flat_exp[order]
     tok_sorted = route_tok[order].to(torch.int64)
     n_route = M * top_k
-    es = xf.index_select(0, tok_sorted).contiguous()
+    # T2 (notes §10be): the up GGEMV folds the per-expert input gather into its
+    # load via tok_sorted (reads xf directly at the sorted token id), so the
+    # explicit `es = xf.index_select(0, tok_sorted)` round-trip (the IndexKernel,
+    # ~10% of prefill) is gone. tok_sorted as int32 for the kernel.
+    tok_sorted_i32 = tok_sorted.to(torch.int32).contiguous()
     counts = torch.bincount(exp_sorted, minlength=E)
     offs = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), counts.cumsum(0)]).cpu().tolist()
     # The GGEMV kernel processes at most MAX_M=64 tokens per chunk (hardcoded
@@ -969,8 +972,10 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
             s += c; n -= c
     chunks_t = torch.tensor(chunks, dtype=torch.int32, device=dev)
     gate_buf = torch.zeros(n_route, 2 * inter, dtype=torch.float16, device=dev)
-    _moe_grouped.moe_up_q4k_ggemv(es, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
-                                  gate_buf, chunks_t, hidden, inter)
+    # read xf directly (xf must be row-contiguous in hidden); tok_sorted_i32 folds
+    # the gather in. xf is [M, hidden] fp16 contiguous from the caller.
+    _moe_grouped.moe_up_q4k_ggemv(xf, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
+                                  gate_buf, chunks_t, hidden, inter, tok_sorted_i32)
     g = gate_buf[:, :inter].float()
     u = gate_buf[:, inter:].float()
     inter_states = (torch.nn.functional.silu(g) * u).to(torch.float16).contiguous()
@@ -1299,6 +1304,39 @@ def _xpu_permute_gdn_out_cols(rep, perm):
         f"is done in _xpu_repack_* (pass col_perm to _xpu_prepare_shard instead).")
 
 
+def _xpu_try_merge_shards(reps: dict, ids: list):
+    """D1: if every shard in `ids` is the SAME GEMV rep kind (q8_0 or q4_0) with
+    the same K, build one merged rep by row-concatenating the per-shard weights,
+    plus the per-shard N sizes (to slice the output). Returns
+    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds / fp16 /
+    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0 rows are
+    independent, so cat-then-GEMV == per-shard-GEMV-then-cat.
+    notes §10bj."""
+    kinds = {reps[i][0] for i in ids}
+    if len(ids) < 2 or len(kinds) != 1:
+        return None
+    kind = next(iter(kinds))
+    if kind == "q8_0":
+        # rep = ("q8_0", qs[N,K] int8, scale[N,K/32] f16)
+        Ks = {reps[i][1].shape[1] for i in ids}
+        if len(Ks) != 1:
+            return None
+        sizes = [reps[i][1].shape[0] for i in ids]
+        qs = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()
+        sc = torch.cat([reps[i][2] for i in ids], dim=0).contiguous()
+        return (("q8_0", qs, sc), sizes)
+    if kind == "q4_0":
+        # rep = ("q4_0", packed[N,K/2] u8, scale[N,K/32] f16); same K -> same K/2
+        Ks = {reps[i][1].shape[1] for i in ids}
+        if len(Ks) != 1:
+            return None
+        sizes = [reps[i][1].shape[0] for i in ids]
+        packed = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()
+        sc = torch.cat([reps[i][2] for i in ids], dim=0).contiguous()
+        return (("q4_0", packed, sc), sizes)
+    return None
+
+
 class GGUFLinearXPUMethod(GGUFLinearMethod):
     """GGUF linear for Intel XPU (PTL Xe3).
 
@@ -1340,6 +1378,14 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 w = qweight[start:end, :offset].contiguous()
                 reps[idx] = _xpu_prepare_shard(w, stype, self.params_dtype)
             layer._xpu_shard_order = ids
+            # D1 (notes §10bf/§10bj): the per-shard q8_0 GEMVs at decode are small-N
+            # (k/v [512,2048] hit only ~48 GB/s = 2.31x BW floor — small N starves
+            # the LSC). If ALL shards share the SAME q8_0/q4_0 rep kind and the same
+            # K, merge their weights into ONE big-N rep (cat rows) so decode runs a
+            # SINGLE large-N GEMV (better LSC util), then slice the output back per
+            # shard. Bit-exact (row-independent). Only for the GEMV reps; fp16 /
+            # k-quant shards keep the per-shard path.
+            layer._xpu_merged = _xpu_try_merge_shards(reps, ids)
         else:
             # GDN out_proj: permute the input (value-head) columns from GGUF
             # [ratio, num_k] order to HF [num_k, ratio]. For quant reps this is
@@ -1352,6 +1398,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
             )
             reps["_single"] = rep
             layer._xpu_shard_order = ["_single"]
+            layer._xpu_merged = None
         layer._xpu_reps = reps
         # free the raw GGUF bytes
         if hasattr(layer, "qweight"):
@@ -1364,9 +1411,17 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x2 = x.reshape(-1, x.shape[-1])
-        parts = [_xpu_shard_matmul(x2, layer._xpu_reps[idx])
-                 for idx in layer._xpu_shard_order]
-        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
+        merged = getattr(layer, "_xpu_merged", None)
+        if merged is not None:
+            # D1: one big-N GEMV over the merged q8_0/q4_0 shards (§10bj). The
+            # merged rep is row-cat in shard_order (q,k,v), so its [M, sum(N)]
+            # output IS already the fused-output concatenation — no split needed.
+            merged_rep, _sizes = merged
+            out = _xpu_shard_matmul(x2, merged_rep)
+        else:
+            parts = [_xpu_shard_matmul(x2, layer._xpu_reps[idx])
+                     for idx in layer._xpu_shard_order]
+            out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=1)
         # The q4_0 ESIMD kernels are fp16-only (PTL has no bf16 ESIMD), so a
         # bf16 network would otherwise get an fp16 tensor back here. Cast the
         # result to the input activation dtype to keep the graph type-consistent.
