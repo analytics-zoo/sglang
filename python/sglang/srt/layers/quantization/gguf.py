@@ -976,9 +976,15 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     # the gather in. xf is [M, hidden] fp16 contiguous from the caller.
     _moe_grouped.moe_up_q4k_ggemv(xf, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
                                   gate_buf, chunks_t, hidden, inter, tok_sorted_i32)
-    g = gate_buf[:, :inter].float()
-    u = gate_buf[:, inter:].float()
-    inter_states = (torch.nn.functional.silu(g) * u).to(torch.float16).contiguous()
+    # P-ELEM-silu (notes §10bl): do silu*mul in fp16 directly. The old explicit
+    # .float() on both halves materialized two [n_route, inter] fp32 intermediates
+    # (the UnrolledElementwise/VectorizedElementwise flood in the prefill trace);
+    # fp16 silu+mul is 4.3x faster (1412→332us @ n_route=8192) and bit-identical
+    # (cos=1.0) since the kernels already produced fp16. (esimd_moe_silu_mul exists
+    # as a binding but its op is in the [skip-ptl] moe module, not built — so the
+    # fp16-lean torch path is the zero-build win.)
+    inter_states = (torch.nn.functional.silu(gate_buf[:, :inter])
+                    * gate_buf[:, inter:]).contiguous()
     out_route = torch.zeros(n_route, hidden, dtype=torch.float16, device=dev)
     if down_is_q6:
         _moe_grouped.moe_down_q6k_ggemv(inter_states, d_ql, d_qh, d_sc, out_route,

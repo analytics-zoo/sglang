@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -105,6 +106,23 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
+
+# ESIMD Gemma fused-add-RMSNorm for Intel XPU (PTL). The CUDA gemma_*rmsnorm ops
+# don't exist on XPU, so GemmaRMSNorm.forward_xpu otherwise falls back to a slow
+# torch native norm. These ESIMD kernels (residual path, fp16, gemma_weight=w+1.0)
+# are built into the sgl-owned kernel package. _esimd_gemma_norm = (single_row_fn,
+# batched_fn) or None. (notes §10bk)
+_esimd_gemma_norm = None
+if _is_xpu:
+    try:
+        from custom_esimd_kernels_sglang import (
+            esimd_fused_add_rms_norm as _esimd_rmsnorm_1,
+            esimd_fused_add_rms_norm_batched as _esimd_rmsnorm_b,
+        )
+
+        _esimd_gemma_norm = (_esimd_rmsnorm_1, _esimd_rmsnorm_b)
+    except ImportError:
+        _esimd_gemma_norm = None
 
 logger = logging.getLogger(__name__)
 
@@ -687,6 +705,36 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # _forward_impl calls gemma_fused_add_rmsnorm/gemma_rmsnorm which are
+        # CUDA-only -> XPU silently fell back to a torch native FusedNormKernel
+        # (~1100ms in the 35B trace). Wire the ESIMD fused-add-RMSNorm instead.
+        # Constraints (verified, notes §10bk):
+        #  - ESIMD kernel only covers the RESIDUAL path (in-place add+norm); the
+        #    no-residual path keeps forward_native.
+        #  - fp16 only (kernel reinterpret_casts fp16); bf16 -> forward_native.
+        #  - Gemma (1+w): the kernel does NOT add 1.0, pass self.gemma_weight.
+        #  - bsz==1 -> single-row kernel; multi-row (prefill) -> _batched.
+        #  - K % 512 == 0 (VL=512, no tail); hidden=2048 ok, guard otherwise.
+        if (
+            residual is not None
+            and x.dtype == torch.float16
+            and x.shape[-1] % 512 == 0
+            and _esimd_gemma_norm is not None
+            and os.environ.get("SGL_XPU_ESIMD_GEMMA_NORM", "1") == "1"
+        ):
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            x = x.contiguous()
+            residual = residual.contiguous()
+            w = self.gemma_weight.to(torch.float16)
+            x2 = x.reshape(-1, x.shape[-1])
+            res2 = residual.reshape(-1, residual.shape[-1])
+            if x2.shape[0] == 1:
+                _esimd_gemma_norm[0](x2, res2, w, self.variance_epsilon)
+            else:
+                _esimd_gemma_norm[1](x2, res2, w, self.variance_epsilon)
+            # kernels update x2/res2 in-place; reshape views share storage.
+            return x, residual
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_with_allreduce_fusion(
