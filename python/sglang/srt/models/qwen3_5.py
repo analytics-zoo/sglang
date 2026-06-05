@@ -455,6 +455,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def _repack_qkvz_ba_for_gdn_attention(self, mixed_qkvz, mixed_ba):
+        """Convert sglang's CONTIGUOUS projection layout into the per-k-head-
+        GROUP INTERLEAVED layout that torch.ops.sgl_kernel.gdn_attention's conv
+        kernel expects (sgl-kernel-xpu/src/gdn_attn/causal_conv1d.hpp:100-177).
+
+        sglang contiguous:  qkvz = [all_q | all_k | all_v | all_z]
+                            ba   = [all_b | all_a]
+        kernel interleaved: qkvz = [g0: q k v(ratio) z(ratio) | g1: ... ]
+                            ba   = [g0: b(ratio) a(ratio) | g1: ... ]
+        where ratio = num_v_heads / num_k_heads, group = per k-head.
+
+        NOTE: contiguous != interleaved at EVERY ratio (incl. ratio 1) — verified
+        in tools/verify_gdn_qkvz_repack.py (all q/k/v/z/b/a round-trip bit-exact).
+        The prior "bit-identical at ratio 1" assumption was wrong; always repack.
+        """
+        hk = self.num_k_heads // self.attn_tp_size
+        ratio = (self.num_v_heads // self.attn_tp_size) // hk
+        dk = self.head_k_dim
+        dv = self.head_v_dim
+        T = mixed_qkvz.shape[0]
+
+        all_q = hk * dk
+        all_k = hk * dk
+        all_v = hk * ratio * dv  # == num_v_heads/tp * dv
+        all_z = all_v
+        q, k, v, z = mixed_qkvz.split([all_q, all_k, all_v, all_z], dim=-1)
+        q = q.reshape(T, hk, dk)
+        k = k.reshape(T, hk, dk)
+        v = v.reshape(T, hk, ratio * dv)
+        z = z.reshape(T, hk, ratio * dv)
+        qkvz_inter = torch.cat([q, k, v, z], dim=-1).reshape(T, -1).contiguous()
+
+        nv_tp = self.num_v_heads // self.attn_tp_size
+        b, a = mixed_ba.split([nv_tp, nv_tp], dim=-1)
+        b = b.reshape(T, hk, ratio)
+        a = a.reshape(T, hk, ratio)
+        ba_inter = torch.cat([b, a], dim=-1).reshape(T, -1).contiguous()
+        return qkvz_inter, ba_inter
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         if (
             _is_cpu
@@ -530,14 +569,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # into scratch), then scatter the (conv_dim, W-1)-laid-out updates
         # back into the pool. Cost is O(bs * conv_dim * (W-1)) per call —
         # negligible for bs=1 decode and still cheap for extend.
+        # DTYPE CONTRACT: gdn_attention dispatches scalar_t off mixed_qkvz /
+        # core_attn_out (= projected_states_qkvz.dtype, here the run dtype) and
+        # reinterpret_casts conv_state / ssm_state / A_log / dt_bias to scalar_t*
+        # (causal_conv1d.hpp:610-619, gated_delta_rule.hpp:362-365,397-406). The
+        # MambaPool defaults are conv=bf16 (SGLANG_MAMBA_CONV_DTYPE) and ssm=fp32
+        # (SGLANG_MAMBA_SSM_DTYPE=None); A_log/dt_bias are fp32. Any tensor whose
+        # native dtype != kdtype is read as garbage bytes (the !!!! bug) — so
+        # cast every kernel-consumed state/param to kdtype here, and scatter
+        # results back in each pool's NATIVE dtype.
+        kdtype = projected_states_qkvz.dtype
         pool_conv = mamba_cache_params.conv[0]  # (cache, conv_dim, W-1)
         pool_ssm = mamba_cache_params.temporal  # (cache, Hv, head_v, head_k)
         scratch_conv = (
-            pool_conv.index_select(0, cache_indices).transpose(-1, -2).contiguous()
-        )  # (bs, W-1, conv_dim) — kernel layout
-        # ssm_state's layout already matches the kernel expectation, so just
-        # gather the active rows.
-        scratch_ssm = pool_ssm.index_select(0, cache_indices).contiguous()
+            pool_conv.index_select(0, cache_indices)
+            .transpose(-1, -2)
+            .to(kdtype)
+            .contiguous()
+        )  # (bs, W-1, conv_dim) — kernel layout + kernel dtype
+        # ssm_state's layout already matches the kernel expectation; gather the
+        # active rows and cast fp32 pool -> kdtype (contiguous so the kernel's
+        # ssm_state_stride_0 = V*K is in kdtype elements).
+        scratch_ssm = (
+            pool_ssm.index_select(0, cache_indices).to(kdtype).contiguous()
+        )
 
         # num_prefills / num_decodes. During pure extend it's bs/0; during
         # pure decode it's 0/bs; we approximate by inspecting forward_mode.
@@ -562,9 +617,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         num_actual_tokens = projected_states_qkvz.shape[0]
 
-        # Contiguity the kernel asserts on.
-        projected_states_qkvz = projected_states_qkvz.contiguous()
-        projected_states_ba = projected_states_ba.contiguous()
+        # Repack sglang's CONTIGUOUS [all_q|all_k|all_v|all_z] / [all_b|all_a]
+        # into the per-k-head-group INTERLEAVED layout the kernel de-interleaves
+        # (causal_conv1d.hpp). Required at every ratio — verified bit-exact in
+        # tools/verify_gdn_qkvz_repack.py. Also makes them contiguous.
+        projected_states_qkvz, projected_states_ba = (
+            self._repack_qkvz_ba_for_gdn_attention(
+                projected_states_qkvz, projected_states_ba
+            )
+        )
 
         # Output buffers (kernel writes into these).
         nv_tp = self.num_v_heads // self.attn_tp_size
@@ -597,8 +658,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ),
             self.conv1d.bias,
             self.activation,
-            self.A_log,
-            self.dt_bias,
+            self.A_log.to(kdtype),
+            self.dt_bias.to(kdtype),
             num_prefills,
             num_decodes,
             has_initial_state,
@@ -611,11 +672,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Scatter kernel writeback into the real MambaPool slots:
         #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
         #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
+        # Scatter back in each pool's NATIVE dtype (conv may be bf16, ssm fp32).
         cache_indices_long = cache_indices.to(torch.long)
         pool_conv.index_copy_(
-            0, cache_indices_long, scratch_conv.transpose(-1, -2).contiguous()
+            0,
+            cache_indices_long,
+            scratch_conv.transpose(-1, -2).to(pool_conv.dtype).contiguous(),
         )
-        pool_ssm.index_copy_(0, cache_indices_long, scratch_ssm)
+        pool_ssm.index_copy_(
+            0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
+        )
 
         # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
         # default path lines 504-519 below.
@@ -656,11 +722,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         _ENABLE_XPU_FAST_PATH = os.environ.get(
             "SGLANG_XPU_GDN_FAST_PATH", "0"
         ) == "1"
+        # Repack adapter (_repack_qkvz_ba_for_gdn_attention) handles any
+        # num_v_heads/num_k_heads ratio (verified bit-exact for ratio 1 & 2),
+        # so the fast path is eligible whenever the kernel's ratio constraint
+        # (num_v_heads % num_k_heads == 0) holds.
         if (
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
             and not forward_batch.forward_mode.is_target_verify()
-            and self.num_v_heads // self.num_k_heads == 1
+            and self.num_v_heads % self.num_k_heads == 0
         ):
             output = self._forward_xpu_fast_path(
                 projected_states_qkvz,
