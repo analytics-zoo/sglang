@@ -187,6 +187,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
         self._bind_packed_weight_loaders(self.in_proj_ba)
 
+        # OPT-1 (notes §11/§12): the GDN fast path (gdn_attention kernel) needs
+        # qkvz/ba in a per-k-head-group INTERLEAVED layout. Instead of the
+        # per-step torch.cat repack (~0.5ms/step, launch-bound at M=1 decode),
+        # bake that static output-feature permutation into the GGUF rep rows at
+        # load. We attach the perms here; GGUFLinearXPUMethod consumes
+        # `_gguf_gdn_out_row_perm` in process_weights_after_loading and the fast
+        # path then skips the repack. On non-XPU-GGUF backends the attrs are
+        # simply ignored (the eager repack still runs). Enabled only when the
+        # fast path is eligible (env + ratio); see _forward_xpu_fast_path.
+        if _is_xpu and os.environ.get("SGLANG_XPU_GDN_BAKE_PERM", "1") == "1":
+            pq, pb = self._build_gdn_out_row_perms()
+            self.in_proj_qkvz._gguf_gdn_out_row_perm = pq
+            self.in_proj_ba._gguf_gdn_out_row_perm = pb
+            self._gdn_out_row_perm_baked = True
+        else:
+            self._gdn_out_row_perm_baked = False
+
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
         value_settings = (self.value_dim, 0, False)
@@ -455,6 +472,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def _build_gdn_out_row_perms(self):
+        """OPT-1: derive the static output-feature permutations that
+        _repack_qkvz_ba_for_gdn_attention applies, as index vectors, so they can
+        be baked into the in_proj rep rows at load (eliminating the per-step cat).
+
+        Each perm P satisfies repack(y)[:, i] == y[:, P[i]] — i.e. running the
+        repack on a row whose values are their own column index yields P. Bake
+        the rep rows by P so the GEMV emits the interleaved layout directly.
+        Bit-exact, verified in tools/verify_gdn_repack_as_weight_perm.py."""
+        hk = self.num_k_heads // self.attn_tp_size
+        ratio = (self.num_v_heads // self.attn_tp_size) // hk
+        dk = self.head_k_dim
+        dv = self.head_v_dim
+        qkvz_w = 2 * hk * dk + 2 * (hk * ratio) * dv
+        ba_w = 2 * (hk * ratio)
+        idx_q = torch.arange(qkvz_w, dtype=torch.float64).reshape(1, qkvz_w)
+        idx_b = torch.arange(ba_w, dtype=torch.float64).reshape(1, ba_w)
+        out_q, out_b = self._repack_qkvz_ba_for_gdn_attention(idx_q, idx_b)
+        perm_q = out_q.reshape(-1).round().long()
+        perm_b = out_b.reshape(-1).round().long()
+        # sanity: both are bijections of their width
+        assert perm_q.numel() == qkvz_w and perm_b.numel() == ba_w
+        assert int(perm_q.min()) == 0 and int(perm_q.max()) == qkvz_w - 1
+        assert int(perm_b.min()) == 0 and int(perm_b.max()) == ba_w - 1
+        assert torch.unique(perm_q).numel() == qkvz_w
+        assert torch.unique(perm_b).numel() == ba_w
+        return perm_q, perm_b
+
     def _repack_qkvz_ba_for_gdn_attention(self, mixed_qkvz, mixed_ba):
         """Convert sglang's CONTIGUOUS projection layout into the per-k-head-
         GROUP INTERLEAVED layout that torch.ops.sgl_kernel.gdn_attention's conv
@@ -579,20 +624,68 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # cast every kernel-consumed state/param to kdtype here, and scatter
         # results back in each pool's NATIVE dtype.
         kdtype = projected_states_qkvz.dtype
+        # OPT-2 (notes §11/§14): A_log / dt_bias are CONSTANT fp32 params, re-cast
+        # to kdtype every decode step every GDN layer (2 launches/layer/step). Cache
+        # the kdtype copy once (keyed by dtype, like _cos_sin_cache_fp16) — the cast
+        # is dtype-deterministic so this is bit-exact vs the per-step .to(). Gated on
+        # the SAME flag as OPT-1 (_gdn_out_row_perm_baked) so SGLANG_XPU_GDN_BAKE_PERM
+        # toggles the OPT-1+OPT-2 bundle together (clean single-variable A/B).
+        if getattr(self, "_gdn_out_row_perm_baked", False):
+            if getattr(self, "_a_log_kdtype_cache", (None, None))[0] != kdtype:
+                self._a_log_kdtype_cache = (
+                    kdtype,
+                    self.A_log.to(kdtype).contiguous(),
+                    self.dt_bias.to(kdtype).contiguous(),
+                )
+            _, a_log_k, dt_bias_k = self._a_log_kdtype_cache
+        else:
+            a_log_k = self.A_log.to(kdtype)
+            dt_bias_k = self.dt_bias.to(kdtype)
         pool_conv = mamba_cache_params.conv[0]  # (cache, conv_dim, W-1)
         pool_ssm = mamba_cache_params.temporal  # (cache, Hv, head_v, head_k)
-        scratch_conv = (
-            pool_conv.index_select(0, cache_indices)
-            .transpose(-1, -2)
-            .to(kdtype)
-            .contiguous()
-        )  # (bs, W-1, conv_dim) — kernel layout + kernel dtype
-        # ssm_state's layout already matches the kernel expectation; gather the
-        # active rows and cast fp32 pool -> kdtype (contiguous so the kernel's
-        # ssm_state_stride_0 = V*K is in kdtype elements).
-        scratch_ssm = (
-            pool_ssm.index_select(0, cache_indices).to(kdtype).contiguous()
+        is_decode = forward_batch.forward_mode.is_decode()
+        # Stage B (§15): for pure DECODE the kernel (NATIVE_LAUNCHER causal_conv1d)
+        # indexes conv_state IN-PLACE by cache_indices with tensor-derived inner
+        # strides, so we pass the WHOLE pool as a transposed VIEW (free, no copy)
+        # + the real cache_indices — eliminating the per-step gather + transpose +
+        # contiguous + scatter (~1.5ms scatter + casts, the +4.88ms adapter). The
+        # conv pool dtype == run dtype (SGLANG_MAMBA_CONV_DTYPE tracks --dtype), so
+        # the in-place write is type-safe (assert guards it). PREFILL still goes
+        # through the XE2 chunk kernel which needs a contiguous [W-1,conv_dim]
+        # scratch, so keep the gather/scatter adapter there (cheap: amortized over
+        # many tokens, §11 prefill cat ~0.22ms).
+        # Stage B in-place: for pure DECODE pass the WHOLE pools (conv as a free
+        # transposed view, ssm as-is fp32) + the real cache_indices, so the kernel
+        # reads/writes pool[cache_indices] in-place. Eliminates the entire adapter
+        # (gather + transpose + cast + scatter, ~4.88ms, §15). The conv pool dtype
+        # must == run dtype (it does: SGLANG_MAMBA_CONV_DTYPE tracks --dtype); the
+        # gated_delta_rule kernel now reads the fp32 ssm pool directly (no cast).
+        use_inplace = (
+            is_decode
+            and getattr(self, "_gdn_inplace", True)
+            and pool_conv.dtype == kdtype
+            and pool_ssm.dtype == torch.float32
         )
+        if use_inplace:
+            scratch_conv = pool_conv.transpose(-1, -2)  # (cache, W-1, conv_dim) view
+            scratch_ssm = pool_ssm                      # (cache, Hv, hv, hk) fp32, in-place
+            kernel_state_indices = cache_indices        # real slots; kernel writes in-place
+        else:
+            scratch_conv = (
+                pool_conv.index_select(0, cache_indices)
+                .transpose(-1, -2)
+                .to(kdtype)
+                .contiguous()
+            )  # (bs, W-1, conv_dim) — kernel layout + kernel dtype
+            # PREFILL (non-inplace) goes through the XE2 chunk_gated_delta_rule
+            # kernel which reads ssm as kdtype (scalar_t) — NOT the fp32-decoupled
+            # gated_delta_rule. So gather + cast to kdtype scratch (dense 0..bs-1),
+            # scattered back to the fp32 pool below via .to(pool.dtype). Decode
+            # (in-place) uses the fp32 gated_delta_rule; pool stays fp32 throughout.
+            scratch_ssm = (
+                pool_ssm.index_select(0, cache_indices).to(kdtype).contiguous()
+            )
+            kernel_state_indices = None  # set to scratch arange below
 
         # num_prefills / num_decodes. During pure extend it's bs/0; during
         # pure decode it's 0/bs; we approximate by inspecting forward_mode.
@@ -621,11 +714,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # into the per-k-head-group INTERLEAVED layout the kernel de-interleaves
         # (causal_conv1d.hpp). Required at every ratio — verified bit-exact in
         # tools/verify_gdn_qkvz_repack.py. Also makes them contiguous.
-        projected_states_qkvz, projected_states_ba = (
-            self._repack_qkvz_ba_for_gdn_attention(
-                projected_states_qkvz, projected_states_ba
+        # OPT-1 (notes §11/§12): when the perm is baked into the GGUF rep rows at
+        # load (_gdn_out_row_perm_baked), the GEMV already emits the interleaved
+        # layout, so skip the per-step cat (~0.5ms/step, launch-bound at M=1).
+        # The projection output is still contiguous (GEMV writes a fresh tensor).
+        if not getattr(self, "_gdn_out_row_perm_baked", False):
+            projected_states_qkvz, projected_states_ba = (
+                self._repack_qkvz_ba_for_gdn_attention(
+                    projected_states_qkvz, projected_states_ba
+                )
             )
-        )
 
         # Output buffers (kernel writes into these).
         nv_tp = self.num_v_heads // self.attn_tp_size
@@ -637,10 +735,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # The kernel takes `cache_indices` so it indexes into `conv_state` as
         # `conv_state[cache_indices[b]]`. Our scratch is densely packed 0..bs-1,
         # so pass an identity index vector to the kernel and scatter back
-        # using the real cache_indices afterwards.
-        scratch_indices = torch.arange(
-            batch_size, device=cache_indices.device, dtype=cache_indices.dtype
-        )
+        # using the real cache_indices afterwards. For the in-place decode path
+        # the kernel uses the REAL cache_indices and writes the pools directly.
+        if kernel_state_indices is None:
+            kernel_state_indices = torch.arange(
+                batch_size, device=cache_indices.device, dtype=cache_indices.dtype
+            )
 
         torch.ops.sgl_kernel.gdn_attention(
             core_attn_out,
@@ -658,30 +758,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ),
             self.conv1d.bias,
             self.activation,
-            self.A_log.to(kdtype),
-            self.dt_bias.to(kdtype),
+            a_log_k,
+            dt_bias_k,
             num_prefills,
             num_decodes,
             has_initial_state,
             query_start_loc,
-            scratch_indices,
+            kernel_state_indices,
             num_actual_tokens,
             self.attn_tp_size,
         )
 
-        # Scatter kernel writeback into the real MambaPool slots:
-        #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
-        #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
-        # Scatter back in each pool's NATIVE dtype (conv may be bf16, ssm fp32).
-        cache_indices_long = cache_indices.to(torch.long)
-        pool_conv.index_copy_(
-            0,
-            cache_indices_long,
-            scratch_conv.transpose(-1, -2).to(pool_conv.dtype).contiguous(),
-        )
-        pool_ssm.index_copy_(
-            0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
-        )
+        # Scatter kernel writeback into the real MambaPool slots. SKIPPED for the
+        # in-place decode path (kernel already wrote pool[cache_indices] directly).
+        if not use_inplace:
+            #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
+            #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
+            cache_indices_long = cache_indices.to(torch.long)
+            pool_conv.index_copy_(
+                0,
+                cache_indices_long,
+                scratch_conv.transpose(-1, -2).to(pool_conv.dtype).contiguous(),
+            )
+            pool_ssm.index_copy_(
+                0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
+            )
 
         # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
         # default path lines 504-519 below.

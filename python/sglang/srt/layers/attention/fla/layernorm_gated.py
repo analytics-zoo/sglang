@@ -40,6 +40,18 @@ if _is_xpu:
     except ImportError:
         _xpu_fused_rms_gated = None
 
+# Plain-SYCL RMSNormGated in the sgl_kernel gdn_attn bucket (rms_norm_gated_sycl.cpp).
+# This is the live replacement for the triton layernorm_gated fallback — the ESIMD
+# awq_fused_xpu variant's build bucket is disabled (oneAPI 2025.3 ESIMD compile
+# wall), so we route through this plain-SYCL op instead. fp16-only, V==hidden.
+_xpu_sgl_rms_gated = None
+if _is_xpu:
+    try:
+        if hasattr(torch.ops.sgl_kernel, "gdn_rms_norm_gated"):
+            _xpu_sgl_rms_gated = torch.ops.sgl_kernel.gdn_rms_norm_gated
+    except Exception:
+        _xpu_sgl_rms_gated = None
+
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
 
@@ -457,6 +469,32 @@ class RMSNorm(torch.nn.Module):
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
             )
+        if (
+            _xpu_sgl_rms_gated is not None
+            and z is not None
+            and self.norm_before_gate
+            and self.group_size is None
+            and self.activation == "swish"
+            and self.bias is None
+            and x.is_xpu
+            and x.dtype == torch.float16
+            and z.dtype == torch.float16
+        ):
+            # Plain-SYCL gdn_rms_norm_gated (replaces the triton fallback — the
+            # last triton kernel on the GDN fast path). fp16-only. Weight is
+            # stored fp16 for Qwen3.5; cache a contiguous fp16 copy.
+            xs = x.reshape(-1, x.shape[-1]).contiguous()
+            zs = z.reshape(-1, z.shape[-1]).contiguous()
+            w = self.weight
+            if w.dtype != torch.float16 or not w.is_contiguous():
+                cache = getattr(self, "_xpu_w_cache", None)
+                if cache is None or cache.dtype != torch.float16:
+                    cache = w.detach().to(torch.float16).contiguous()
+                    self._xpu_w_cache = cache
+                w = cache
+            out = torch.empty_like(xs)
+            _xpu_sgl_rms_gated(out, xs, zs, w, self.eps)
+            return out.reshape(x.shape)
         if (
             _xpu_fused_rms_gated is not None
             and z is not None

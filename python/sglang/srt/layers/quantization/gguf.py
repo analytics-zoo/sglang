@@ -1310,6 +1310,68 @@ def _xpu_permute_gdn_out_cols(rep, perm):
         f"is done in _xpu_repack_* (pass col_perm to _xpu_prepare_shard instead).")
 
 
+def _xpu_perm_rep_rows(rep, perm: torch.Tensor):
+    """Permute the OUTPUT-N rows (axis 0) of a resident rep. N is the output
+    dim, so out[:, perm] == (rep with rows permuted) @ x. Bit-exact (rows are
+    independent). Handles every rep kind by permuting each row-indexed tensor.
+    perm is a LongTensor of length N on the rep's device."""
+    kind = rep[0]
+    perm = perm.to(rep[1].device)
+    if kind == "fp16":
+        return ("fp16", rep[1].index_select(0, perm).contiguous(), None)
+    if kind == "q8_0":
+        # ("q8_0", qs[N,K] int8, scale[N,K/32] f16) — both row-indexed by N
+        return ("q8_0",
+                rep[1].index_select(0, perm).contiguous(),
+                rep[2].index_select(0, perm).contiguous())
+    if kind == "q4_0":
+        return ("q4_0",
+                rep[1].index_select(0, perm).contiguous(),
+                rep[2].index_select(0, perm).contiguous())
+    # k-quant reps (q4_k/q5_k/q6_k) are not expected for the GDN in_proj on the
+    # 35B (q8_0); fall back to an explicit error rather than silently mis-permute.
+    raise NotImplementedError(
+        f"_xpu_perm_rep_rows: output-row perm not implemented for rep kind {kind}"
+    )
+
+
+def _xpu_bake_out_row_perm(reps: dict, merged, ids: list, perm: torch.Tensor):
+    """OPT-1: bake the GDN qkvz/ba interleave (a static output-feature
+    permutation) into the rep ROWS so the GEMV emits the kernel's interleaved
+    layout directly, eliminating the per-step repack cat.
+
+    Builds ONE assembled rep in shard-order row layout (= the [q|k|v|z] /
+    [b|a] concatenation the fast path used to cat), permutes its rows by `perm`,
+    and returns (reps={'_single': rep}, merged=(rep, sizes), order=['_single'])
+    so apply() runs a single GEMV with no per-step cat/split.
+
+    Requires all shards share one rep kind (true for 35B: qkvz all q8_0, ba all
+    fp16). perm length must equal the assembled N (sum of per-shard N)."""
+    if merged is not None:
+        # q8_0/q4_0 already row-cat in shard order -> just permute its rows.
+        merged_rep, sizes = merged
+        N = merged_rep[1].shape[0]
+        assert perm.numel() == N, f"perm {perm.numel()} != merged N {N}"
+        pr = _xpu_perm_rep_rows(merged_rep, perm)
+        return {"_single": pr}, (pr, [N]), ["_single"]
+    # not merged (e.g. ba = 2 fp16 shards): row-cat the per-shard reps in shard
+    # order into one rep, then permute. All must be the same kind.
+    kinds = {reps[i][0] for i in ids}
+    assert len(kinds) == 1, f"_xpu_bake_out_row_perm: mixed kinds {kinds}"
+    kind = next(iter(kinds))
+    if kind == "fp16":
+        w = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()  # [sumN, K]
+        N = w.shape[0]
+        assert perm.numel() == N, f"perm {perm.numel()} != cat N {N}"
+        pr = ("fp16", w.index_select(0, perm.to(w.device)).contiguous(), None)
+        return {"_single": pr}, (pr, [N]), ["_single"]
+    # quant + unmerged (shouldn't happen for GDN in_proj): cat row-indexed tensors
+    qs = torch.cat([reps[i][1] for i in ids], dim=0)
+    sc = torch.cat([reps[i][2] for i in ids], dim=0)
+    pr = _xpu_perm_rep_rows((kind, qs, sc), perm)
+    return {"_single": pr}, (pr, [pr[1].shape[0]]), ["_single"]
+
+
 def _xpu_try_merge_shards(reps: dict, ids: list):
     """D1: if every shard in `ids` is the SAME GEMV rep kind (q8_0 or q4_0) with
     the same K, build one merged rep by row-concatenating the per-shard weights,
@@ -1392,6 +1454,23 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
             # shard. Bit-exact (row-independent). Only for the GEMV reps; fp16 /
             # k-quant shards keep the per-shard path.
             layer._xpu_merged = _xpu_try_merge_shards(reps, ids)
+            # OPT-1 (notes §11/§12): GDN in_proj_qkvz/ba feed the gdn_attention
+            # kernel, which wants a per-k-head-group INTERLEAVED feature layout.
+            # The model normally produces that with a per-step torch.cat repack
+            # (_repack_qkvz_ba_for_gdn_attention) — ~90 CatArrayBatchedCopy/step,
+            # launch-bound at M=1 decode (~0.5ms/step, notes §12). Since the repack
+            # is a STATIC output-feature permutation (POC bit-exact,
+            # tools/verify_gdn_repack_as_weight_perm.py), bake it into the rep ROWS
+            # ONCE here so the GEMV emits interleaved directly and the cat is gone.
+            # The model sets layer._gguf_gdn_out_row_perm at init.
+            out_perm = getattr(layer, "_gguf_gdn_out_row_perm", None)
+            if out_perm is not None:
+                layer._xpu_reps, layer._xpu_merged, layer._xpu_shard_order = (
+                    _xpu_bake_out_row_perm(
+                        reps, layer._xpu_merged, ids, out_perm
+                    )
+                )
+                reps = layer._xpu_reps
         else:
             # GDN out_proj: permute the input (value-head) columns from GGUF
             # [ratio, num_k] order to HF [num_k, ratio]. For quant reps this is
