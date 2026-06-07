@@ -24,6 +24,24 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+# 腿C (#69): the PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_vllm,
+# HD=256). Replaces the cutlass-sycl flash fp16 prefill (which NaNs on PTL) and the
+# slow Python SDPA fallback. Lazily resolved; gated by SGL_XPU_PREFILL_DPAS=1.
+_prefill_dpas_op = None
+_prefill_dpas_tried = False
+
+
+def _get_prefill_dpas_op():
+    global _prefill_dpas_op, _prefill_dpas_tried
+    if not _prefill_dpas_tried:
+        _prefill_dpas_tried = True
+        try:
+            import custom_esimd_kernels_vllm.custom_esimd_kernels_prefill_dpas  # noqa: F401 — registers the op
+            _prefill_dpas_op = torch.ops.custom_esimd_kernels_vllm.esimd_sdpa_prefill_dpas
+        except Exception:
+            _prefill_dpas_op = None
+    return _prefill_dpas_op
+
 
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
@@ -643,20 +661,46 @@ class XPUAttentionBackend(AttentionBackend):
                 not use_cascade_attn
                 and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
             ):
-                result = self._sdpa_fallback(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=cu_seqlens_q,
-                    softmax_scale=layer.scaling,
-                    causal=causal,
-                    window_size=window_size,
-                    tp_q_head_num=layer.tp_q_head_num,
-                    tp_k_head_num=layer.tp_k_head_num,
-                    head_dim=layer.head_dim,
+                # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS
+                # SDPA kernel (cos=1.0 vs ref, incl. scattered-paged) over the slow
+                # Python SDPA fallback. Gated by SGL_XPU_PREFILL_DPAS=1; falls
+                # through to _sdpa_fallback when off / ineligible / op missing.
+                _dpas = (
+                    _get_prefill_dpas_op()
+                    if (
+                        os.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
+                        and q.dtype == torch.float16
+                        and layer.head_dim == 256
+                        and not layer.is_cross_attention
+                    )
+                    else None
                 )
+                if _dpas is not None:
+                    result = _dpas(
+                        q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        key_cache,
+                        value_cache,
+                        cu_seqlens_q.to(torch.int32),
+                        cache_seqlens.to(torch.int32),
+                        causal,
+                        float(layer.scaling),
+                        page_table.to(torch.int32),
+                    )
+                else:
+                    result = self._sdpa_fallback(
+                        q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        softmax_scale=layer.scaling,
+                        causal=causal,
+                        window_size=window_size,
+                        tp_q_head_num=layer.tp_q_head_num,
+                        tp_k_head_num=layer.tp_k_head_num,
+                        head_dim=layer.head_dim,
+                    )
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
