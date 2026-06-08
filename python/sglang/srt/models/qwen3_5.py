@@ -742,47 +742,110 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 batch_size, device=cache_indices.device, dtype=cache_indices.dtype
             )
 
-        torch.ops.sgl_kernel.gdn_attention(
-            core_attn_out,
-            z,
-            projected_states_qkvz,
-            projected_states_ba,
-            self.num_k_heads,
-            self.num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            scratch_conv,
-            scratch_ssm,
-            self.conv1d.weight.view(
+        is_verify = forward_batch.forward_mode.is_target_verify()
+        if is_verify:
+            # MTP target-verify GDN on XPU. The triton GDN path (conv +
+            # fused_sigmoid recurrence) is numerically BROKEN on triton-XPU, so
+            # route verify through the SAME correct SYCL gdn_attention as decode.
+            # The multi-token call only exposes the FINAL state, but the mamba
+            # rollback needs the per-step (post-each-draft-token) ssm/conv state.
+            # Solution (proven offline in tools/gdn_verify_pertoken_check.py: core
+            # rel 3.4e-4 vs the multi-token call, final-state rel 4.5e-4): replay
+            # gdn_attention ONE draft token at a time, threading the gathered
+            # scratch state IN PLACE, and snapshot scratch_ssm/scratch_conv into
+            # the SpeculativeState intermediate buffers after each step (the
+            # post-step state, matching the triton kernels' [cache_idx, step]
+            # write convention). NO commit to the main pool (disable_state_update)
+            # — update_mamba_state_after_mtp_verify scatters the accepted step's
+            # intermediate back. All-SYCL, reuses the only correct GDN kernel on
+            # PTL; no triton, no separate conv kernel.
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            inter_ssm = mamba_cache_params.intermediate_ssm  # [spec+1, draft, Hv, V, K]
+            inter_conv = mamba_cache_params.intermediate_conv_window[0]  # [.,.,dim,W-1]
+            verify_state_idx = linear_backend.verify_intermediate_state_indices[
+                :batch_size
+            ].to(torch.long)
+            step_qsl = torch.arange(
+                batch_size + 1, dtype=torch.int32, device=cache_indices.device
+            )
+            step_his = torch.ones(
+                batch_size, dtype=torch.bool, device=cache_indices.device
+            )
+            row_base = (
+                torch.arange(batch_size, device=cache_indices.device)
+                * draft_token_num
+            )
+            conv_w_view = self.conv1d.weight.view(
                 self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-            ),
-            self.conv1d.bias,
-            self.activation,
-            a_log_k,
-            dt_bias_k,
-            num_prefills,
-            num_decodes,
-            has_initial_state,
-            query_start_loc,
-            kernel_state_indices,
-            num_actual_tokens,
-            self.attn_tp_size,
-        )
+            )
+            for t in range(draft_token_num):
+                rows = row_base + t
+                qkvz_t = projected_states_qkvz.index_select(0, rows).contiguous()
+                ba_t = projected_states_ba.index_select(0, rows).contiguous()
+                core_t = core_attn_out.new_empty(
+                    (batch_size, nv_tp, self.head_v_dim)
+                )
+                z_t = torch.empty_like(core_t)
+                torch.ops.sgl_kernel.gdn_attention(
+                    core_t, z_t, qkvz_t, ba_t,
+                    self.num_k_heads, self.num_v_heads,
+                    self.head_k_dim, self.head_v_dim,
+                    scratch_conv, scratch_ssm, conv_w_view,
+                    self.conv1d.bias, self.activation, a_log_k, dt_bias_k,
+                    batch_size, 0, step_his, step_qsl, kernel_state_indices,
+                    batch_size, self.attn_tp_size,
+                )
+                core_attn_out.index_copy_(0, rows, core_t)
+                z.index_copy_(0, rows, z_t)
+                # Snapshot the POST-step state (state after consuming draft token
+                # t) into the per-step intermediate buffers, dense request index.
+                inter_ssm[verify_state_idx, t] = scratch_ssm.to(inter_ssm.dtype)
+                inter_conv[verify_state_idx, t] = scratch_conv.transpose(
+                    -1, -2
+                ).to(inter_conv.dtype)
+            # disable_state_update: do NOT write scratch back to the main pool.
+        else:
+            torch.ops.sgl_kernel.gdn_attention(
+                core_attn_out,
+                z,
+                projected_states_qkvz,
+                projected_states_ba,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                scratch_conv,
+                scratch_ssm,
+                self.conv1d.weight.view(
+                    self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+                ),
+                self.conv1d.bias,
+                self.activation,
+                a_log_k,
+                dt_bias_k,
+                num_prefills,
+                num_decodes,
+                has_initial_state,
+                query_start_loc,
+                kernel_state_indices,
+                num_actual_tokens,
+                self.attn_tp_size,
+            )
 
-        # Scatter kernel writeback into the real MambaPool slots. SKIPPED for the
-        # in-place decode path (kernel already wrote pool[cache_indices] directly).
-        if not use_inplace:
-            #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
-            #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
-            cache_indices_long = cache_indices.to(torch.long)
-            pool_conv.index_copy_(
-                0,
-                cache_indices_long,
-                scratch_conv.transpose(-1, -2).to(pool_conv.dtype).contiguous(),
-            )
-            pool_ssm.index_copy_(
-                0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
-            )
+            # Scatter kernel writeback into the real MambaPool slots. SKIPPED for
+            # the in-place decode path (kernel already wrote pool[cache_indices]).
+            if not use_inplace:
+                #   conv: (bs, W-1, conv_dim) → (cache, conv_dim, W-1)
+                #   ssm:  (bs, Hv, head_v, head_k) — already matches pool layout
+                cache_indices_long = cache_indices.to(torch.long)
+                pool_conv.index_copy_(
+                    0,
+                    cache_indices_long,
+                    scratch_conv.transpose(-1, -2).to(pool_conv.dtype).contiguous(),
+                )
+                pool_ssm.index_copy_(
+                    0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
+                )
 
         # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
         # default path lines 504-519 below.
@@ -793,7 +856,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad = torch.zeros_like(z)
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
-        core_attn_out = self.norm(core_attn_out, z)
+        _gn = self.norm(core_attn_out, z)
+        core_attn_out = _gn
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
         output, _ = self.out_proj(core_attn_out)
@@ -827,10 +891,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # num_v_heads/num_k_heads ratio (verified bit-exact for ratio 1 & 2),
         # so the fast path is eligible whenever the kernel's ratio constraint
         # (num_v_heads % num_k_heads == 0) holds.
+        # MTP target-verify now routes through the SYCL fast path (per-token
+        # gdn_attention replay + per-step intermediate-state capture, see
+        # _forward_xpu_fast_path's is_verify branch). The triton GDN path is
+        # numerically broken on triton-XPU, so this is the correct route and is
+        # ON BY DEFAULT. SGL_XPU_VERIFY_FASTPATH=0 forces the legacy triton
+        # verify path (GDNAttnBackend.target_verify) for A/B comparison.
+        _allow_verify_fast = os.environ.get("SGL_XPU_VERIFY_FASTPATH", "1") != "0"
         if (
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
-            and not forward_batch.forward_mode.is_target_verify()
+            and (_allow_verify_fast or not forward_batch.forward_mode.is_target_verify())
             and self.num_v_heads % self.num_k_heads == 0
         ):
             output = self._forward_xpu_fast_path(
@@ -889,7 +960,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        _gn = self.norm(core_attn_out, z)
+        core_attn_out = _gn
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -1066,6 +1138,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rope_theta, rope_scaling = get_rope_config(config)
         self.partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
         self.layer_id = layer_id
+        self.is_nextn = is_nextn  # used by the MTP NaN-trace debug probe
 
         # If rope_scaling doesn't specify a scaling type, treat as no scaling
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
@@ -1906,9 +1979,32 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         cfg = getattr(model, "config", None)
         return int(getattr(cfg, "num_hidden_layers", 0))
 
+    def _share_dequant(self, layer):
+        """Return a dense fp16 [rows, hidden] weight for sharing target->draft
+        (EAGLE/NEXTN). Under GGUF on XPU the embed/head are quantized and have NO
+        plain `.weight`: the XPU embed method (GGUFEmbeddingXPUMethod) deletes
+        `.qweight` post-load and keeps `layer._xpu_emb_rep`; a quantized linear
+        head keeps `.qweight`+`.qweight_type`. Dequantize the FULL matrix. (GAP-B)"""
+        w = getattr(layer, "weight", None)
+        if w is not None:
+            return w
+        if hasattr(layer, "_xpu_emb_rep"):
+            qm = layer.quant_method
+            rep = layer._xpu_emb_rep
+            rows = rep[1].shape[0]
+            ids = torch.arange(rows, device=rep[1].device, dtype=torch.long)
+            return qm.embedding(layer, ids)
+        from sglang.srt.layers.quantization.gguf import _xpu_dequant_to_fp16
+        if hasattr(layer, "qweight"):
+            qtype = layer.qweight_type.weight_type
+            return _xpu_dequant_to_fp16(layer.qweight, qtype, torch.float16)
+        raise AttributeError(
+            f"_share_dequant: {type(layer).__name__} has no weight/_xpu_emb_rep/qweight"
+        )
+
     def get_embed_and_head(self):
-        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        embed = self._share_dequant(self.model.embed_tokens) if self.pp_group.is_first_rank else None
+        head = self._share_dequant(self.lm_head) if self.pp_group.is_last_rank else None
         return embed, head
 
     def set_embed_and_head(self, embed, head):
@@ -2172,9 +2268,32 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return 0
         return self.model.layers[0].mlp.num_fused_shared_experts
 
+    def _share_dequant(self, layer):
+        """Return a dense fp16 [rows, hidden] weight for sharing target->draft
+        (EAGLE/NEXTN). Under GGUF on XPU the embed/head are quantized and have NO
+        plain `.weight`: the XPU embed method (GGUFEmbeddingXPUMethod) deletes
+        `.qweight` post-load and keeps `layer._xpu_emb_rep`; a quantized linear
+        head keeps `.qweight`+`.qweight_type`. Dequantize the FULL matrix. (GAP-B)"""
+        w = getattr(layer, "weight", None)
+        if w is not None:
+            return w
+        if hasattr(layer, "_xpu_emb_rep"):
+            qm = layer.quant_method
+            rep = layer._xpu_emb_rep
+            rows = rep[1].shape[0]
+            ids = torch.arange(rows, device=rep[1].device, dtype=torch.long)
+            return qm.embedding(layer, ids)
+        from sglang.srt.layers.quantization.gguf import _xpu_dequant_to_fp16
+        if hasattr(layer, "qweight"):
+            qtype = layer.qweight_type.weight_type
+            return _xpu_dequant_to_fp16(layer.qweight, qtype, torch.float16)
+        raise AttributeError(
+            f"_share_dequant: {type(layer).__name__} has no weight/_xpu_emb_rep/qweight"
+        )
+
     def get_embed_and_head(self):
-        embed = self.model.embed_tokens.weight if self.pp_group.is_first_rank else None
-        head = self.lm_head.weight if self.pp_group.is_last_rank else None
+        embed = self._share_dequant(self.model.embed_tokens) if self.pp_group.is_first_rank else None
+        head = self._share_dequant(self.lm_head) if self.pp_group.is_last_rank else None
         return embed, head
 
     def set_embed_and_head(self, embed, head):

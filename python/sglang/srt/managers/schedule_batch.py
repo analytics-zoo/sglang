@@ -954,6 +954,11 @@ class Req(ReqDllmMixin):
         Args:
             accepted_draft_tokens: Number of draft tokens accepted in this step.
         """
+        # accepted_draft_tokens can be -1 when a step accepts ZERO draft tokens
+        # (caller computes sum(accepted) - 1); clamp to 0 so the histogram (pure
+        # stats) never indexes negatively / crashes the scheduler.
+        if accepted_draft_tokens < 0:
+            accepted_draft_tokens = 0
         if len(self.spec_acceptance_histogram) <= accepted_draft_tokens:
             self.spec_acceptance_histogram.extend(
                 [0] * (accepted_draft_tokens - len(self.spec_acceptance_histogram) + 1)

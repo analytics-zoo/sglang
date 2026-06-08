@@ -87,6 +87,60 @@ def _fused_mamba_state_scatter_with_mask_kernel(
     tl.store(dst_ptr + dst_offset + offsets, data, mask=mask)
 
 
+def _xpu_mamba_state_scatter_with_mask(
+    dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
+    src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
+    dst_indices_raw: torch.Tensor,  # [total_requests]
+    step_indices_raw: torch.Tensor,  # [total_requests]; entry >= 0 means valid
+):
+    """Vectorized XPU equivalent of the triton fused gather-scatter.
+
+    Semantics (mirror the triton kernel exactly, incl. its bounds checks):
+      for each request i where step_indices_raw[i] >= 0:
+        src_idx  = i
+        dst_idx  = dst_indices_raw[i]
+        step_idx = step_indices_raw[i]
+        if dst_idx in [0,dst_req_size) and src_idx in [0,src_req_size)
+           and step_idx in [0,src_step_size):
+          dst[:, dst_idx, :] = src[:, src_idx, step_idx, :]
+
+    Done with a single boolean mask + advanced-index assignment over the layer
+    dim (no Python per-request loop, no .item() — R13). dst/src must be
+    contiguous (the caller's invariant).
+    """
+    total_requests = step_indices_raw.shape[0]
+    src_req_size = src.shape[1]
+    src_step_size = src.shape[2]
+    dst_req_size = dst.shape[1]
+    device = dst.device
+
+    dst_idx = dst_indices_raw.to(torch.long)
+    step_idx = step_indices_raw.to(torch.long)
+    req_idx = torch.arange(total_requests, device=device, dtype=torch.long)
+
+    valid = (
+        (step_idx >= 0)
+        & (dst_idx >= 0)
+        & (dst_idx < dst_req_size)
+        & (req_idx < src_req_size)
+        & (step_idx < src_step_size)
+    )
+    if not bool(valid.any()):
+        return
+
+    v_req = req_idx[valid]      # source request indices
+    v_dst = dst_idx[valid]      # destination cache lines
+    v_step = step_idx[valid]    # per-request accepted step
+
+    # src[:, v_req, v_step, :] -> gather along (req, step) for every layer.
+    # Indexing src[:, v_req, v_step] broadcasts the two index tensors and keeps
+    # the leading layer dim + trailing state dims:
+    #   result shape [num_layers, num_valid, *state_shape]
+    gathered = src[:, v_req, v_step]
+    # scatter into dst[:, v_dst, :]
+    dst[:, v_dst] = gathered
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
@@ -117,6 +171,18 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
+
+    # XPU has no triton; this op is a pure masked gather-scatter (no math), so a
+    # vectorized torch equivalent is correct and device-sync-free (R13: one
+    # device-side boolean_mask + advanced-index assign, NOT a per-request loop
+    # with .item()). dst[:, dst_idx[v], :] = src[:, v, step_idx[v], :] for
+    # requests where step_indices_raw[v] >= 0.
+    if dst.device.type == "xpu":
+        _xpu_mamba_state_scatter_with_mask(
+            dst, src, dst_indices_raw, step_indices_raw
+        )
+        return
+
     if not dst.is_cuda or not src.is_cuda:
         raise ValueError(
             "fused_mamba_state_scatter_with_mask only supports CUDA tensors."

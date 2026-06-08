@@ -56,6 +56,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
+            "intel_xpu": self._create_intel_xpu_decode_backend,
         }
 
         return self._create_backend(
@@ -81,6 +82,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
+            "intel_xpu": self._create_intel_xpu_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -133,6 +135,18 @@ class DraftBackendFactory:
         return TritonMultiStepDraftBackend(
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
+
+    def _create_intel_xpu_decode_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUMultiStepDraftBackend
+
+        return XPUMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
+    def _create_intel_xpu_prefill_backend(self):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        return XPUAttentionBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_aiter_decode_backend(self):
         from sglang.srt.layers.attention.aiter_backend import AiterMultiStepDraftBackend

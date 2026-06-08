@@ -3414,6 +3414,12 @@ class ServerArgs:
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
                 "HYV3ForCausalLM",
+                # Qwen3.5/3.6 MoE: the MTP (NextN) head lives in the SAME
+                # checkpoint (blk.<num_hidden_layers>.nextn.*). NEXTN draft loads
+                # the same model path; model_config swaps the draft arch to
+                # Qwen3_5ForCausalLMMTP. (GGUF MTP load: notes/qwen35_gguf_mtp_gap.md)
+                "Qwen3_5MoeForConditionalGeneration",
+                "Qwen3_5ForConditionalGeneration",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path

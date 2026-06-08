@@ -258,9 +258,10 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert (
-                    False
-                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
+                # NOTE(mtp-xpu): the per-step draft-decode metadata below is a
+                # 1:1 port of the FlashAttentionBackend draft path. Only topk<=1
+                # (linear chain) is exercised on XPU today; topk>1 (branching
+                # tree) needs the cascade/tree-mask verify path, still untested.
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -268,6 +269,9 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
                         self.speculative_step_id + 1
                     )
+                    # Draft decode is 1 query token per sequence; the esimd /
+                    # flash decode paths read max_seq_len_q.
+                    metadata.max_seq_len_q = 1
                     metadata.cu_seqlens_q = torch.arange(
                         0, batch_size + 1, dtype=torch.int32, device=device
                     )
@@ -1558,3 +1562,87 @@ class XPUAttentionBackend(AttentionBackend):
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+class XPUMultiStepDraftBackend:
+    """Wrap multiple XPUAttentionBackend instances as one for the consecutive
+    draft-decode steps of EAGLE/NEXTN speculative decoding.
+
+    Mirrors FlashAttentionMultiStepBackend: each step gets its own
+    XPUAttentionBackend with a distinct speculative_step_id, and the per-step
+    forward metadata is recomputed straight from forward_batch — so unlike the
+    Triton multi-step backend, NO separate generate_draft_decode_kv_indices
+    kernel is needed (the XPU backend reads req_to_token directly, same as
+    FlashAttention).
+
+    Only topk<=1 (linear draft chain) is supported on XPU today; topk>1
+    (branching tree) needs the tree-mask cascade verify path, which the XPU
+    backend does not implement yet.
+    """
+
+    def __init__(
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        if topk > 1:
+            raise NotImplementedError(
+                "intel_xpu draft attention backend only supports "
+                "speculative-eagle-topk <= 1 (linear chain); topk>1 tree "
+                "verify is not implemented on XPU yet."
+            )
+        self.model_runner = model_runner
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(
+                XPUAttentionBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    speculative_step_id=i,
+                    topk=self.topk,
+                    speculative_num_steps=self.speculative_num_steps,
+                )
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+            )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )

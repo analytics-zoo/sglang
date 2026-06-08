@@ -108,14 +108,30 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        del self.model.embed_tokens.weight
+        # The eagle/nextn embed-share replaces the draft's embed_tokens/lm_head
+        # with the TARGET's (dequantized) shared `.weight`. For a GGUF-quantized
+        # draft, embed_tokens has NO plain `.weight` (XPU GGUF stores
+        # `_xpu_emb_rep`, deletes `.qweight` post-load). We just need to ASSIGN
+        # `.weight`; the GGUF embedding()/apply() methods now prefer a present
+        # `.weight` over the rep (gguf.py), so leaving the rep in place is
+        # harmless. Only `del` a `.weight` that actually exists (non-GGUF draft).
+        def _del_weight_if_present(layer):
+            if "weight" in layer._parameters or hasattr(layer, "weight"):
+                try:
+                    del layer.weight
+                except AttributeError:
+                    pass
+
+        _del_weight_if_present(self.model.embed_tokens)
         if not self.config.tie_word_embeddings:
-            del self.lm_head.weight
+            _del_weight_if_present(self.lm_head)
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # device-agnostic (XPU has no torch.cuda): use the active device module.
+        _dev = torch.get_device_module()
+        _dev.empty_cache()
+        _dev.synchronize()
 
     @torch.no_grad()
     def forward(

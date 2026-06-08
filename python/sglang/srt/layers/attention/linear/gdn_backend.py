@@ -21,6 +21,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
+import os as _os
+
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -421,19 +423,47 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
-                mixed_qkv_reshaped,
-                conv_states,
-                layer.conv_weights,
-                layer.bias,
-                layer.activation,
-                conv_state_indices=cache_indices[:batch_size],
-                intermediate_conv_window=intermediate_conv_window_cache,
-                intermediate_state_indices=intermediate_state_indices[:batch_size],
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-                retrieve_parent_token=retrieve_parent_token,
-            )
+            if _os.environ.get("SGL_XPU_GDN_VERIFY_TRITON") != "1":
+                # SYCL depthwise causal conv (eagle_ops) — the triton
+                # causal_conv1d_update is numerically broken on triton-XPU
+                # (whole triton GDN path is). topk=1 chain only.
+                import torch as _t
+                if not getattr(GDNAttnBackend, "_convv_loaded", False):
+                    import custom_esimd_kernels_sglang  # noqa: F401
+                    GDNAttnBackend._convv_loaded = True
+                act_i = 1 if layer.activation in ("silu", "swish") else 0
+                # out + all kernel tensors MUST be contiguous in the layout my
+                # kernel indexes ([bs,conv_dim,N] row-major). empty_like of a
+                # transposed VIEW keeps the view's strides -> scrambled writes.
+                mixed_qkv_processed = _t.empty(
+                    mixed_qkv_reshaped.shape, dtype=mixed_qkv_reshaped.dtype,
+                    device=mixed_qkv_reshaped.device,
+                )  # contiguous [bs, conv_dim, N]
+                _t.ops.eagle_ops.causal_conv1d_verify(
+                    mixed_qkv_processed,
+                    mixed_qkv_reshaped.contiguous(),
+                    layer.conv_weights.contiguous(),
+                    layer.bias.contiguous() if layer.bias is not None else None,
+                    conv_states.contiguous(),
+                    intermediate_conv_window_cache,
+                    cache_indices[:batch_size].to(_t.int32).contiguous(),
+                    intermediate_state_indices[:batch_size].to(_t.int32).contiguous(),
+                    int(act_i),
+                )
+            else:
+                mixed_qkv_processed = causal_conv1d_update(
+                    mixed_qkv_reshaped,
+                    conv_states,
+                    layer.conv_weights,
+                    layer.bias,
+                    layer.activation,
+                    conv_state_indices=cache_indices[:batch_size],
+                    intermediate_conv_window=intermediate_conv_window_cache,
+                    intermediate_state_indices=intermediate_state_indices[:batch_size],
+                    retrieve_next_token=retrieve_next_token,
+                    retrieve_next_sibling=retrieve_next_sibling,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)

@@ -1086,11 +1086,24 @@ def get_gguf_extra_tensor_names(
 
 
 def gguf_quant_weights_iterator(
-    gguf_file: str, gguf_to_hf_name_map: Dict[str, str]
+    gguf_file: str,
+    gguf_to_hf_name_map: Dict[str, str],
+    mtp_rebase: Optional[Tuple[int, int, str]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the quant weights in the model gguf files and convert
     them to torch tensors
+
+    ``mtp_rebase`` (MTP / NextN draft loading): when set to
+    ``(src_layer, dst_layer, prefix)`` the routed-expert tensors of GGUF layer
+    ``src_layer`` (the MTP layer, e.g. blk.40) are emitted under
+    ``{prefix}model.layers.{dst_layer}.mlp.experts.*`` (e.g.
+    ``mtp.model.layers.0.mlp.experts.*``), and ALL other layers' experts are
+    skipped (the draft has a single layer). When ``None`` (the main model)
+    experts emit the legacy ``model.layers.{layer_id}.mlp.experts.*`` names.
+    The expert path regexes the GGUF tensor name directly and bypasses
+    ``gguf_to_hf_name_map``, so the rebase must be applied here.
+    See notes/qwen35_gguf_mtp_gap.md.
     """
 
     import gguf
@@ -1103,6 +1116,38 @@ def gguf_quant_weights_iterator(
         "ffn_up_exps": "up_proj",  # up projection
         "ffn_down_exps": "down_proj",  # down projection
     }
+
+    # MTP draft: target names that map to BARE (non-quant) params — these must
+    # arrive as a plain `.weight` (dequantized), never `.qweight`. Covers `fc`
+    # (nextn.eh_proj, Q8_0 -> bare nn.Linear) and the router gates (blk.<L>.
+    # ffn_gate_inp / ffn_gate_inp_shexp are BF16 in the MTP layer — the only 2
+    # BF16 tensors in the whole GGUF; the main model's gates are F32). The gguf
+    # iterator otherwise treats any non-F32 type as quantized and appends
+    # `.qweight`, which misses these bare params.
+    _MTP_BARE_WEIGHT_TARGETS = {
+        "mtp.fc.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+    }
+
+    def _expert_base(layer_id: int, expert_id: int, hf_weight_name: str):
+        """HF param base for one expert, applying MTP rebase/prefix/filter.
+
+        Returns None if this expert tensor should be SKIPPED for the current
+        (main vs MTP-draft) load.
+        """
+        if mtp_rebase is None:
+            return f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}"
+        src_layer, dst_layer, prefix = mtp_rebase
+        if layer_id != src_layer:
+            return None  # draft loads only the MTP layer's experts
+        # `prefix` is "mtp." — Qwen3_5ForCausalLMMTP.load_weights does
+        # `mtp.`->`model.`, so emit `mtp.layers.{dst}...` (NOT mtp.model.layers,
+        # which would become a double `model.` and miss the params_dict).
+        return (
+            f"{prefix}layers.{dst_layer}.mlp.experts."
+            f"{expert_id}.{hf_weight_name}"
+        )
 
     # First pass: yield weight types
     for tensor in reader.tensors:
@@ -1130,12 +1175,18 @@ def gguf_quant_weights_iterator(
                     weight = tensor.data
                     num_experts = weight.shape[0]
                     for expert_id in range(num_experts):
-                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
-                        yield hf_name, torch.tensor(weight_type)
+                        base = _expert_base(layer_id, expert_id, hf_weight_name)
+                        if base is None:
+                            continue
+                        yield f"{base}.qweight_type", torch.tensor(weight_type)
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
 
+            # MTP bare-weight targets (fc + router gates) are dequantized to a
+            # plain `.weight` in pass 2, so emit NO qweight_type for them.
+            if mtp_rebase is not None and name in _MTP_BARE_WEIGHT_TARGETS:
+                continue
             if weight_type.name != "F32":
                 weight_type_name = name.replace("weight", "qweight_type")
                 yield weight_type_name, torch.tensor(weight_type)
@@ -1165,18 +1216,40 @@ def gguf_quant_weights_iterator(
                     # Packed format: [num_experts, ...]
                     num_experts = weight.shape[0]
                     for expert_id in range(num_experts):
+                        base = _expert_base(layer_id, expert_id, hf_weight_name)
+                        if base is None:
+                            continue
                         expert_weight = weight[expert_id]
-
-                        if weight_type.name != "F32":
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
-                        else:
-                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
-
-                        yield hf_name, torch.tensor(expert_weight)
+                        suffix = (
+                            "qweight" if weight_type.name != "F32" else "weight"
+                        )
+                        yield f"{base}.{suffix}", torch.tensor(expert_weight)
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]
 
+            # MTP bare-weight targets (fc=nextn.eh_proj Q8_0; router gates BF16):
+            # the wrapped MTP class builds these as BARE Linear/gate params (no
+            # qweight), but the GGUF stores them non-F32. Dequantize to fp16 and
+            # yield a plain `.weight`. (Small tensors; one-time at load.)
+            if (
+                mtp_rebase is not None
+                and name in _MTP_BARE_WEIGHT_TARGETS
+                and weight_type.name != "F32"
+            ):
+                import gguf as _gguf
+
+                deq = torch.tensor(_gguf.dequantize(weight, weight_type)).to(
+                    torch.float16
+                )
+                # shared_expert_gate param is [1, hidden] (a 1-row Linear) but the
+                # GGUF ffn_gate_inp_shexp is a 1-D [hidden] vector — add the row
+                # dim so it loads (the main model's F32 gate matches because its
+                # param is 1-D; the MTP class builds it as [1, hidden]).
+                if name.endswith("shared_expert_gate.weight") and deq.dim() == 1:
+                    deq = deq.unsqueeze(0)
+                yield name, deq
+                continue
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
             param = torch.tensor(weight)

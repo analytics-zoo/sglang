@@ -4,11 +4,12 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda or _is_hip or _is_musa:
@@ -134,6 +135,23 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_xpu:
+        # XPU: the build_tree kernel lives in custom_esimd_kernels_sglang's
+        # eagle_ops (torch.ops.eagle_ops.build_tree_kernel_efficient), not sgl_kernel.
+        torch.ops.eagle_ops.build_tree_kernel_efficient(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -198,5 +216,22 @@ def verify_tree_greedy_func(
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
+        )
+    elif _is_xpu:
+        # XPU: verify_tree_greedy lives in custom_esimd_kernels_sglang's
+        # eagle_ops (SYCL port of eagle_utils.cu::VerifyTreeGreedy). Positional
+        # args (the torch.ops schema doesn't take the retrive_* kwarg names).
+        # Without this branch verify_tree_greedy is a NO-OP on XPU, leaving
+        # accept_index/accept_token_num uninitialized -> OOB indices in
+        # _mamba_verify_update -> device-lost.
+        torch.ops.eagle_ops.verify_tree_greedy(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
         )
     return predicts, accept_index, accept_token_num

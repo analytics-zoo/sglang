@@ -216,25 +216,56 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_sigmoid_gating_delta_rule_update(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            is_kda=False,
-            # target_verify specific parameters
-            disable_state_update=True,
-            intermediate_states_buffer=intermediate_states_buffer,
-            intermediate_state_indices=intermediate_state_indices,
-            cache_steps=cache_steps,
-            retrieve_parent_token=retrieve_parent_token,
-        )
+        import os as _os
+        if is_xpu() and _os.environ.get("SGL_XPU_GDN_VERIFY_TRITON") != "1":
+            # SYCL GDN verify recurrence (custom_esimd_kernels_sglang.eagle_ops),
+            # replacing the triton fused_sigmoid path which is numerically WRONG
+            # on triton-XPU (produces ~100x-too-large core_attn_out vs the decode
+            # SYCL kernel -> garbage). All-SYCL goal + measured-correct recurrence.
+            # topk=1 (linear chain) only: tokens processed sequentially per req.
+            # SGL_XPU_GDN_VERIFY_TRITON=1 forces the (broken) triton path for A/B.
+            import torch as _t
+            if not getattr(TritonGDNKernel, "_gdnv_loaded", False):
+                import custom_esimd_kernels_sglang  # noqa: F401 — registers eagle_ops
+                TritonGDNKernel._gdnv_loaded = True
+            # q/k:[1,T,Hk,K] v:[1,T,Hv,V] a,b:[T,Hv]; A_log/dt_bias fp32; ssm fp32.
+            out = _t.empty_like(v)  # [1,T,Hv,V], same dtype as v
+            a2 = a[0] if a.dim() == 3 else a
+            b2 = b[0] if b.dim() == 3 else b
+            _t.ops.eagle_ops.gdn_target_verify(
+                out, q.contiguous(), k.contiguous(), v.contiguous(),
+                a2.contiguous(), b2.contiguous(),
+                A_log.float().contiguous(), dt_bias.float().contiguous(),
+                ssm_states, intermediate_states_buffer,
+                query_start_loc.to(_t.int32).contiguous(),
+                cache_indices.to(_t.int32).contiguous(),
+                intermediate_state_indices.to(_t.int32).contiguous(),
+                int(cache_steps),
+            )
+            # match the triton fused path's return shape exactly:
+            # fused_sigmoid returns o = new_empty(NK=1,*v.shape).squeeze(0) =
+            # [1,T,Hv,V] (v is [1,T,Hv,V]). Our `out` is already [1,T,Hv,V].
+        else:
+            out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                is_kda=False,
+                # target_verify specific parameters
+                disable_state_update=True,
+                intermediate_states_buffer=intermediate_states_buffer,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=cache_steps,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        return out

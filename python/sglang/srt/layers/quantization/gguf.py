@@ -639,6 +639,15 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
             del layer.qweight
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        # Eagle/NEXTN embed-share: set_embed_and_head may have replaced this
+        # layer's table with the TARGET's shared dequantized `.weight`
+        # ([vocab, hidden] fp16). When present it takes priority over the GGUF
+        # rep — a plain embedding lookup (graph-safe, no dequant).
+        shared_w = getattr(layer, "weight", None)
+        if isinstance(shared_w, torch.Tensor):
+            x_flat = x.flatten()
+            out = torch.nn.functional.embedding(x_flat, shared_w.to(self.params_dtype))
+            return out.view(*x.shape, shared_w.shape[1])
         rep = getattr(layer, "_xpu_emb_rep", None)
         if rep is None:  # not yet processed (shouldn't happen post-load)
             qweight = layer.qweight
