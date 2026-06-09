@@ -746,64 +746,59 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if is_verify:
             # MTP target-verify GDN on XPU. The triton GDN path (conv +
             # fused_sigmoid recurrence) is numerically BROKEN on triton-XPU, so
-            # route verify through the SAME correct SYCL gdn_attention as decode.
-            # The multi-token call only exposes the FINAL state, but the mamba
-            # rollback needs the per-step (post-each-draft-token) ssm/conv state.
-            # Solution (proven offline in tools/gdn_verify_pertoken_check.py: core
-            # rel 3.4e-4 vs the multi-token call, final-state rel 4.5e-4): replay
-            # gdn_attention ONE draft token at a time, threading the gathered
-            # scratch state IN PLACE, and snapshot scratch_ssm/scratch_conv into
-            # the SpeculativeState intermediate buffers after each step (the
-            # post-step state, matching the triton kernels' [cache_idx, step]
-            # write convention). NO commit to the main pool (disable_state_update)
-            # — update_mamba_state_after_mtp_verify scatters the accepted step's
-            # intermediate back. All-SYCL, reuses the only correct GDN kernel on
-            # PTL; no triton, no separate conv kernel.
+            # run the verify conv+recurrence in ONE all-SYCL eagle_ops kernel
+            # (gdn_fused_verify) per layer — instead of replaying gdn_attention
+            # per draft token (~4 launches/layer + ~40 glue ops/layer, launch-
+            # bound on PTL). The fused kernel takes the RAW interleaved
+            # projection directly, does gdn_attention's internal conv channel
+            # reorder + width-W causal conv + the gated_delta_rule recurrence,
+            # and emits the per-step (post-each-draft-token) ssm + conv-window
+            # intermediates the mamba rollback needs. NO commit to the main pool
+            # (disable_state_update) — update_mamba_state_after_mtp_verify
+            # scatters the accepted step's intermediate back. Layout + numerics
+            # validated vs gdn_attention in tools/gdn_fused_sycl_check.py
+            # (out rel 6.8e-4, inter_ssm rel 3.9e-4). projected_states_qkvz/_ba
+            # are already in the interleaved layout the kernel expects (repacked
+            # above, or GEMV-baked). A_log/dt_bias MUST be fp32 (self.*), not the
+            # kdtype copies.
+            if not getattr(self, "_gdn_fused_loaded", False):
+                import custom_esimd_kernels_sglang  # noqa: F401 — registers eagle_ops
+                self._gdn_fused_loaded = True
             draft_token_num = forward_batch.spec_info.draft_token_num
-            inter_ssm = mamba_cache_params.intermediate_ssm  # [spec+1, draft, Hv, V, K]
-            inter_conv = mamba_cache_params.intermediate_conv_window[0]  # [.,.,dim,W-1]
+            inter_ssm = mamba_cache_params.intermediate_ssm  # [slots, draft, Hv, V, K]
+            inter_conv = mamba_cache_params.intermediate_conv_window[0]  # [slots,draft,dim,W-1]
             verify_state_idx = linear_backend.verify_intermediate_state_indices[
                 :batch_size
-            ].to(torch.long)
-            step_qsl = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=cache_indices.device
-            )
-            step_his = torch.ones(
-                batch_size, dtype=torch.bool, device=cache_indices.device
-            )
-            row_base = (
-                torch.arange(batch_size, device=cache_indices.device)
-                * draft_token_num
-            )
+            ]
             conv_w_view = self.conv1d.weight.view(
                 self.conv1d.weight.size(0), self.conv1d.weight.size(2)
             )
-            for t in range(draft_token_num):
-                rows = row_base + t
-                qkvz_t = projected_states_qkvz.index_select(0, rows).contiguous()
-                ba_t = projected_states_ba.index_select(0, rows).contiguous()
-                core_t = core_attn_out.new_empty(
-                    (batch_size, nv_tp, self.head_v_dim)
-                )
-                z_t = torch.empty_like(core_t)
-                torch.ops.sgl_kernel.gdn_attention(
-                    core_t, z_t, qkvz_t, ba_t,
-                    self.num_k_heads, self.num_v_heads,
-                    self.head_k_dim, self.head_v_dim,
-                    scratch_conv, scratch_ssm, conv_w_view,
-                    self.conv1d.bias, self.activation, a_log_k, dt_bias_k,
-                    batch_size, 0, step_his, step_qsl, kernel_state_indices,
-                    batch_size, self.attn_tp_size,
-                )
-                core_attn_out.index_copy_(0, rows, core_t)
-                z.index_copy_(0, rows, z_t)
-                # Snapshot the POST-step state (state after consuming draft token
-                # t) into the per-step intermediate buffers, dense request index.
-                inter_ssm[verify_state_idx, t] = scratch_ssm.to(inter_ssm.dtype)
-                inter_conv[verify_state_idx, t] = scratch_conv.transpose(
-                    -1, -2
-                ).to(inter_conv.dtype)
-            # disable_state_update: do NOT write scratch back to the main pool.
+            act_i = 1 if self.activation in ("silu", "swish") else 0
+            torch.ops.eagle_ops.gdn_fused_verify(
+                core_attn_out,
+                z,                                      # gate out: reordered z-block
+                projected_states_qkvz.contiguous(),
+                projected_states_ba.contiguous(),
+                conv_w_view.contiguous(),
+                self.conv1d.bias.contiguous() if self.conv1d.bias is not None else None,
+                pool_conv,                              # [slots, conv_dim, W-1] pool
+                self.A_log.float().contiguous(),
+                self.dt_bias.float().contiguous(),
+                pool_ssm,                               # [slots, Hv, V, K] fp32 pool
+                inter_ssm,
+                inter_conv,
+                query_start_loc.to(torch.int32).contiguous(),
+                cache_indices.to(torch.int32).contiguous(),
+                verify_state_idx.to(torch.int32).contiguous(),
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                int(act_i),
+                int(draft_token_num),
+            )
+            # disable_state_update: main ssm/conv pools left untouched; the
+            # mamba scatter commits the accepted step from inter_ssm/inter_conv.
         else:
             torch.ops.sgl_kernel.gdn_attention(
                 core_attn_out,

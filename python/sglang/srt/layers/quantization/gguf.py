@@ -109,6 +109,8 @@ elif _is_xpu:
     (esimd_gemv_q8_0,) = _imp_kernels(("esimd_gemv_q8_0",))
     (esimd_gemv_q4_k,) = _imp_kernels(("esimd_gemv_q4_k",))
     esimd_gemv_q5_k, esimd_gemv_q6_k = _imp_kernels(("esimd_gemv_q5_k", "esimd_gemv_q6_k"))
+    # M-tiled q6_K GEMV (small M, MTP verify) — optional (older .so may lack it).
+    (esimd_gemv_q6_k_m,) = _imp_kernels(("esimd_gemv_q6_k_m",))
     esimd_moe_up_q4k, esimd_moe_down_q5k, esimd_moe_down_q6k = _imp_kernels(
         ("esimd_moe_up_q4k", "esimd_moe_down_q5k", "esimd_moe_down_q6k"))
 else:
@@ -723,6 +725,27 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
 
+        # Small-M (e.g. MTP verify, M = draft_token_num <= 16): the dense fallback
+        # below dequantizes Q6_K -> a 2.5x-bigger fp16 vocab table (~1GB) + a
+        # generic GEMM (reads 1017MB/call). The M-tiled GEMV reads the 413MB Q6_K
+        # ONCE (weights-resident, M accumulators) — measured 2.35x faster at M=4
+        # (tools/q6k_mgemv_check.py, cos=1.0) AND avoids materializing the 1GB
+        # fp16 table. q6_k only (lm_head is Q6_K; that's where the bytes win is).
+        if (
+            rep is not None
+            and rep[0] == "q6_k"
+            and 2 <= M <= 16
+            and esimd_gemv_q6_k_m is not None
+        ):
+            xf = x2.to(torch.float16).contiguous()
+            N = rep[1].shape[0]
+            out = torch.empty(M, N, dtype=torch.float16, device=xf.device)
+            esimd_gemv_q6_k_m(xf, rep[1], rep[2], rep[3], out)
+            out = out.to(x.dtype)
+            if bias is not None:
+                out = out + bias
+            return out.reshape(*x.shape[:-1], out.shape[-1])
+
         w = getattr(layer, "_xpu_lmhead_dense", None)
         if w is None:
             # process_weights_after_loading deletes layer.qweight and keeps the
@@ -967,24 +990,50 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     # ~10% of prefill) is gone. tok_sorted as int32 for the kernel.
     tok_sorted_i32 = tok_sorted.to(torch.int32).contiguous()
     counts = torch.bincount(exp_sorted, minlength=E)
-    offs = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), counts.cumsum(0)]).cpu().tolist()
-    # The GGEMV kernel processes at most MAX_M=64 tokens per chunk (hardcoded
-    # tiling); split any expert with >64 routed tokens into contiguous ≤64
-    # sub-chunks, else tokens beyond 64 are silently dropped (wrong output).
+    cumsum = counts.cumsum(0)
+    # chunks_t = [n_chunks, 3] int32 cols (eid, t0, nt) = the non-empty expert
+    # groups in sorted-token order; the GGEMV kernel iterates these. The kernel
+    # tiles at most MAX_M=64 tokens/chunk, so any expert with >64 routed tokens
+    # must split into ≤64 sub-chunks (else tokens beyond 64 are dropped).
     MAX_M = 64
-    chunks = []
-    for e in range(E):
-        s, n = offs[e], offs[e + 1] - offs[e]
-        while n > 0:
-            c = min(MAX_M, n)
-            chunks.append([e, s, c])
-            s += c; n -= c
-    chunks_t = torch.tensor(chunks, dtype=torch.int32, device=dev)
+    # FAST PATH (small M, e.g. MTP verify M≤19): every per-expert count ≤ M < 64,
+    # so NO splitting needed — build chunks_t ENTIRELY ON-DEVICE (no .cpu()/.item()
+    # host sync, no 256-iter Python loop). Those host costs are M-independent and
+    # dominated the small-M grouped path (2.2x slower than per-route at M≤2; the
+    # whole reason verify's M=4 grouped MoE was inefficient). One cheap scalar
+    # max() decides; the host-loop fallback stays for true prefill (>64/expert).
+    if int(counts.max()) <= MAX_M:
+        nz = (counts > 0).nonzero(as_tuple=True)[0]          # non-empty expert ids
+        t0 = cumsum[nz] - counts[nz]                          # start offset (sorted)
+        chunks_t = torch.stack(
+            [nz.to(torch.int32), t0.to(torch.int32), counts[nz].to(torch.int32)],
+            dim=1,
+        ).contiguous()
+    else:
+        offs = torch.cat(
+            [torch.zeros(1, dtype=torch.long, device=dev), cumsum]
+        ).cpu().tolist()
+        chunks = []
+        for e in range(E):
+            s, n = offs[e], offs[e + 1] - offs[e]
+            while n > 0:
+                c = min(MAX_M, n)
+                chunks.append([e, s, c])
+                s += c; n -= c
+        chunks_t = torch.tensor(chunks, dtype=torch.int32, device=dev)
     gate_buf = torch.zeros(n_route, 2 * inter, dtype=torch.float16, device=dev)
+    # SMALL-M variant (MTP verify, M<=16): the grouped kernels tile rows in
+    # blocks of 16 (MS) up to MAX_M=64; at M=4 the default MS=4 does a 64-row
+    # DPAS to produce <=4 tokens (~16x wasted matmul rows -> measured ~1.5x/tok
+    # penalty). smallm=True uses a 16-row tile (MS=1) -> ~4x less wasted DPAS.
+    # Correct only when every per-expert count <= 16 (holds for verify: M<=16
+    # total => any expert's count <= M <= 16). One scalar reuse of counts.max().
+    _smallm = bool(int(counts.max()) <= 16)
     # read xf directly (xf must be row-contiguous in hidden); tok_sorted_i32 folds
     # the gather in. xf is [M, hidden] fp16 contiguous from the caller.
     _moe_grouped.moe_up_q4k_ggemv(xf, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
-                                  gate_buf, chunks_t, hidden, inter, tok_sorted_i32)
+                                  gate_buf, chunks_t, hidden, inter, tok_sorted_i32,
+                                  smallm=_smallm)
     # P-ELEM-silu (notes §10bl): do silu*mul in fp16 directly. The old explicit
     # .float() on both halves materialized two [n_route, inter] fp32 intermediates
     # (the UnrolledElementwise/VectorizedElementwise flood in the prefill trace);
@@ -997,10 +1046,10 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     out_route = torch.zeros(n_route, hidden, dtype=torch.float16, device=dev)
     if down_is_q6:
         _moe_grouped.moe_down_q6k_ggemv(inter_states, d_ql, d_qh, d_sc, out_route,
-                                        chunks_t, inter, hidden)
+                                        chunks_t, inter, hidden, smallm=_smallm)
     else:
         _moe_grouped.moe_down_q5k_ggemv(inter_states, d_ql, d_qh, d_sc, d_mn, out_route,
-                                        chunks_t, inter, hidden)
+                                        chunks_t, inter, hidden, smallm=_smallm)
     # Combine: each token has exactly top_k routes. Instead of an atomic
     # index_add_ scatter (fp32 atomics over 32k routes = the prefill IndexKernel
     # hot spot, ~19ms/layer; notes §10ar/§10as), un-sort the per-route outputs
