@@ -1997,9 +1997,39 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             f"_share_dequant: {type(layer).__name__} has no weight/_xpu_emb_rep/qweight"
         )
 
+    def _share_head_quant(self, layer):
+        """Share the QUANTIZED lm_head (not a dense-dequant fp16 copy) so the
+        draft's _compute_lm_head takes the GGUF branch (quant_method.apply ->
+        Q6_K M-GEMV, the #86 kernel) instead of a dense [hidden, vocab] aten::mm
+        (~14.7ms/draft-fwd, the #89 hog). Returns a dict of the prepared XPU
+        quant reps (the SAME tensor objects -> bit-identical to the target,
+        EAGLE-safe) + the quant_method, or None if the head isn't an XPU-GGUF
+        quant layer (caller then falls back to the dense dequant share).
+        SGLANG_XPU_SHARE_QUANT_HEAD=0 reverts to the dequant share."""
+        if os.environ.get("SGLANG_XPU_SHARE_QUANT_HEAD", "1") == "0":
+            return None
+        # The lm_head is a VocabParallelEmbedding/ParallelLMHead loaded via
+        # GGUFEmbeddingXPUMethod, whose apply() reads `_xpu_emb_rep` (the packed
+        # Q6_K rep) and runs _xpu_rep_gemv (M=1) / esimd_gemv_q6_k_m (M>1). Share
+        # that rep + the quant_method instance (SAME objects -> bit-identical).
+        rep = getattr(layer, "_xpu_emb_rep", None)
+        qm = getattr(layer, "quant_method", None)
+        if rep is None or qm is None:
+            return None
+        return {
+            "kind": "xpu_quant_head",
+            "_xpu_emb_rep": rep,
+            "quant_method": qm,
+        }
+
     def get_embed_and_head(self):
         embed = self._share_dequant(self.model.embed_tokens) if self.pp_group.is_first_rank else None
-        head = self._share_dequant(self.lm_head) if self.pp_group.is_last_rank else None
+        if self.pp_group.is_last_rank:
+            head = self._share_head_quant(self.lm_head)
+            if head is None:
+                head = self._share_dequant(self.lm_head)
+        else:
+            head = None
         return embed, head
 
     def set_embed_and_head(self, embed, head):
@@ -2286,9 +2316,39 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             f"_share_dequant: {type(layer).__name__} has no weight/_xpu_emb_rep/qweight"
         )
 
+    def _share_head_quant(self, layer):
+        """Share the QUANTIZED lm_head (not a dense-dequant fp16 copy) so the
+        draft's _compute_lm_head takes the GGUF branch (quant_method.apply ->
+        Q6_K M-GEMV, the #86 kernel) instead of a dense [hidden, vocab] aten::mm
+        (~14.7ms/draft-fwd, the #89 hog). Returns a dict of the prepared XPU
+        quant reps (the SAME tensor objects -> bit-identical to the target,
+        EAGLE-safe) + the quant_method, or None if the head isn't an XPU-GGUF
+        quant layer (caller then falls back to the dense dequant share).
+        SGLANG_XPU_SHARE_QUANT_HEAD=0 reverts to the dequant share."""
+        if os.environ.get("SGLANG_XPU_SHARE_QUANT_HEAD", "1") == "0":
+            return None
+        # The lm_head is a VocabParallelEmbedding/ParallelLMHead loaded via
+        # GGUFEmbeddingXPUMethod, whose apply() reads `_xpu_emb_rep` (the packed
+        # Q6_K rep) and runs _xpu_rep_gemv (M=1) / esimd_gemv_q6_k_m (M>1). Share
+        # that rep + the quant_method instance (SAME objects -> bit-identical).
+        rep = getattr(layer, "_xpu_emb_rep", None)
+        qm = getattr(layer, "quant_method", None)
+        if rep is None or qm is None:
+            return None
+        return {
+            "kind": "xpu_quant_head",
+            "_xpu_emb_rep": rep,
+            "quant_method": qm,
+        }
+
     def get_embed_and_head(self):
         embed = self._share_dequant(self.model.embed_tokens) if self.pp_group.is_first_rank else None
-        head = self._share_dequant(self.lm_head) if self.pp_group.is_last_rank else None
+        if self.pp_group.is_last_rank:
+            head = self._share_head_quant(self.lm_head)
+            if head is None:
+                head = self._share_dequant(self.lm_head)
+        else:
+            head = None
         return embed, head
 
     def set_embed_and_head(self, embed, head):

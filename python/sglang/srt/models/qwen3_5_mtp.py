@@ -127,7 +127,22 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             _del_weight_if_present(self.lm_head)
 
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        # HEAD: if the target shared its QUANTIZED lm_head (dict form, #89), install
+        # the prepared XPU quant reps + quant_method on the draft's lm_head and
+        # leave it WITHOUT a `.weight`, so LogitsProcessor._compute_lm_head takes
+        # the GGUF branch (lm_head.quant_method.apply -> Q6_K M-GEMV) instead of a
+        # dense [hidden, vocab] aten::mm. The shared reps are the SAME tensors as
+        # the target -> bit-identical logits (EAGLE-safe). Else (dense fp16 share)
+        # assign `.weight` as before (dense matmul path).
+        if isinstance(head, dict) and head.get("kind") == "xpu_quant_head":
+            # Install the shared Q6_K rep + GGUFEmbeddingXPUMethod, leave NO
+            # `.weight` -> LogitsProcessor._compute_lm_head takes the GGUF branch
+            # (quant_method.apply -> q6_k_m GEMV) on the shared (bit-identical)
+            # weights, not a dense [hidden, vocab] aten::mm. (#89)
+            self.lm_head._xpu_emb_rep = head["_xpu_emb_rep"]
+            self.lm_head.quant_method = head["quant_method"]
+        else:
+            self.lm_head.weight = head
         # device-agnostic (XPU has no torch.cuda): use the active device module.
         _dev = torch.get_device_module()
         _dev.empty_cache()
