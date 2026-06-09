@@ -107,6 +107,8 @@ elif _is_xpu:
     except ImportError:
         _moe_grouped = None
     (esimd_gemv_q8_0,) = _imp_kernels(("esimd_gemv_q8_0",))
+    # M-tiled q8_0 dense GEMV (small M, MTP verify) — optional (older .so may lack it).
+    (esimd_gemv_q8_0_m,) = _imp_kernels(("esimd_gemv_q8_0_m",))
     (esimd_gemv_q4_k,) = _imp_kernels(("esimd_gemv_q4_k",))
     esimd_gemv_q5_k, esimd_gemv_q6_k = _imp_kernels(("esimd_gemv_q5_k", "esimd_gemv_q6_k"))
     # M-tiled q6_K GEMV (small M, MTP verify) — optional (older .so may lack it).
@@ -1288,10 +1290,24 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q8_0(xf, qs, scale, out)
             return out
-        # Prefill (M>1): oneDNN s8 fused-dequant matmul (symmetric, no zero-point;
-        # qs [N,K] int8 IS the s8 weight, scale transposed to [K/32,N]). Keeps the
-        # weight int8, no fp16 DRAM round-trip. Covers 35B dense prefill (notes
-        # §10x). Falls back to dequant+matmul if the ext is absent.
+        # Small-M (MTP verify, M = draft_token_num ~2..4): M-tiled ESIMD GEMV,
+        # weights-read-once. The M>1 oneDNN jit:gemm path CACHE-MISSes and
+        # JIT-recompiles for EACH new (M,K,N) — the dominant verify-forward cost
+        # (#87, 23% XPU). This kernel avoids both the recompile and the dequant
+        # traffic. Requires K % 256 == 0 (the dense proj K=2048/4096 qualify);
+        # else fall through to oneDNN. cos=1.0 vs dequant ref (q8_0_m_check.py).
+        if (
+            esimd_gemv_q8_0_m is not None
+            and 2 <= M <= 16
+            and (qs.shape[1] % 256) == 0
+        ):
+            out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+            esimd_gemv_q8_0_m(xf, qs, scale, out)
+            return out
+        # Prefill (large M): oneDNN s8 fused-dequant matmul (symmetric, no
+        # zero-point; qs [N,K] int8 IS the s8 weight, scale transposed to
+        # [K/32,N]). Keeps the weight int8, no fp16 DRAM round-trip. Covers 35B
+        # dense prefill (notes §10x). Falls back to dequant+matmul if absent.
         if _onednn_gguf is not None:
             return _onednn_gguf.onednn_q8_gemm(xf, qs, _onednn_scale_t(scale))
         w = _xpu_dequant_q8_0(qs, scale, torch.float16)  # [N, K]
