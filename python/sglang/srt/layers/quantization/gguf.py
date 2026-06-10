@@ -101,7 +101,14 @@ elif _is_xpu:
     # GEMV at prefill (M>1), which is ~161x off the compute floor (notes §10x).
     # ~17x faster (§10ad). Falls back to per-route GEMV if absent / SGLANG_GGUF_XPU_NO_GROUPED_MOE=1.
     try:
-        import moe_grouped_gguf_xpu as _moe_grouped
+        # Preferred: the git-tracked eagle_ops package extension (AOT ptl-u
+        # doubleGRF, built by custom-esimd-kernels-sglang/setup.py). Fall back to
+        # the legacy standalone top-level .so (docker-context prebuilt) so older
+        # images keep working.
+        try:
+            from custom_esimd_kernels_sglang import moe_grouped_gguf_xpu as _moe_grouped
+        except ImportError:
+            import moe_grouped_gguf_xpu as _moe_grouped
         if os.environ.get("SGLANG_GGUF_XPU_NO_GROUPED_MOE") == "1":
             _moe_grouped = None
     except ImportError:
