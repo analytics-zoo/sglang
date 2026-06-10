@@ -134,8 +134,10 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Verify packs draft_token_num query tokens per request, so cu_seqlens_q
         # strides by that: [0, ntok, 2*ntok, ...]. Constant for a given bs, so
-        # build it once here (no host work at capture/replay).
-        ntok_v = max(1, self.speculative_num_draft_tokens)
+        # build it once here (no host work at capture/replay). With no
+        # speculation (speculative_num_draft_tokens is None) there is no verify
+        # path, so the stride defaults to 1 (pure-decode geometry).
+        ntok_v = max(1, self.speculative_num_draft_tokens or 1)
         self._graph_state = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
             # For pure-decode, cu_seqlens_q is constant [0, 1, 2, ..., bs].
