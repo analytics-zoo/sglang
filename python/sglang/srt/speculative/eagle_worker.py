@@ -269,6 +269,20 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
+        # XPU (notes #96): the DRAFT-side graph runners are CUDA/NPU-only
+        # (EAGLEDraftCudaGraphRunner calls torch.cuda.CUDAGraph() directly, no XPU
+        # shim) and the draft step is device-bound + only ~17% of per-step wall
+        # (#94), so it's low-ROI. We enable graph for the TARGET-VERIFY forward
+        # (the launch-bound 71% — captured by the target model_runner's
+        # CudaGraphRunner, which IS XPU-shimmed) and keep the draft path EAGER.
+        # Skip here instead of KeyError-ing on the device dict below.
+        if self.device == "xpu":
+            logger.info(
+                "XPU: skipping draft-side cuda graph capture (target-verify graph "
+                "is captured by the target model_runner; draft stays eager)."
+            )
+            return
+
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,

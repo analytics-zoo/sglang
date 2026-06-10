@@ -998,20 +998,39 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     # explicit `es = xf.index_select(0, tok_sorted)` round-trip (the IndexKernel,
     # ~10% of prefill) is gone. tok_sorted as int32 for the kernel.
     tok_sorted_i32 = tok_sorted.to(torch.int32).contiguous()
-    counts = torch.bincount(exp_sorted, minlength=E)
+    # NOTE (#96): torch.bincount is NOT XPU-graph-capturable — it internally does an
+    # event .wait() ("wait method cannot be used for an event associated with a
+    # command graph"). scatter_add_ into a zeroed [E] vector is the capture-safe
+    # equivalent (pure elementwise atomics, no host sync / event wait) and is
+    # bit-identical (integer counts). exp_sorted is int64 in [0,E).
+    counts = torch.zeros(E, dtype=torch.int64, device=dev)
+    counts.scatter_add_(0, exp_sorted, torch.ones_like(exp_sorted))
     cumsum = counts.cumsum(0)
     # chunks_t = [n_chunks, 3] int32 cols (eid, t0, nt) = the non-empty expert
     # groups in sorted-token order; the GGEMV kernel iterates these. The kernel
     # tiles at most MAX_M=64 tokens/chunk, so any expert with >64 routed tokens
     # must split into ≤64 sub-chunks (else tokens beyond 64 are dropped).
     MAX_M = 64
-    # FAST PATH (small M, e.g. MTP verify M≤19): every per-expert count ≤ M < 64,
-    # so NO splitting needed — build chunks_t ENTIRELY ON-DEVICE (no .cpu()/.item()
-    # host sync, no 256-iter Python loop). Those host costs are M-independent and
-    # dominated the small-M grouped path (2.2x slower than per-route at M≤2; the
-    # whole reason verify's M=4 grouped MoE was inefficient). One cheap scalar
-    # max() decides; the host-loop fallback stays for true prefill (>64/expert).
-    if int(counts.max()) <= MAX_M:
+    # GRAPH-CAPTURE SAFE GATE (notes #94/#96): the chunk-build branch + smallm tiling
+    # were decided by `int(counts.max())` — a device->host sync, a hard graph-capture
+    # breaker. The fast branch also used `(counts>0).nonzero()` — ALSO non-capturable
+    # on XPU (data-dependent output shape => internal event .wait(), measured #96).
+    # INVARIANT (each token routes to top_k DISTINCT experts => counts.max() <= M):
+    # M (host shape topk_ids.shape[0], NO sync) decides the path. For the small-M
+    # verify path (M<=16 => max per-expert count <= 16 <= MAX_M, no split needed),
+    # build chunks_t over ALL E experts with a FIXED [E,3] shape: eid=arange(E),
+    # t0=exclusive prefix sum, nt=counts. Empty experts get nt=0 and the GGEMV
+    # kernels skip them (`if (nt<=0) return;` — verified moe_q4k/q5k/q6k_ggemv.h).
+    # No nonzero, no int() sync => fully graph-capturable AND bit-identical (the
+    # zero-count chunks contribute nothing). Prefill (M>16) keeps the host-loop split.
+    _m_small = M <= 16
+    if _m_small:
+        eid_all = torch.arange(E, device=dev, dtype=torch.int32)
+        t0_all = (cumsum - counts).to(torch.int32)            # exclusive prefix sum
+        chunks_t = torch.stack(
+            [eid_all, t0_all, counts.to(torch.int32)], dim=1
+        ).contiguous()                                        # [E, 3] fixed shape
+    elif int(counts.max()) <= MAX_M:
         nz = (counts > 0).nonzero(as_tuple=True)[0]          # non-empty expert ids
         t0 = cumsum[nz] - counts[nz]                          # start offset (sorted)
         chunks_t = torch.stack(
@@ -1036,8 +1055,9 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     # DPAS to produce <=4 tokens (~16x wasted matmul rows -> measured ~1.5x/tok
     # penalty). smallm=True uses a 16-row tile (MS=1) -> ~4x less wasted DPAS.
     # Correct only when every per-expert count <= 16 (holds for verify: M<=16
-    # total => any expert's count <= M <= 16). One scalar reuse of counts.max().
-    _smallm = bool(int(counts.max()) <= 16)
+    # total => any expert's count <= M <= 16). M-gated (host) to skip the sync;
+    # short-circuit keeps int(counts.max()) only for the prefill M>16 case.
+    _smallm = _m_small or bool(int(counts.max()) <= 16)
     # read xf directly (xf must be row-contiguous in hidden); tok_sorted_i32 folds
     # the gather in. xf is [M, hidden] fp16 contiguous from the caller.
     _moe_grouped.moe_up_q4k_ggemv(xf, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,

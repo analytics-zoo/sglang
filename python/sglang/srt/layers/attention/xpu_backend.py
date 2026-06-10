@@ -132,11 +132,19 @@ class XPUAttentionBackend(AttentionBackend):
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
         device = self.device
 
+        # Verify packs draft_token_num query tokens per request, so cu_seqlens_q
+        # strides by that: [0, ntok, 2*ntok, ...]. Constant for a given bs, so
+        # build it once here (no host work at capture/replay).
+        ntok_v = max(1, self.speculative_num_draft_tokens)
         self._graph_state = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
             # For pure-decode, cu_seqlens_q is constant [0, 1, 2, ..., bs].
             "cu_seqlens_q_decode": torch.arange(
                 0, max_bs + 1, dtype=torch.int32, device=device
+            ),
+            # For verify, cu_seqlens_q is [0, ntok, 2*ntok, ..., bs*ntok].
+            "cu_seqlens_q_verify": torch.arange(
+                0, (max_bs + 1) * ntok_v, ntok_v, dtype=torch.int32, device=device
             ),
             "cu_seqlens_k": torch.zeros(
                 max_bs + 1, dtype=torch.int32, device=device
@@ -160,29 +168,50 @@ class XPUAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info,
     ):
-        assert spec_info is None, "XPU graph capture with spec_info not supported yet"
-        assert forward_mode.is_decode_or_idle(), (
-            f"XPU graph capture only supports decode; got {forward_mode=}"
-        )
+        # TARGET_VERIFY capture (notes #94/#96): MTP verify is graph-capturable on
+        # XPU once the in-forward host-syncs are gone (#95). Supported for the
+        # linear-chain topk<=1 path (our NEXTN config); topk>1 tree verify still
+        # needs the cascade/expand metadata (not captured here).
+        is_verify = forward_mode.is_target_verify()
+        if is_verify:
+            assert self.topk <= 1, (
+                "XPU graph verify capture only supports speculative_eagle_topk<=1; "
+                f"got topk={self.topk}"
+            )
+        else:
+            assert spec_info is None, (
+                "XPU graph capture with spec_info not supported yet (non-verify)"
+            )
+            assert forward_mode.is_decode_or_idle(), (
+                f"XPU graph capture only supports decode/verify; got {forward_mode=}"
+            )
+        # Verify packs draft_token_num query tokens per request; decode packs 1.
+        ntok = self.speculative_num_draft_tokens if is_verify else 1
         state = self._graph_state
         metadata = FlashAttentionMetadata()
         metadata.cache_seqlens_int32 = state["cache_seqlens"][:bs]
-        metadata.cu_seqlens_q = state["cu_seqlens_q_decode"][: bs + 1]
         metadata.cu_seqlens_k = state["cu_seqlens_k"][: bs + 1]
         metadata.page_table = state["page_table"][:bs, :]
-        metadata.max_seq_len_q = 1
+        metadata.max_seq_len_q = ntok
+        if is_verify:
+            # cu_seqlens_q strides by draft_token_num: [0, ntok, 2*ntok, ...].
+            metadata.cu_seqlens_q = state["cu_seqlens_q_verify"][: bs + 1]
+        else:
+            metadata.cu_seqlens_q = state["cu_seqlens_q_decode"][: bs + 1]
 
         # Populate cache_seqlens and cu_seqlens_k with the dummy seq_lens
         # from the warmup _dummy_run, so the captured attention kernel
         # launch exercises a non-trivial KV range. Without this, seq_lens
-        # stays at 0 during capture and replay produces garbage.
-        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        # stays at 0 during capture and replay produces garbage. For verify the
+        # KV range each query attends spans seq_len + draft_token_num.
+        eff_seqlens = (seq_lens + ntok) if is_verify else seq_lens
+        metadata.cache_seqlens_int32.copy_(eff_seqlens.to(torch.int32))
         torch.cumsum(
             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
             out=metadata.cu_seqlens_k[1:],
         )
         metadata.max_seq_len_k = max(
-            1, int(seq_lens.max().item()) if seq_lens.numel() else 1,
+            1, int(eff_seqlens.max().item()) if eff_seqlens.numel() else 1,
         )
 
         # Populate page_table with real req_to_token pages so captured
@@ -201,7 +230,7 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.page_table[:bs, :max_seq_pages].copy_(pt)
 
-        state["captured"][bs] = metadata
+        state["captured"][(bs, is_verify)] = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -216,23 +245,35 @@ class XPUAttentionBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
-        assert spec_info is None, "XPU graph replay with spec_info not supported yet"
-        assert forward_mode.is_decode_or_idle()
+        is_verify = forward_mode.is_target_verify()
+        if not is_verify:
+            assert spec_info is None, (
+                "XPU graph replay with spec_info not supported yet (non-verify)"
+            )
+            assert forward_mode.is_decode_or_idle()
+        ntok = self.speculative_num_draft_tokens if is_verify else 1
         state = self._graph_state
-        metadata = state["captured"][bs]
+        metadata = state["captured"][(bs, is_verify)]
 
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
 
-        # Refresh per-request values in place.
-        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        # Refresh per-request values in place. For verify each query attends a KV
+        # range of seq_len + draft_token_num (the draft tokens just written).
+        eff_seqlens = (seq_lens + ntok) if is_verify else seq_lens
+        metadata.cache_seqlens_int32.copy_(eff_seqlens.to(torch.int32))
         torch.cumsum(
             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
             out=state["cu_seqlens_k"][1 : bs + 1],
         )
 
-        max_len = int(seq_lens_cpu.max().item()) if seq_lens_cpu is not None else int(seq_lens.max().item())
+        base_max = (
+            int(seq_lens_cpu.max().item())
+            if seq_lens_cpu is not None
+            else int(seq_lens.max().item())
+        )
+        max_len = base_max + (ntok if is_verify else 0)
         metadata.max_seq_len_k = max_len
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
@@ -658,10 +699,35 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            # TARGET_VERIFY via looped ESIMD page_attn_decode (notes #99/#100):
+            # XPU-graph-CAPTURABLE attention for the topk<=1 linear chain. Replaces
+            # the non-capturable flash/SDPA path so the whole verify forward can be
+            # graph-captured. Each draft token i -> one q=1 page_attn_decode with
+            # seq_lens = prefix+i+1 (causal slice). Validated cos=1.0 vs causal SDPA.
+            # Gated for clean A/B; only valid for non-cross-attn, topk<=1, HD=256.
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self.topk <= 1
+                and not layer.is_cross_attention
+                and os.environ.get("SGLANG_XPU_VERIFY_ESIMD_ATTN") == "1"
+            ):
+                result = self._esimd_verify_attn(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    max_seq_len=int(self.max_context_len),
+                    tp_q_head_num=layer.tp_q_head_num,
+                    tp_k_head_num=layer.tp_k_head_num,
+                    head_dim=layer.head_dim,
+                    draft_token_num=self.speculative_num_draft_tokens,
+                )
+                # falls through to `else: o = result` below (use_cascade_attn=False)
             # Prefill: SDPA fallback only when SGL_XPU_FA_FALLBACK=1.
             # SGL_XPU_ESIMD_DECODE does NOT force prefill fallback — prefill
             # keeps the native FMHA kernel.
-            if (
+            elif (
                 not use_cascade_attn
                 and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
             ):
@@ -1055,6 +1121,128 @@ class XPUAttentionBackend(AttentionBackend):
             temp_p,        # external scratch (stable data_ptr for graph replay)
         )
         return out_kern if out_kern.dtype == q.dtype else out_kern.to(q.dtype)
+
+    def _esimd_verify_attn(
+        self,
+        q: torch.Tensor,              # (bs*draft, num_q_heads, head_dim)
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,     # (bs, max_pages) int32
+        cache_seqlens: torch.Tensor,  # (bs,) int32 = prefix + draft_token_num
+        max_seq_len: int,
+        tp_q_head_num: int,
+        tp_k_head_num: int,
+        head_dim: int,
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """XPU-graph-capturable TARGET_VERIFY attention via a SINGLE BATCHED
+        page_attn_decode (notes #99/#100/#104). For the topk<=1 linear chain, draft
+        token i of each request attends prefix + draft[0..i] — exactly the causal
+        slice. The kernel processes each `batches` row independently with its own
+        seq_lens[b] + page_table[b] (page.attn.h: kvSeqLen=batchKvSeqLen[batchIdx],
+        pageTableBase=stride*batchIdx; grid groupD=batches). So we pack the bs*draft
+        draft tokens as bs*draft BATCH ROWS in ONE call — no per-token loop, no
+        kernel change (max_query_len stays 1; we grow `batches`, not query_len):
+          - q is already [bs*draft, H, D] in (req-major, draft-minor) order.
+          - page_table_exp[b*draft+i] = request b's pages (repeat_interleave draft).
+          - seq_lens_exp[b*draft+i] = prefix[b] + i + 1 (the causal slice; the draft
+            tokens sit at CONTIGUOUS slots prefix..prefix+draft-1, prepare_for_verify).
+        Validated bit-exact vs causal SDPA at cos=1.0 (tools/batched_verify_test.py).
+        Replaces the NON-capturable flash/SDPA path AND the earlier 4x loop — 1
+        launch instead of draft_token_num, all draft tokens parallel across the GPU.
+        """
+        if not getattr(self, "_esimd_loaded", False):
+            import custom_esimd_kernels_sglang  # noqa: F401 — registers torch.ops.eagle_ops
+            self._esimd_loaded = True
+        bs = cache_seqlens.numel()
+        nrow = bs * draft_token_num
+        kernel_dtype = (
+            key_cache.dtype
+            if key_cache.dtype in (torch.float16, torch.bfloat16)
+            else torch.float16
+        )
+        # prefix[b] = cache_seqlens[b] - draft_token_num (KV length before drafts).
+        prefix = cache_seqlens.to(torch.int32) - draft_token_num
+
+        # Persistent scratch ('verify' tag so it never collides with the decode
+        # buffers). All buffers sized for nrow=bs*draft batch rows; temp_p sized for
+        # the worst-case context so capture (max_context_len) and replay share a
+        # stable data_ptr. page_table_exp / seq_lens_exp are refreshed IN PLACE per
+        # step (data_ptr stable for graph replay).
+        max_ctx = self.max_context_len
+        max_pages = page_table.size(1)
+        cache_key = ("verify", nrow, tp_q_head_num, head_dim, max_pages, kernel_dtype)
+        scratch = getattr(self, "_esimd_scratch", {})
+        buf = scratch.get(cache_key)
+        if buf is None:
+            from custom_esimd_kernels_sglang.ops import (
+                eagle_page_attn_decode_temp_size,
+            )
+            tp_size = eagle_page_attn_decode_temp_size(
+                nrow, tp_q_head_num, tp_k_head_num, head_dim, max_ctx,
+            )
+            # per-(req,pos) draft index offset [0,1,..,draft-1, 0,1,..] of length nrow
+            pos_off = (
+                torch.arange(draft_token_num, dtype=torch.int32, device=q.device)
+                .repeat(bs)
+                + 1
+            )
+            buf = {
+                "temp_p": torch.zeros(
+                    (tp_size,), dtype=torch.float32, device=q.device,
+                ),
+                "q_kern": torch.empty(
+                    (nrow, tp_q_head_num, head_dim),
+                    dtype=kernel_dtype, device=q.device,
+                ),
+                "out_kern": torch.empty(
+                    (nrow, tp_q_head_num, head_dim),
+                    dtype=kernel_dtype, device=q.device,
+                ),
+                "seq_lens_i32": torch.zeros(
+                    (nrow,), dtype=torch.int32, device=q.device,
+                ),
+                "page_table_exp": torch.zeros(
+                    (nrow, max_pages), dtype=torch.int32, device=q.device,
+                ),
+                "pos_off": pos_off,
+            }
+            scratch[cache_key] = buf
+            self._esimd_scratch = scratch
+        temp_p = buf["temp_p"]
+        q_kern = buf["q_kern"]
+        out_kern = buf["out_kern"]
+        seq_lens_i32 = buf["seq_lens_i32"]
+        page_table_exp = buf["page_table_exp"]
+        pos_off = buf["pos_off"]
+
+        # Fill all batch rows in place (graph-stable data_ptrs).
+        q_src = q.view(nrow, tp_q_head_num, head_dim)
+        if q_src.dtype != kernel_dtype:
+            q_kern.copy_(q_src.to(kernel_dtype))
+        else:
+            q_kern.copy_(q_src)
+        # seq_lens[b*draft+i] = prefix[b] + i + 1  (prefix repeated draft times + pos)
+        seq_lens_i32.copy_(
+            prefix.repeat_interleave(draft_token_num) + pos_off
+        )
+        # page_table row (b*draft+i) = request b's page row.
+        page_table_exp.copy_(
+            page_table.to(torch.int32).repeat_interleave(draft_token_num, dim=0)
+        )
+        torch.ops.eagle_ops.page_attn_decode(
+            q_kern,
+            key_cache,
+            value_cache,
+            page_table_exp,
+            seq_lens_i32,
+            out_kern,
+            1,             # max_query_len stays 1; the draft tokens are BATCH rows
+            max_seq_len,   # worst-case bound; kernel early-exits past seq_lens
+            temp_p,
+        )
+        out = out_kern.view(nrow, tp_q_head_num, head_dim)
+        return out if out.dtype == q.dtype else out.to(q.dtype)
 
     def _sdpa_fallback_decode(
         self,
