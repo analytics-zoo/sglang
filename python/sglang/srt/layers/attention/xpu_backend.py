@@ -169,23 +169,40 @@ class XPUAttentionBackend(AttentionBackend):
         spec_info,
     ):
         # TARGET_VERIFY capture (notes #94/#96): MTP verify is graph-capturable on
-        # XPU once the in-forward host-syncs are gone (#95). Supported for the
-        # linear-chain topk<=1 path (our NEXTN config); topk>1 tree verify still
-        # needs the cascade/expand metadata (not captured here).
+        # XPU once the in-forward host-syncs are gone (#95). DRAFT_DECODE capture
+        # (notes #111): the multi-step draft decode (XPUMultiStepDraftBackend, one
+        # XPUAttentionBackend per step with speculative_step_id) is also capturable
+        # — it's a q=1 decode whose KV range = seq_len + (step_id + 1) draft tokens.
+        # Both topk<=1 (our NEXTN linear chain).
         is_verify = forward_mode.is_target_verify()
+        is_draft_decode = (
+            (not is_verify) and forward_mode.is_decode() and spec_info is not None
+        )
         if is_verify:
             assert self.topk <= 1, (
                 "XPU graph verify capture only supports speculative_eagle_topk<=1; "
                 f"got topk={self.topk}"
             )
+        elif is_draft_decode:
+            assert self.topk <= 1, (
+                "XPU graph draft-decode capture only supports topk<=1; "
+                f"got topk={self.topk}"
+            )
         else:
             assert spec_info is None, (
-                "XPU graph capture with spec_info not supported yet (non-verify)"
+                "XPU graph capture with spec_info not supported yet (non-verify/draft)"
             )
             assert forward_mode.is_decode_or_idle(), (
                 f"XPU graph capture only supports decode/verify; got {forward_mode=}"
             )
-        # Verify packs draft_token_num query tokens per request; decode packs 1.
+        # KV-range extension per query: verify sees draft_token_num extra tokens;
+        # draft-decode step i sees (step_id + 1) tokens written by prior draft steps;
+        # plain decode sees 0. Query count is draft_token_num for verify, else 1.
+        kv_ext = (
+            self.speculative_num_draft_tokens if is_verify
+            else (self.speculative_step_id + 1) if is_draft_decode
+            else 0
+        )
         ntok = self.speculative_num_draft_tokens if is_verify else 1
         state = self._graph_state
         metadata = FlashAttentionMetadata()
@@ -197,14 +214,14 @@ class XPUAttentionBackend(AttentionBackend):
             # cu_seqlens_q strides by draft_token_num: [0, ntok, 2*ntok, ...].
             metadata.cu_seqlens_q = state["cu_seqlens_q_verify"][: bs + 1]
         else:
+            # draft-decode AND plain decode are q=1/req: cu_seqlens_q = [0,1,..,bs].
             metadata.cu_seqlens_q = state["cu_seqlens_q_decode"][: bs + 1]
 
         # Populate cache_seqlens and cu_seqlens_k with the dummy seq_lens
         # from the warmup _dummy_run, so the captured attention kernel
         # launch exercises a non-trivial KV range. Without this, seq_lens
-        # stays at 0 during capture and replay produces garbage. For verify the
-        # KV range each query attends spans seq_len + draft_token_num.
-        eff_seqlens = (seq_lens + ntok) if is_verify else seq_lens
+        # stays at 0 during capture and replay produces garbage.
+        eff_seqlens = seq_lens + kv_ext
         metadata.cache_seqlens_int32.copy_(eff_seqlens.to(torch.int32))
         torch.cumsum(
             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
@@ -230,8 +247,20 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.page_table[:bs, :max_seq_pages].copy_(pt)
 
-        state["captured"][(bs, is_verify)] = metadata
+        state["captured"][self._graph_key(bs, is_verify, is_draft_decode)] = metadata
         self.forward_metadata = metadata
+
+    def _graph_key(self, bs, is_verify, is_draft_decode):
+        # Distinguish the captured-metadata variants that share a bs. Draft-decode
+        # additionally keys on speculative_step_id (one graph per draft step, each
+        # with a different KV-range offset). 'V'/'D<step>'/'P' = verify/draft/plain.
+        if is_verify:
+            tag = "V"
+        elif is_draft_decode:
+            tag = f"D{self.speculative_step_id}"
+        else:
+            tag = "P"
+        return (bs, tag)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -246,22 +275,29 @@ class XPUAttentionBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         is_verify = forward_mode.is_target_verify()
-        if not is_verify:
+        is_draft_decode = (
+            (not is_verify) and forward_mode.is_decode() and spec_info is not None
+        )
+        if not (is_verify or is_draft_decode):
             assert spec_info is None, (
-                "XPU graph replay with spec_info not supported yet (non-verify)"
+                "XPU graph replay with spec_info not supported yet (non-verify/draft)"
             )
             assert forward_mode.is_decode_or_idle()
-        ntok = self.speculative_num_draft_tokens if is_verify else 1
+        kv_ext = (
+            self.speculative_num_draft_tokens if is_verify
+            else (self.speculative_step_id + 1) if is_draft_decode
+            else 0
+        )
         state = self._graph_state
-        metadata = state["captured"][(bs, is_verify)]
+        metadata = state["captured"][self._graph_key(bs, is_verify, is_draft_decode)]
 
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
         req_pool_indices = req_pool_indices[:bs]
 
-        # Refresh per-request values in place. For verify each query attends a KV
-        # range of seq_len + draft_token_num (the draft tokens just written).
-        eff_seqlens = (seq_lens + ntok) if is_verify else seq_lens
+        # Refresh per-request values in place. KV range = seq_len + kv_ext (verify:
+        # +draft_token_num; draft-decode step i: +(step_id+1); plain decode: +0).
+        eff_seqlens = seq_lens + kv_ext
         metadata.cache_seqlens_int32.copy_(eff_seqlens.to(torch.int32))
         torch.cumsum(
             metadata.cache_seqlens_int32, dim=0, dtype=torch.int32,
@@ -273,7 +309,7 @@ class XPUAttentionBackend(AttentionBackend):
             if seq_lens_cpu is not None
             else int(seq_lens.max().item())
         )
-        max_len = base_max + (ntok if is_verify else 0)
+        max_len = base_max + kv_ext
         metadata.max_seq_len_k = max_len
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 

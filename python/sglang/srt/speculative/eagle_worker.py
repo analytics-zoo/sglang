@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
@@ -269,18 +270,31 @@ class EAGLEWorker(TpModelWorker):
         if self.server_args.disable_cuda_graph:
             return
 
-        # XPU (notes #96): the DRAFT-side graph runners are CUDA/NPU-only
-        # (EAGLEDraftCudaGraphRunner calls torch.cuda.CUDAGraph() directly, no XPU
-        # shim) and the draft step is device-bound + only ~17% of per-step wall
-        # (#94), so it's low-ROI. We enable graph for the TARGET-VERIFY forward
-        # (the launch-bound 71% — captured by the target model_runner's
-        # CudaGraphRunner, which IS XPU-shimmed) and keep the draft path EAGER.
-        # Skip here instead of KeyError-ing on the device dict below.
+        # XPU (notes #96/#111): draft-DECODE graph capture. EAGLEDraftCudaGraphRunner
+        # calls torch.cuda.CUDAGraph()/graph() directly, but the base CudaGraphRunner
+        # installs a GLOBAL torch.cuda->torch.xpu shim at import (cuda_graph_runner.py
+        # _xpu_patch_cuda_graph_apis), so those calls route to XPUGraph transparently.
+        # The draft attn is XPUMultiStepDraftBackend (graph hooks already present) and
+        # the draft model is a 1-layer full-attn MTP head whose q=1 decode uses the
+        # capturable page_attn_decode. Gated by SGLANG_XPU_DRAFT_GRAPH for clean A/B;
+        # default OFF keeps draft eager (the validated #103/#104 config). The
+        # draft-EXTEND graph (below) stays eager on XPU (separate runner, unvalidated).
         if self.device == "xpu":
-            logger.info(
-                "XPU: skipping draft-side cuda graph capture (target-verify graph "
-                "is captured by the target model_runner; draft stays eager)."
-            )
+            if os.environ.get("SGLANG_XPU_DRAFT_GRAPH") != "1":
+                logger.info(
+                    "XPU: draft-side cuda graph disabled (SGLANG_XPU_DRAFT_GRAPH!=1); "
+                    "draft stays eager, target-verify graph still captured."
+                )
+                return
+            if self.speculative_num_steps > 1:
+                tic = time.perf_counter()
+                logger.info(
+                    "XPU: capturing draft-decode cuda graph (SGLANG_XPU_DRAFT_GRAPH=1)."
+                )
+                self.cuda_graph_runner = EAGLEDraftCudaGraphRunner(self)
+                logger.info(
+                    f"XPU draft-decode graph captured in {time.perf_counter() - tic:.2f}s."
+                )
             return
 
         Device2DraftCudaGraphRunner = {

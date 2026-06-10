@@ -125,6 +125,14 @@ def _xpu_patch_cuda_graph_apis() -> None:
             return self._ctx.__exit__(exc_type, exc, tb)
 
     torch.cuda.graph = _XpuGraphCtx  # type: ignore[assignment]
+
+    # EAGLEDraftCudaGraphRunner._capture_init calls torch.cuda.synchronize()
+    # directly (not via self.device_module), which raises "Torch not compiled
+    # with CUDA enabled" on XPU. Alias it to torch.xpu.synchronize so the draft
+    # graph runner works unchanged (drop-in, same signature). (#111)
+    if hasattr(torch.xpu, "synchronize"):
+        torch.cuda.synchronize = torch.xpu.synchronize  # type: ignore[assignment]
+
     torch.cuda._sglang_xpu_patched = True
 
 
