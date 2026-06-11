@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     next_power_of_2,
+    xpu_flag_on,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -280,7 +281,7 @@ class EAGLEWorker(TpModelWorker):
         # default OFF keeps draft eager (the validated #103/#104 config). The
         # draft-EXTEND graph (below) stays eager on XPU (separate runner, unvalidated).
         if self.device == "xpu":
-            if os.environ.get("SGLANG_XPU_DRAFT_GRAPH") != "1":
+            if not xpu_flag_on("DRAFT_GRAPH"):
                 logger.info(
                     "XPU: draft-side cuda graph disabled (SGLANG_XPU_DRAFT_GRAPH!=1); "
                     "draft stays eager, target-verify graph still captured."

@@ -97,6 +97,7 @@ from sglang.srt.utils import (
     is_xpu,
     make_layers,
     set_weight_attrs,
+    xpu_flag_on,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
@@ -196,7 +197,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # path then skips the repack. On non-XPU-GGUF backends the attrs are
         # simply ignored (the eager repack still runs). Enabled only when the
         # fast path is eligible (env + ratio); see _forward_xpu_fast_path.
-        if _is_xpu and os.environ.get("SGLANG_XPU_GDN_BAKE_PERM", "1") == "1":
+        if _is_xpu and xpu_flag_on("GDN_BAKE_PERM", default=True):
             pq, pb = self._build_gdn_out_row_perms()
             self.in_proj_qkvz._gguf_gdn_out_row_perm = pq
             self.in_proj_ba._gguf_gdn_out_row_perm = pb
@@ -887,9 +888,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Gate with an env var so we can A/B against the PyTorch fallback
         # (chunk_torch_xpu.py) per-run without a code change. Keep off by
         # default until end-to-end correctness has been confirmed on Qwen3.5.
-        _ENABLE_XPU_FAST_PATH = os.environ.get(
-            "SGLANG_XPU_GDN_FAST_PATH", "0"
-        ) == "1"
+        # XPU-default-on (the PTL GGUF prod config; the use-site below also
+        # gates on _is_xpu + ratio). Set SGLANG_XPU_GDN_FAST_PATH=0 to disable.
+        _ENABLE_XPU_FAST_PATH = xpu_flag_on("GDN_FAST_PATH", default=True)
         # Repack adapter (_repack_qkvz_ba_for_gdn_attention) handles any
         # num_v_heads/num_k_heads ratio (verified bit-exact for ratio 1 & 2),
         # so the fast path is eligible whenever the kernel's ratio constraint
@@ -900,7 +901,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # numerically broken on triton-XPU, so this is the correct route and is
         # ON BY DEFAULT. SGL_XPU_VERIFY_FASTPATH=0 forces the legacy triton
         # verify path (GDNAttnBackend.target_verify) for A/B comparison.
-        _allow_verify_fast = os.environ.get("SGL_XPU_VERIFY_FASTPATH", "1") != "0"
+        _allow_verify_fast = xpu_flag_on("VERIFY_FASTPATH", default=True)
         if (
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
@@ -1296,9 +1297,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
         # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
         # Hard-coded requirements: head_dim=256, fp16, GemmaRMSNorm weight+1.0
-        # (matches Qwen3.5's q_norm/k_norm). Gate with env + shape checks.
+        # (matches Qwen3.5's q_norm/k_norm). XPU-default-on (the PTL GGUF prod
+        # config); shape + ImportError checks below keep it safe. Set
+        # SGLANG_XPU_FA_ESIMD_QKV=0 to disable. (legacy SGL_XPU_* honored.)
         if (
-            os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
+            _is_xpu
+            and xpu_flag_on("FA_ESIMD_QKV", default=True)
             and self.head_dim == 256
             and hidden_states.dim() == 2
         ):
@@ -2014,7 +2018,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         EAGLE-safe) + the quant_method, or None if the head isn't an XPU-GGUF
         quant layer (caller then falls back to the dense dequant share).
         SGLANG_XPU_SHARE_QUANT_HEAD=0 reverts to the dequant share."""
-        if os.environ.get("SGLANG_XPU_SHARE_QUANT_HEAD", "1") == "0":
+        if not xpu_flag_on("SHARE_QUANT_HEAD", default=True):
             return None
         # The lm_head is a VocabParallelEmbedding/ParallelLMHead loaded via
         # GGUFEmbeddingXPUMethod, whose apply() reads `_xpu_emb_rep` (the packed
@@ -2333,7 +2337,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         EAGLE-safe) + the quant_method, or None if the head isn't an XPU-GGUF
         quant layer (caller then falls back to the dense dequant share).
         SGLANG_XPU_SHARE_QUANT_HEAD=0 reverts to the dequant share."""
-        if os.environ.get("SGLANG_XPU_SHARE_QUANT_HEAD", "1") == "0":
+        if not xpu_flag_on("SHARE_QUANT_HEAD", default=True):
             return None
         # The lm_head is a VocabParallelEmbedding/ParallelLMHead loaded via
         # GGUFEmbeddingXPUMethod, whose apply() reads `_xpu_emb_rep` (the packed

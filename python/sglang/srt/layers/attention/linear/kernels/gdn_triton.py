@@ -3,7 +3,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_npu, is_xpu, xpu_flag_on
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
@@ -159,10 +159,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # when conditions match (head_dim == 128 and H_v % H_k == 0; covers
         # Qwen3.5-0.8B dense GDN with H_k=H_v=16 and Qwen3.5-4B grouped-value
         # GDN with H_k=16, H_v=32). Env-gated so rollback is a one-liner.
-        import os as _os
         if (
             is_xpu()
-            and _os.environ.get("SGL_XPU_GDN_EXTEND_ESIMD") == "1"
+            and xpu_flag_on("GDN_EXTEND_ESIMD", default=True)
             and q.size(-1) == 128
             and v.size(-1) == 128
             and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)
@@ -216,8 +215,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        import os as _os
-        if is_xpu() and _os.environ.get("SGL_XPU_GDN_VERIFY_TRITON") != "1":
+        if is_xpu() and not xpu_flag_on("GDN_VERIFY_TRITON"):
             # SYCL GDN verify recurrence (custom_esimd_kernels_sglang.eagle_ops),
             # replacing the triton fused_sigmoid path which is numerically WRONG
             # on triton-XPU (produces ~100x-too-large core_attn_out vs the decode

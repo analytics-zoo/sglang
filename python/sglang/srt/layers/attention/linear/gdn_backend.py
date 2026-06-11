@@ -18,10 +18,9 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu, xpu_flag_on
 from sglang.srt.utils.common import rank0_log
 
-import os as _os
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -289,8 +288,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices = self.forward_metadata.mamba_cache_indices
 
         assert isinstance(mixed_qkv, torch.Tensor)
-        import os as _os
-        _py_gdn = _os.environ.get("SGL_XPU_GDN_PY") == "1"
+        _py_gdn = xpu_flag_on("GDN_PY")
 
         if _py_gdn:
             from sglang.srt.layers.attention.xpu_gdn_pytorch_fallback import (
@@ -423,7 +421,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            if _os.environ.get("SGL_XPU_GDN_VERIFY_TRITON") != "1":
+            if not xpu_flag_on("GDN_VERIFY_TRITON"):
                 # SYCL depthwise causal conv (eagle_ops) — the triton
                 # causal_conv1d_update is numerically broken on triton-XPU
                 # (whole triton GDN path is). topk=1 chain only.

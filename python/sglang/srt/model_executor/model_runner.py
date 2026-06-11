@@ -184,6 +184,7 @@ from sglang.srt.utils import (
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
+    xpu_flag_on,
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
@@ -759,7 +760,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # extension does not yet support; capture either fails with
             # "sycl_ext_oneapi_work_group_scratch_memory feature is not
             # yet available" or produces incorrect output on replay.
-            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
+            # NOTE: kept default-OFF (not an always-on A-class flag): SYCL graph
+            # capture is unsafe for backends using work_group_scratch_memory (see
+            # above) — opt-in only. Prefix unified; legacy SGL_XPU_* honored.
+            if xpu_flag_on("ENABLE_GRAPH"):
                 self.init_device_graphs()
             else:
                 self.graph_runner = None

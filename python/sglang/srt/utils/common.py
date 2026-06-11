@@ -353,6 +353,26 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
+def xpu_flag_on(name: str, default: bool = False) -> bool:
+    """Read a custom XPU feature switch with a single canonical prefix.
+
+    The PTL-GGUF work accumulated switches under TWO prefixes (SGLANG_XPU_* and
+    a legacy SGL_XPU_*). This consolidates them: the canonical name is
+    SGLANG_XPU_<name> (matches upstream's SGLANG_ convention); the legacy
+    SGL_XPU_<name> is still honored as a fallback so older start scripts / baked
+    images keep working. `name` is the suffix WITHOUT prefix, e.g. "ESIMD_DECODE".
+
+    default=True => on unless explicitly set to a falsy value (0/false) under
+    either prefix (canonical wins if both set).
+    """
+    canonical = os.getenv(f"SGLANG_XPU_{name}")
+    legacy = os.getenv(f"SGL_XPU_{name}")
+    raw = canonical if canonical is not None else legacy
+    if raw is None:
+        return default
+    return raw.lower() in ("1", "true")
+
+
 def get_int_env_var(name: str, default: int = 0) -> int:
     # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name)

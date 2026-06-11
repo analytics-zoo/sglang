@@ -38,6 +38,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
+    xpu_flag_on,
 )
 
 _is_cuda = is_cuda()
@@ -720,7 +721,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             and x.dtype == torch.float16
             and x.shape[-1] % 512 == 0
             and _esimd_gemma_norm is not None
-            and os.environ.get("SGL_XPU_ESIMD_GEMMA_NORM", "1") == "1"
+            and xpu_flag_on("ESIMD_GEMMA_NORM", default=True)
         ):
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition

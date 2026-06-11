@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
 )
 from sglang.srt.managers.schedule_batch import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import xpu_flag_on
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -747,7 +748,7 @@ class XPUAttentionBackend(AttentionBackend):
                 forward_batch.forward_mode.is_target_verify()
                 and self.topk <= 1
                 and not layer.is_cross_attention
-                and os.environ.get("SGLANG_XPU_VERIFY_ESIMD_ATTN") == "1"
+                and xpu_flag_on("VERIFY_ESIMD_ATTN")
             ):
                 result = self._esimd_verify_attn(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -767,7 +768,7 @@ class XPUAttentionBackend(AttentionBackend):
             # keeps the native FMHA kernel.
             elif (
                 not use_cascade_attn
-                and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+                and xpu_flag_on("FA_FALLBACK", default=True)
             ):
                 # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS
                 # SDPA kernel (cos=1.0 vs ref, incl. scattered-paged) over the slow
@@ -776,7 +777,7 @@ class XPUAttentionBackend(AttentionBackend):
                 _dpas = (
                     _get_prefill_dpas_op()
                     if (
-                        os.environ.get("SGL_XPU_PREFILL_DPAS") == "1"
+                        xpu_flag_on("PREFILL_DPAS")
                         and q.dtype == torch.float16
                         and layer.head_dim == 256
                         and not layer.is_cross_attention
@@ -1515,7 +1516,7 @@ class XPUAttentionBackend(AttentionBackend):
 
                 if (
                     not use_cascade_attn
-                    and os.environ.get("SGL_XPU_ESIMD_DECODE") == "1"
+                    and xpu_flag_on("ESIMD_DECODE", default=True)
                 ):
                     # ESIMD page_attn_decode's `max_seq_len` arg sizes the
                     # host-side launch grid (groupV = ceil(max_seq_len/64));
@@ -1549,7 +1550,7 @@ class XPUAttentionBackend(AttentionBackend):
                     )
                 elif (
                     not use_cascade_attn
-                    and os.environ.get("SGL_XPU_FA_FALLBACK") == "1"
+                    and xpu_flag_on("FA_FALLBACK", default=True)
                 ):
                     result = self._sdpa_fallback_decode(
                         q=q_reshaped,
