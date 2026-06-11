@@ -1847,26 +1847,40 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
             f"GGUFMoEXPUMethod fused path expects Q4_K gate/up, got {w13_type}")
         assert w2_type in (_Q5_K_TYPE, _Q6_K_TYPE), (
             f"GGUFMoEXPUMethod fused path expects Q5_K/Q6_K down, got {w2_type}")
-        gq, gs, gm, uq, us, um = [], [], [], [], [], []
-        dq, dh, ds, dm = [], [], [], []
-        self._down_is_q6 = (w2_type == _Q6_K_TYPE)
-        for e in range(E):
-            ql, sc, mn = _xpu_repack_q4_k(w13[e, :half, :].contiguous())
-            gq.append(ql); gs.append(sc); gm.append(mn)
-            ql, sc, mn = _xpu_repack_q4_k(w13[e, half:, :].contiguous())
-            uq.append(ql); us.append(sc); um.append(mn)
-            if self._down_is_q6:
-                ql, qh, sc = _xpu_repack_q6_k(w2[e].contiguous())
-                dq.append(ql); dh.append(qh); ds.append(sc)
-            else:
-                ql, qh, sc, mn = _xpu_repack_q5_k(w2[e].contiguous())
-                dq.append(ql); dh.append(qh); ds.append(sc); dm.append(mn)
+        # LOAD SPEED (notes #137f): this per-expert repack loop is the 35B weight-load
+        # bottleneck — ~100s = 92% of process_weights (40 layers x 256 experts x ~5
+        # CPU repacks). The _xpu_repack_* helpers are pure tensor ops tagged
+        # device=qweight.device; GGUF loads w13/w2 to CPU so they run on CPU. Move the
+        # stacked [E,...] tensors to XPU ONCE here so every per-expert slice+repack
+        # runs on-device (microbench: _xpu_repack_q4_k 175x faster on XPU, bit-identical
+        # #137b). The stacked reps are meant to be XPU-resident anyway. Gated for revert.
+        if (os.environ.get("SGLANG_GGUF_XPU_MOE_REPACK_ON_DEVICE", "1") == "1"
+                and w13.device.type == "cpu"):
+            w13 = w13.to("xpu"); w2 = w2.to("xpu")
         dev = w13.device
-        self.gate_ql = torch.stack(gq).contiguous(); self.gate_sc = torch.stack(gs).contiguous(); self.gate_mn = torch.stack(gm).contiguous()
-        self.up_ql = torch.stack(uq).contiguous(); self.up_sc = torch.stack(us).contiguous(); self.up_mn = torch.stack(um).contiguous()
-        self.down_ql = torch.stack(dq).contiguous(); self.down_qh = torch.stack(dh).contiguous(); self.down_sc = torch.stack(ds).contiguous()
-        self.down_mn = (torch.stack(dm).contiguous() if not self._down_is_q6
-                        else torch.zeros(1, dtype=torch.float16, device=dev))
+        self._down_is_q6 = (w2_type == _Q6_K_TYPE)
+        # BATCH repack (notes #137g): the old per-expert loop (E=256 x ~5 repacks
+        # x 40 layers) was the 35B load bottleneck. The _xpu_repack_* helpers are
+        # pure per-ROW ops, so flatten the [E, N, Kb] expert stack to [E*N, Kb],
+        # repack ALL experts in ONE call, then reshape back to [E, N, ...]. The
+        # repack code is UNCHANGED -> bit-identical to the loop (verified cos/equal,
+        # #137g); collapses 256 Python iters + tiny launches into 1 (q4_k 8x faster).
+        Kb13 = w13.shape[2]
+        gate_b = w13[:, :half, :].reshape(E * half, Kb13).contiguous()
+        up_b = w13[:, half:, :].reshape(E * half, Kb13).contiguous()
+        ql, sc, mn = _xpu_repack_q4_k(gate_b)
+        self.gate_ql = ql.reshape(E, half, -1).contiguous(); self.gate_sc = sc.reshape(E, half, -1).contiguous(); self.gate_mn = mn.reshape(E, half, -1).contiguous()
+        ql, sc, mn = _xpu_repack_q4_k(up_b)
+        self.up_ql = ql.reshape(E, half, -1).contiguous(); self.up_sc = sc.reshape(E, half, -1).contiguous(); self.up_mn = mn.reshape(E, half, -1).contiguous()
+        Nd, Kbd = w2.shape[1], w2.shape[2]
+        down_b = w2.reshape(E * Nd, Kbd).contiguous()
+        if self._down_is_q6:
+            ql, qh, sc = _xpu_repack_q6_k(down_b)
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
+            self.down_mn = torch.zeros(1, dtype=torch.float16, device=dev)
+        else:
+            ql, qh, sc, mn = _xpu_repack_q5_k(down_b)
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
         # dims: w13 gate rows = intermediate; hidden from gate K (=ql cols*2).
         self.intermediate = half
         self.hidden = self.gate_ql.shape[2] * 2
@@ -1879,14 +1893,13 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         # can't be reused). Both Q5_K (1-bit qh) and Q6_K (2-bit qh) down supported.
         self._grouped_ok = _moe_grouped is not None
         if self._grouped_ok:
-            dh2 = []
-            for e in range(E):
-                if self._down_is_q6:
-                    _, qh_plain, _ = _xpu_repack_q6_k_plain(w2[e].contiguous())
-                else:
-                    _, qh_plain, _, _ = _xpu_repack_q5_k_plain(w2[e].contiguous())
-                dh2.append(qh_plain)
-            self.down_qh_plain = torch.stack(dh2).contiguous()
+            # BATCH (notes #137g): same flatten-[E*Nd,Kbd] one-call repack as above.
+            down_b = w2.reshape(E * Nd, Kbd).contiguous()
+            if self._down_is_q6:
+                _, qh_plain, _ = _xpu_repack_q6_k_plain(down_b)
+            else:
+                _, qh_plain, _, _ = _xpu_repack_q5_k_plain(down_b)
+            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
 
         layer._xpu_moe_ready = True
         del layer.w13_qweight
