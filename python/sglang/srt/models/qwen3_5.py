@@ -487,11 +487,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         dv = self.head_v_dim
         qkvz_w = 2 * hk * dk + 2 * (hk * ratio) * dv
         ba_w = 2 * (hk * ratio)
-        idx_q = torch.arange(qkvz_w, dtype=torch.float64).reshape(1, qkvz_w)
-        idx_b = torch.arange(ba_w, dtype=torch.float64).reshape(1, ba_w)
+        # Build the index vectors on CPU as integers. This runs once per GDN
+        # layer inside `with torch.device("xpu")` (model init); a float64 arange
+        # there would dispatch to the XPU and PTL Xe3 (LPG) has NO hardware fp64,
+        # so it emulates — serializing the whole per-layer init loop into tens of
+        # seconds of cold-start. The repack below is pure split/reshape/cat (no
+        # arithmetic), so integer indices are exact; the consumers
+        # (_xpu_perm_rep_rows / _xpu_bake_out_row_perm) `.to(w.device)` the perm
+        # themselves, so building on CPU is correct and device-agnostic.
+        idx_q = torch.arange(qkvz_w, dtype=torch.long, device="cpu").reshape(1, qkvz_w)
+        idx_b = torch.arange(ba_w, dtype=torch.long, device="cpu").reshape(1, ba_w)
         out_q, out_b = self._repack_qkvz_ba_for_gdn_attention(idx_q, idx_b)
-        perm_q = out_q.reshape(-1).round().long()
-        perm_b = out_b.reshape(-1).round().long()
+        perm_q = out_q.reshape(-1).long()
+        perm_b = out_b.reshape(-1).long()
         # sanity: both are bijections of their width
         assert perm_q.numel() == qkvz_w and perm_b.numel() == ba_w
         assert int(perm_q.min()) == 0 and int(perm_q.max()) == qkvz_w - 1
