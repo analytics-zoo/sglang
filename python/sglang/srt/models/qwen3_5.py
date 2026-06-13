@@ -197,7 +197,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # path then skips the repack. On non-XPU-GGUF backends the attrs are
         # simply ignored (the eager repack still runs). Enabled only when the
         # fast path is eligible (env + ratio); see _forward_xpu_fast_path.
-        if _is_xpu and xpu_flag_on("GDN_BAKE_PERM", default=True):
+        #
+        # #138g COUPLING: baking rewrites in_proj rows into the path-X interleaved
+        # layout. When prefill is routed to path Y (the ESIMD extend kernel — the
+        # NaN fix, #138d) the model's fused_qkvzba_split_reshape_cat expects the
+        # NON-baked layout, so a baked projection silently produces GARBAGE on
+        # prefill (GSM8K 0.0). Bake is a single load-time weight rewrite (the same
+        # weights serve decode AND prefill), so it can't be per-mode at the weight
+        # level.
+        #
+        # #138l RESOLUTION: measured bake-OFF vs bake-ON+runtime-unbake — bake-off
+        # is strictly better: it removes the per-prefill un-bake gather (#138k:
+        # ~140ms of IndexSelect at 4k → 1k TTFT 1480→1125 ≈ path-X) AND costs
+        # nothing on decode (TPOT 39.7 vs 38.6 = within DVFS noise; the OPT-1 bake
+        # never actually helped decode TPOT, which is LPDDR-BW/DVFS-bound). So when
+        # prefill takes path Y, just disable bake entirely (no unbake code path).
+        # SGLANG_XPU_GDN_PREFILL_FASTPATH=1 puts prefill back on path-X and
+        # re-enables bake for that A/B.
+        _prefill_on_path_y = _is_xpu and not xpu_flag_on(
+            "GDN_PREFILL_FASTPATH", default=False
+        )
+        if (
+            _is_xpu
+            and xpu_flag_on("GDN_BAKE_PERM", default=True)
+            and not _prefill_on_path_y
+        ):
             pq, pb = self._build_gdn_out_row_perms()
             self.in_proj_qkvz._gguf_gdn_out_row_perm = pq
             self.in_proj_ba._gguf_gdn_out_row_perm = pb
@@ -902,9 +926,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # ON BY DEFAULT. SGL_XPU_VERIFY_FASTPATH=0 forces the legacy triton
         # verify path (GDNAttnBackend.target_verify) for A/B comparison.
         _allow_verify_fast = xpu_flag_on("VERIFY_FASTPATH", default=True)
+        # PREFILL NaN FIX (#138d): the fast-path prefill branch routes through the
+        # XE2 chunk_gated_delta_rule kernel (chunk-parallel + MMA-opt matrix
+        # inverse, ssm read as fp16), which produces NaN from FINITE inputs on
+        # long prefill (>=1 full 4096 chunk) — the kernel's PVC-style accuracy
+        # issue that GSM8K's short context never exercised (probe: BFCL ntok=4096
+        # -> L1 GDN core_out=NaN with all inputs finite). Decode (in-place fp32
+        # gated_delta_rule) and target-verify (gdn_fused_verify) are numerically
+        # fine and stay on the fast path. Route NON-speculative extend (pure
+        # prefill / mixed / split-prefill) to the fallback, which on XPU uses the
+        # all-fp32-state, inverse-free ESIMD chunk_gated_delta_rule_extend kernel
+        # (gdn_triton.py:162; 35B GDN dims H_k=16/H_v=32/dim=128 satisfy its
+        # gate). Gated so it can be reverted: SGLANG_XPU_GDN_PREFILL_FASTPATH=1
+        # forces the (buggy) fast path back on for prefill A/B.
+        _skip_fast_for_prefill = (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and not xpu_flag_on("GDN_PREFILL_FASTPATH", default=False)
+        )
         if (
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
+            and not _skip_fast_for_prefill
             and (_allow_verify_fast or not forward_batch.forward_mode.is_target_verify())
             and self.num_v_heads % self.num_k_heads == 0
         ):
@@ -915,6 +957,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             if output is not None:
                 return output
+
+        # #138l: reaching the path-Y fallback means prefill is routed off the fast
+        # path. With bake disabled in that case (see __init__), the projection is
+        # already in the NON-baked layout the split below expects — no un-bake
+        # needed. (_gdn_out_row_perm_baked is False whenever prefill takes path Y.)
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
