@@ -206,16 +206,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # weights serve decode AND prefill), so it can't be per-mode at the weight
         # level.
         #
-        # #138l RESOLUTION: measured bake-OFF vs bake-ON+runtime-unbake — bake-off
-        # is strictly better: it removes the per-prefill un-bake gather (#138k:
-        # ~140ms of IndexSelect at 4k → 1k TTFT 1480→1125 ≈ path-X) AND costs
-        # nothing on decode (TPOT 39.7 vs 38.6 = within DVFS noise; the OPT-1 bake
-        # never actually helped decode TPOT, which is LPDDR-BW/DVFS-bound). So when
-        # prefill takes path Y, just disable bake entirely (no unbake code path).
-        # SGLANG_XPU_GDN_PREFILL_FASTPATH=1 puts prefill back on path-X and
-        # re-enables bake for that A/B.
+        # #139-b UPDATE: path-X's long-prefill NaN is now FIXED at the kernel level
+        # (sgl-kernel-xpu chunk_gated_delta_rule_kernels_xe2.hpp: clamp the
+        # compute_A/fwd_o exp arg to <=0, killing the 0*inf in the to-be-masked
+        # upper triangle). With that fix path-X is NaN-safe AND ~5-18% faster TTFT
+        # than path-Y (clean same-session A/B, out=512: 1k 18% / 4k-8k ~10%), so
+        # prefill now takes path-X BY DEFAULT (GDN_PREFILL_FASTPATH default True).
+        # path-X wants the baked interleaved in_proj layout, so bake stays ENABLED
+        # in the default case. SGLANG_XPU_GDN_PREFILL_FASTPATH=0 reverts prefill to
+        # the path-Y ESIMD extend kernel AND disables bake (path-Y's split expects
+        # the NON-baked layout — see #138l below); both paths pass GSM8K 0.95 + BFCL.
+        #
+        # #138l (path-Y branch, when GDN_PREFILL_FASTPATH=0): bake-OFF is required
+        # because path-Y's fused_qkvzba_split_reshape_cat expects the non-baked
+        # layout (a baked rep -> silent GARBAGE, GSM8K 0.0). bake-off also removes
+        # the per-prefill un-bake gather (#138k: ~140ms IndexSelect at 4k) and costs
+        # nothing on decode (TPOT within DVFS noise; OPT-1 bake never helped decode,
+        # which is LPDDR-BW-bound). So path-Y just disables bake (no unbake path).
         _prefill_on_path_y = _is_xpu and not xpu_flag_on(
-            "GDN_PREFILL_FASTPATH", default=False
+            "GDN_PREFILL_FASTPATH", default=True
         )
         if (
             _is_xpu
@@ -926,22 +935,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # ON BY DEFAULT. SGL_XPU_VERIFY_FASTPATH=0 forces the legacy triton
         # verify path (GDNAttnBackend.target_verify) for A/B comparison.
         _allow_verify_fast = xpu_flag_on("VERIFY_FASTPATH", default=True)
-        # PREFILL NaN FIX (#138d): the fast-path prefill branch routes through the
-        # XE2 chunk_gated_delta_rule kernel (chunk-parallel + MMA-opt matrix
-        # inverse, ssm read as fp16), which produces NaN from FINITE inputs on
-        # long prefill (>=1 full 4096 chunk) — the kernel's PVC-style accuracy
-        # issue that GSM8K's short context never exercised (probe: BFCL ntok=4096
-        # -> L1 GDN core_out=NaN with all inputs finite). Decode (in-place fp32
-        # gated_delta_rule) and target-verify (gdn_fused_verify) are numerically
-        # fine and stay on the fast path. Route NON-speculative extend (pure
-        # prefill / mixed / split-prefill) to the fallback, which on XPU uses the
-        # all-fp32-state, inverse-free ESIMD chunk_gated_delta_rule_extend kernel
-        # (gdn_triton.py:162; 35B GDN dims H_k=16/H_v=32/dim=128 satisfy its
-        # gate). Gated so it can be reverted: SGLANG_XPU_GDN_PREFILL_FASTPATH=1
-        # forces the (buggy) fast path back on for prefill A/B.
+        # PREFILL via path-X (#138d root cause + #139-b fix): the fast-path prefill
+        # branch routes through the XE2 chunk_gated_delta_rule kernel (chunk-parallel
+        # + MMA-opt matrix inverse). It used to produce NaN from FINITE inputs on
+        # long prefill (>=1 full 4096 chunk): compute_A/fwd_o evaluated
+        # exp(g[m]-g[n]) over the whole tile before masking, and the to-be-masked
+        # upper-tri (m<n) had a large positive arg -> exp=inf, times K.Kt=0 there ->
+        # 0*inf=NaN leaking before the mask. FIXED in sgl-kernel-xpu by clamping the
+        # exp arg to <=0 (lossless on kept m>=n entries). With the fix path-X is
+        # NaN-safe and ~5-18% faster TTFT than path-Y, so it is the DEFAULT prefill
+        # path now. SGLANG_XPU_GDN_PREFILL_FASTPATH=0 routes NON-speculative extend
+        # to the fallback path-Y instead (the all-fp32-state, inverse-free ESIMD
+        # chunk_gated_delta_rule_extend kernel, gdn_triton.py:162) — kept as a
+        # reversible fallback (also NaN-safe, GSM8K 0.95 + BFCL). decode + verify
+        # always stay on the fast path (different fp32 kernels, never NaN'd).
         _skip_fast_for_prefill = (
             forward_batch.forward_mode.is_extend_without_speculative()
-            and not xpu_flag_on("GDN_PREFILL_FASTPATH", default=False)
+            and not xpu_flag_on("GDN_PREFILL_FASTPATH", default=True)
         )
         if (
             _ENABLE_XPU_FAST_PATH
@@ -958,10 +968,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if output is not None:
                 return output
 
-        # #138l: reaching the path-Y fallback means prefill is routed off the fast
-        # path. With bake disabled in that case (see __init__), the projection is
-        # already in the NON-baked layout the split below expects — no un-bake
-        # needed. (_gdn_out_row_perm_baked is False whenever prefill takes path Y.)
+        # Reaching here means prefill is on the path-Y fallback
+        # (GDN_PREFILL_FASTPATH=0, no longer the default). Bake was disabled in that
+        # case (see __init__), so the projection is already in the NON-baked layout
+        # the split below expects — no un-bake needed. (_gdn_out_row_perm_baked is
+        # False whenever prefill takes path-Y.)
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
