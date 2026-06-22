@@ -6,6 +6,88 @@ from typing import List, Optional, Tuple
 
 import torch
 
+# ---------------------------------------------------------------------------
+# MTP per-step device-event profiler (gated by SGL_XPU_MTP_PROF=1).
+# Isolated device-event timing of the 3 spec sub-phases (draft / verify /
+# draft_extend). Device-synchronized per phase → real isolated ms, NOT the
+# record_shapes-in-graph times (which are overlap-inflated; trace note §6/#133).
+# Dumps a cumulative table to SGL_XPU_MTP_PROF_OUT (default /tmp/mtp_prof.txt)
+# every SGL_XPU_MTP_PROF_EVERY steps. Zero overhead when the env is unset.
+# ---------------------------------------------------------------------------
+_MTP_PROF_ON = os.environ.get("SGL_XPU_MTP_PROF") == "1"
+_MTP_PROF_OUT = os.environ.get("SGL_XPU_MTP_PROF_OUT", "/tmp/mtp_prof.txt")
+_MTP_PROF_EVERY = int(os.environ.get("SGL_XPU_MTP_PROF_EVERY", "40"))
+
+
+class _MtpProf:
+    """Accumulate isolated device-event ms per spec sub-phase."""
+
+    def __init__(self):
+        self.sums = {}      # phase -> total ms
+        self.counts = {}    # phase -> n samples
+        self.accepts = []   # accepted-tokens per step (for accept_len)
+        self.steps = 0
+
+    def add(self, phase, ms):
+        self.sums[phase] = self.sums.get(phase, 0.0) + ms
+        self.counts[phase] = self.counts.get(phase, 0) + 1
+
+    def end_step(self, accepted=None):
+        self.steps += 1
+        if accepted is not None:
+            self.accepts.append(accepted)
+        if self.steps % _MTP_PROF_EVERY == 0:
+            self.dump()
+
+    def dump(self):
+        try:
+            lines = [f"=== MTP_PROF after {self.steps} steps ==="]
+            total = 0.0
+            top = ("draft", "verify", "draft_extend")
+            for ph in top:
+                if ph in self.sums:
+                    n = self.counts[ph]
+                    total += self.sums[ph]
+                    lines.append(
+                        f"{ph:20s} mean={self.sums[ph]/n:8.3f} ms  n={n:6d}  sum={self.sums[ph]:10.1f}"
+                    )
+            for ph in sorted(self.sums):  # sub-phases (verify.target_fwd, etc.)
+                if ph not in top:
+                    n = self.counts[ph]
+                    lines.append(
+                        f"  {ph:18s} mean={self.sums[ph]/n:8.3f} ms  n={n:6d}  sum={self.sums[ph]:10.1f}"
+                    )
+            if self.steps:
+                lines.append(f"{'STEP_TOTAL':14s} mean={total/self.steps:8.3f} ms (sum 3 phases / steps)")
+            if self.accepts:
+                al = sum(self.accepts) / len(self.accepts)
+                lines.append(f"{'accept_len':14s} mean={al:8.3f}  n={len(self.accepts)}")
+            with open(_MTP_PROF_OUT, "w") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+
+_MTP_PROF = _MtpProf() if _MTP_PROF_ON else None
+
+
+@contextmanager
+def _mtp_phase(name):
+    """Device-event timed phase. No-op when profiling is off."""
+    if _MTP_PROF is None:
+        yield
+        return
+    dev = "xpu"
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    try:
+        yield
+    finally:
+        end.record()
+        torch.xpu.synchronize()
+        _MTP_PROF.add(name, start.elapsed_time(end))
+
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -74,6 +156,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_musa,
     is_npu,
+    is_xpu,
     next_power_of_2,
     xpu_flag_on,
 )
@@ -81,6 +164,21 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
+if _is_xpu:
+    # registers torch.ops.eagle_ops.* (SYCL spec-decode index kernels), replacing
+    # the triton index kernels (triton-on-XPU is unreliable). Best-effort: if the
+    # ext is missing, _XPU_EAGLE_OPS stays False and we fall back to triton.
+    try:
+        import custom_esimd_kernels_sglang  # noqa: F401
+
+        _XPU_EAGLE_OPS = hasattr(torch.ops, "eagle_ops") and hasattr(
+            torch.ops.eagle_ops, "assign_draft_cache_locs_p1"
+        ) and os.environ.get("SGL_XPU_NO_EAGLE_SYCL") != "1"
+    except Exception:
+        _XPU_EAGLE_OPS = False
+else:
+    _XPU_EAGLE_OPS = False
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -501,14 +599,16 @@ class EAGLEWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                spec_info = self.draft(batch)
+                with _mtp_phase("draft"):
+                    spec_info = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
+            with _mtp_phase("verify"):
+                logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
+                    self.verify(batch, spec_info)
+                )
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -529,11 +629,21 @@ class EAGLEWorker(TpModelWorker):
                     or batch.spec_info.verified_id.shape[0] > 0
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    with _mtp_phase("draft_extend"):
+                        self.forward_draft_extend_after_decode(batch)
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
             )
+
+            if _MTP_PROF is not None:
+                try:
+                    _acc = sum(verify_output.accept_length_per_req_cpu) / max(
+                        1, len(verify_output.accept_length_per_req_cpu)
+                    )
+                except Exception:
+                    _acc = None
+                _MTP_PROF.end_step(_acc)
 
             controller = getattr(self, "adaptive_controller", None)
             if controller is not None:
@@ -698,24 +808,36 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len = 0
             source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
 
-        assign_draft_cache_locs[(num_seqs,)](
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            self.extend_lens,
-            self.num_new_pages_per_topk,
-            out_cache_loc,
-            source_cache_loc,
-            target_cache_loc,
-            last_page_lens_cumsum,
-            duplicate_cache_len,
-            batch.req_to_token_pool.req_to_token.shape[1],
-            self.topk,
-            self.speculative_num_steps,
-            self.page_size,
-            next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
-        )
+        if _XPU_EAGLE_OPS and (self.page_size == 1 or self.topk == 1):
+            # SYCL port (Part-1 copy; the only branch the topk==1/page-aligned
+            # XPU path takes). Replaces the triton kernel (triton-on-XPU unreliable).
+            torch.ops.eagle_ops.assign_draft_cache_locs_p1(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                out_cache_loc,
+                self.topk,
+                self.speculative_num_steps,
+            )
+        else:
+            assign_draft_cache_locs[(num_seqs,)](
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                self.extend_lens,
+                self.num_new_pages_per_topk,
+                out_cache_loc,
+                source_cache_loc,
+                target_cache_loc,
+                last_page_lens_cumsum,
+                duplicate_cache_len,
+                batch.req_to_token_pool.req_to_token.shape[1],
+                self.topk,
+                self.speculative_num_steps,
+                self.page_size,
+                next_power_of_2(num_seqs),
+                next_power_of_2(self.speculative_num_steps + self.page_size),
+            )
 
         if self.page_size > 1 and self.topk > 1:
             if duplicate_cache_len > 0:
@@ -935,9 +1057,10 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
+        with _mtp_phase("verify.target_fwd"):
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -966,13 +1089,14 @@ class EAGLEWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
-            batch,
-            logits_output,
-            self.token_to_kv_pool_allocator,
-            self.page_size,
-            vocab_mask,
-        )
+        with _mtp_phase("verify.accept"):
+            res: EagleVerifyOutput = spec_info.verify(
+                batch,
+                logits_output,
+                self.token_to_kv_pool_allocator,
+                self.page_size,
+                vocab_mask,
+            )
 
         # Post process based on verified outputs.
         # Pick indices that we care (accepted)
@@ -986,9 +1110,10 @@ class EAGLEWorker(TpModelWorker):
             or self.target_worker.model_runner.mamba2_config is not None
             or self.target_worker.model_runner.hybrid_lightning_config is not None
         ):
-            self._mamba_verify_update(
-                batch, res, logits_output, spec_info, seq_lens_pre_verify
-            )
+            with _mtp_phase("verify.mamba_update"):
+                self._mamba_verify_update(
+                    batch, res, logits_output, spec_info, seq_lens_pre_verify
+                )
 
         if batch.return_logprob:
             add_output_logprobs_for_spec_v1(batch, res, logits_output)

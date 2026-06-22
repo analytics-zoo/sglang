@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -44,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils import is_cuda, is_xpu, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -52,6 +53,27 @@ if is_cuda():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+# SYCL spec-decode index kernels (eagle_ops) replace the triton index kernels on
+# XPU (triton-on-XPU unreliable). Best-effort load; flag false → fall back to triton.
+_is_xpu = is_xpu()
+if _is_xpu:
+    try:
+        import custom_esimd_kernels_sglang  # noqa: F401
+
+        _XPU_EAGLE_OPS = (
+            hasattr(torch.ops, "eagle_ops")
+            and hasattr(torch.ops.eagle_ops, "align_evict_mask_to_page_size_xpu")
+            and os.environ.get("SGL_XPU_NO_EAGLE_SYCL") != "1"
+        )
+    except Exception:
+        _XPU_EAGLE_OPS = False
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        f"[eagle_ops] SYCL spec-decode index kernels: _XPU_EAGLE_OPS={_XPU_EAGLE_OPS}"
+    )
+else:
+    _XPU_EAGLE_OPS = False
 
 logger = logging.getLogger(__name__)
 
@@ -477,13 +499,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
-                align_evict_mask_to_page_size[len(batch.seq_lens),](
-                    batch.seq_lens,
-                    evict_mask,
-                    page_size,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                )
+                if _XPU_EAGLE_OPS:
+                    torch.ops.eagle_ops.align_evict_mask_to_page_size_xpu(
+                        batch.seq_lens, evict_mask, page_size, self.draft_token_num
+                    )
+                else:
+                    align_evict_mask_to_page_size[len(batch.seq_lens),](
+                        batch.seq_lens,
+                        evict_mask,
+                        page_size,
+                        self.draft_token_num,
+                        next_power_of_2(self.draft_token_num),
+                    )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
             else:
                 # Shift the accepted tokens to the beginning.
@@ -511,16 +538,26 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 # split each row of out_cache_loc into two parts.
                 # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
                 # 2. the second part goes to to_free_slots.
-                get_target_cache_loc[(bs,)](
-                    tgt_cache_loc,
-                    to_free_slots,
-                    accept_length,
-                    to_free_num_slots,
-                    batch.out_cache_loc,
-                    self.draft_token_num,
-                    next_power_of_2(self.draft_token_num),
-                    next_power_of_2(bs),
-                )
+                if _XPU_EAGLE_OPS:
+                    torch.ops.eagle_ops.get_target_cache_loc_xpu(
+                        tgt_cache_loc,
+                        to_free_slots,
+                        accept_length,
+                        to_free_num_slots,
+                        batch.out_cache_loc,
+                        self.draft_token_num,
+                    )
+                else:
+                    get_target_cache_loc[(bs,)](
+                        tgt_cache_loc,
+                        to_free_slots,
+                        accept_length,
+                        to_free_num_slots,
+                        batch.out_cache_loc,
+                        self.draft_token_num,
+                        next_power_of_2(self.draft_token_num),
+                        next_power_of_2(bs),
+                    )
 
                 # Free the kv cache
                 token_to_kv_pool_allocator.free(to_free_slots)
@@ -599,14 +636,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         batch.seq_lens,
                     )
                     batch.seq_lens_cpu.add_(accept_length_cpu + 1)
-                    filter_finished_cache_loc_kernel[(bs,)](
-                        batch.out_cache_loc,
-                        tgt_cache_loc,
-                        accept_length,
-                        accept_length_filter,
-                        next_power_of_2(bs),
-                        next_power_of_2(self.draft_token_num),
-                    )
+                    if _XPU_EAGLE_OPS:
+                        torch.ops.eagle_ops.filter_finished_cache_loc_xpu(
+                            batch.out_cache_loc,
+                            tgt_cache_loc,
+                            accept_length,
+                            accept_length_filter,
+                        )
+                    else:
+                        filter_finished_cache_loc_kernel[(bs,)](
+                            batch.out_cache_loc,
+                            tgt_cache_loc,
+                            accept_length,
+                            accept_length_filter,
+                            next_power_of_2(bs),
+                            next_power_of_2(self.draft_token_num),
+                        )
 
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
@@ -740,14 +785,23 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
         self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
 
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.accept_length,
-            self.positions,
-            self.verified_id,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
-        )
+        if _XPU_EAGLE_OPS:
+            torch.ops.eagle_ops.create_extend_after_decode_spec_info_xpu(
+                batch.input_ids,
+                batch.seq_lens,
+                self.accept_length,
+                self.positions,
+                self.verified_id,
+            )
+        else:
+            create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+                batch.input_ids,
+                batch.seq_lens,
+                self.accept_length,
+                self.positions,
+                self.verified_id,
+                next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+            )
 
     def generate_attn_arg_prefill(
         self,
