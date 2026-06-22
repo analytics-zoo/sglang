@@ -842,6 +842,45 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # disable_state_update: main ssm/conv pools left untouched; the
             # mamba scatter commits the accepted step from inter_ssm/inter_conv.
         else:
+            # RADIX TRACK-BUFFER FIX: when this prefill needs to populate the
+            # extra_buffer mamba track slot (mamba_track_mask=True for some req),
+            # allocate a per-chunk intermediate ssm buffer and let the kernel fill
+            # the carry state at every 64-aligned chunk boundary. We then copy the
+            # chunk matching each req's track point into its real track slot. This
+            # is the XPU equivalent of CUDA's FLA intermediate `h` (see
+            # hybrid_linear_attn_backend.py:_init_track_ssm_indices). Without it the
+            # radix track slot stays zero (measured) → cross-turn mamba memory lost.
+            _need_track = False
+            _tmask = getattr(forward_batch, "mamba_track_mask", None)
+            if (not use_inplace) and _tmask is not None:
+                _need_track = bool(_tmask[:batch_size].any().item())
+            _inter_ssm = None
+            _inter_ssm_idx = None
+            _inter_conv = None
+            if _need_track:
+                # max chunks across the batch's seqs (query_start_loc deltas)
+                _qsl = query_start_loc.to(torch.long)
+                _seqlens = (_qsl[1 : batch_size + 1] - _qsl[:batch_size])
+                _chunk = 64  # chunk_size_xe2
+                _max_chunks = int(
+                    ((_seqlens + _chunk - 1) // _chunk).max().item()
+                )
+                _max_chunks = max(_max_chunks, 1)
+                _inter_ssm = scratch_ssm.new_zeros(
+                    (batch_size, _max_chunks, nv_tp, self.head_v_dim, self.head_k_dim)
+                )
+                _inter_ssm_idx = torch.arange(
+                    batch_size, device=scratch_ssm.device, dtype=torch.int32
+                )
+                # RADIX TRACK-BUFFER FIX (conv): aligned-boundary conv window.
+                # Kernel writes inter_conv[req] = conv window ending at the
+                # 64-aligned boundary (= radix reuse point), shape
+                # [bs, W-1, conv_elems] matching the pool's (conv_dim, W-1)
+                # transposed → here (W-1, conv_dim). scratch_conv is the kernel
+                # layout (bs, W-1, conv_dim); reuse its dtype/shape per req.
+                _inter_conv = scratch_conv.new_zeros(
+                    (batch_size, scratch_conv.shape[1], scratch_conv.shape[2])
+                )
             torch.ops.sgl_kernel.gdn_attention(
                 core_attn_out,
                 z,
@@ -867,6 +906,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 kernel_state_indices,
                 num_actual_tokens,
                 self.attn_tp_size,
+                _inter_ssm,
+                _inter_ssm_idx,
+                _inter_conv,
+                _inter_ssm_idx,  # same per-req islot mapping (arange(bs))
             )
 
             # Scatter kernel writeback into the real MambaPool slots. SKIPPED for
@@ -883,6 +926,125 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 pool_ssm.index_copy_(
                     0, cache_indices_long, scratch_ssm.to(pool_ssm.dtype)
                 )
+
+                # FIX (radix mamba track-buffer): fill the extra_buffer track slot
+                # so radix prefix-reuse restores the correct mid-sequence mamba
+                # state (else it stays 0 → cross-turn memory lost; measured). The
+                # track point is mamba_track_seqlens, which can fall on a 64-aligned
+                # chunk boundary INSIDE this prefill (radix branch point), not just
+                # the end — that's why filling only the final state was insufficient.
+                # Replicates CUDA _init_track_ssm_indices (hybrid_linear_attn_backend.py:
+                # 337-360): aligned → final state (main slot); unaligned → the chunk
+                # of inter_ssm at (lens_to_track-1)//64. conv: final window (W-1 tail).
+                _tmask = getattr(forward_batch, "mamba_track_mask", None)
+                _tidx = getattr(forward_batch, "mamba_track_indices", None)
+                _tseq = getattr(forward_batch, "mamba_track_seqlens", None)
+                _epl = forward_batch.extend_prefix_lens
+                if (
+                    _tmask is not None
+                    and _tidx is not None
+                    and _tseq is not None
+                    and _epl is not None
+                ):
+                    _dev = pool_ssm.device
+                    _sel = _tmask[:batch_size].to(_dev).to(torch.bool)
+                    if bool(_sel.any().item()):
+                        _dstL = _tidx[:batch_size].to(_dev).to(torch.long)
+                        _ci = cache_indices_long.to(_dev)
+                        _ts = _tseq[:batch_size].to(_dev).to(torch.long)
+                        _pl = _epl[:batch_size].to(_dev).to(torch.long)
+                        _csel = torch.nonzero(_sel, as_tuple=True)[0]
+                        # ssm + conv track: per req, aligned→final state/window,
+                        # unaligned→inter_ssm chunk / inter_conv aligned window.
+                        _chunk = 64
+                        for _bi in _csel.tolist():
+                            _ltt = int(_ts[_bi].item() - _pl[_bi].item())
+                            if _ltt <= 0:
+                                continue
+                            _dslot = int(_dstL[_bi].item())
+                            _aligned = (_ltt % _chunk) == 0
+                            # --- conv track (mirror ssm aligned/unaligned) ---
+                            # aligned: the just-written pool_conv[cache_idx] final
+                            # window IS the aligned-boundary window. unaligned: the
+                            # final window is at the (unaligned) seq end, NOT the
+                            # 64-aligned reuse point → use _inter_conv (kernel wrote
+                            # the aligned-boundary window). _inter_conv[req] is
+                            # (W-1, conv_dim); pool is (conv_dim, W-1) → transpose.
+                            if _aligned or _inter_conv is None:
+                                pool_conv[_dslot] = pool_conv[int(_ci[_bi].item())]
+                            else:
+                                pool_conv[_dslot] = (
+                                    _inter_conv[_bi]
+                                    .transpose(-1, -2)
+                                    .to(pool_conv.dtype)
+                                )
+                            # --- ssm track ---
+                            if _aligned or _inter_ssm is None:
+                                # aligned (or no inter buffer): final state is correct
+                                pool_ssm[_dslot] = pool_ssm[int(_ci[_bi].item())]
+                            else:
+                                # inter_ssm[c] holds state AFTER chunk c, i.e. it
+                                # equals FLA's h[c+1] (FLA's h[k] is the carry-IN
+                                # to chunk k = state up to token k*64; our kernel
+                                # snapshots AFTER the S-update = state up to
+                                # (c+1)*64). CUDA _init_track_ssm_indices reads
+                                # h[_ltt//64]; in our buffer that is index
+                                # _ltt//64 - 1. The old (_ltt-1)//64 over-indexed
+                                # by one chunk → for a near-end track point in a
+                                # req shorter than the batch max it hit an
+                                # unwritten (zero) chunk → ssm_norm=0 on reuse
+                                # (turn4 failure). Source: chunk_delta_h.py:123-127
+                                # vs kernels_xe2.hpp:1280.
+                                _cidx = (_ltt // _chunk) - 1
+                                if _cidx < 0:
+                                    # _ltt < 64: target is h[0] = prefix carry-in,
+                                    # not in the buffer; shouldn't occur under
+                                    # track_mask (extend>=64). Fall back to final.
+                                    pool_ssm[_dslot] = pool_ssm[int(_ci[_bi].item())]
+                                else:
+                                    _cidx = min(_cidx, _inter_ssm.shape[1] - 1)
+                                    pool_ssm[_dslot] = _inter_ssm[_bi, _cidx].to(
+                                        pool_ssm.dtype
+                                    )
+
+            else:
+                # DECODE-TIME track (use_inplace path). CUDA's GDN backend calls
+                # _track_mamba_state_decode after EVERY decode step
+                # (gdn_backend.py:349,378 → track_mamba_states_if_needed,
+                # hybrid_linear_attn_backend.py:591-593): copy the current
+                # conv+ssm row from cache_indices into the radix track slot for
+                # every req whose mamba_track_mask is True. On decode the mask is
+                # (seq_lens % track_interval == 0) (schedule_batch.py:2359-2360),
+                # i.e. True exactly when this decode position lands on a 64-aligned
+                # boundary — that's the position radix will later reuse. Our prefill
+                # fill above only covers prefill boundaries; without this, every
+                # 64-boundary CROSSED DURING DECODE GENERATION never gets a track
+                # slot → stays 0 → cross-turn radix reuse at that point restores 0
+                # → state corruption (measured: turn1 echo content space→\n,
+                # base_6 FAIL). The kernel already wrote pool[cache_indices]
+                # in-place, so the current row IS the aligned-boundary state — a
+                # plain row copy suffices (no inter_ssm needed on decode).
+                #
+                # CRITICAL: this runs INSIDE the captured XPU decode graph
+                # (forward_batch.mamba_track_mask / mamba_track_indices are live
+                # graph-replay input buffers — cuda_graph_runner.py:376-387). So it
+                # MUST be branchless + host-sync-free (R13): NO .item()/.any()/
+                # .tolist(), NO data-dependent shapes, NO Python `if` on tensor
+                # values. We build a per-req destination index
+                #   dst = where(mask, track_idx, cache_idx)
+                # and do ONE unconditional index_copy_ from the cache_idx rows.
+                # Where mask is False, dst == src (self-copy: harmless no-op);
+                # where True, the freshly-written aligned-boundary state lands in
+                # the track slot. Fully static shape → graph-capturable.
+                _tmask = getattr(forward_batch, "mamba_track_mask", None)
+                _tidx = getattr(forward_batch, "mamba_track_indices", None)
+                if _tmask is not None and _tidx is not None:
+                    _src = cache_indices.to(torch.long)
+                    _sel = _tmask[:batch_size].to(_src.device, torch.bool)
+                    _trk = _tidx[:batch_size].to(_src.device, torch.long)
+                    _dst = torch.where(_sel, _trk, _src)
+                    pool_conv.index_copy_(0, _dst, pool_conv.index_select(0, _src))
+                    pool_ssm.index_copy_(0, _dst, pool_ssm.index_select(0, _src))
 
         # Post: RMSNormGated(core_attn_out, z) then out_proj. Mirrors the
         # default path lines 504-519 below.
