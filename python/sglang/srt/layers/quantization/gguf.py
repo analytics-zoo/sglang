@@ -122,6 +122,15 @@ elif _is_xpu:
     (esimd_gemv_q6_k_m,) = _imp_kernels(("esimd_gemv_q6_k_m",))
     esimd_moe_up_q4k, esimd_moe_down_q5k, esimd_moe_down_q6k = _imp_kernels(
         ("esimd_moe_up_q4k", "esimd_moe_down_q5k", "esimd_moe_down_q6k"))
+    # fused silu(gate)*up PTL-ESIMD kernel (1 launch vs torch's silu+mul+contiguous=3).
+    # kernel-bench (device-event): 1.42-1.74x faster than torch at n_route>=16 (verify
+    # MoE main shapes), but ~0.6x SLOWER at n_route<16 (tiny launch-dominated) -> gated
+    # on size below. Optional (older .so lacks it -> None -> torch fallback).
+    (esimd_moe_silu_mul,) = _imp_kernels(("esimd_moe_silu_mul",))
+    # fused MoE combine (weighted gather-reduce): final[t]=sum_k out_route[ids]*w. Replaces
+    # the torch un-sort+mul+index_select+sum (5 launches, launch-bound 94x over BW floor).
+    # kernel-bench: 1.30-1.40x vs torch incl. host prep at verify shapes. Optional.
+    (esimd_moe_gather,) = _imp_kernels(("esimd_moe_gather",))
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
@@ -1063,15 +1072,22 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     _moe_grouped.moe_up_q4k_ggemv(xf, gate_ql, gate_sc, gate_mn, up_ql, up_sc, up_mn,
                                   gate_buf, chunks_t, hidden, inter, tok_sorted_i32,
                                   smallm=_smallm)
-    # P-ELEM-silu (notes §10bl): do silu*mul in fp16 directly. The old explicit
-    # .float() on both halves materialized two [n_route, inter] fp32 intermediates
-    # (the UnrolledElementwise/VectorizedElementwise flood in the prefill trace);
-    # fp16 silu+mul is 4.3x faster (1412→332us @ n_route=8192) and bit-identical
-    # (cos=1.0) since the kernels already produced fp16. (esimd_moe_silu_mul exists
-    # as a binding but its op is in the [skip-ptl] moe module, not built — so the
-    # fp16-lean torch path is the zero-build win.)
-    inter_states = (torch.nn.functional.silu(gate_buf[:, :inter])
-                    * gate_buf[:, inter:]).contiguous()
+    # silu(gate)*up. The PTL-ESIMD esimd_moe_silu_mul fuses it into ONE launch (vs
+    # torch's silu+mul+contiguous = 3); kernel-bench is 1.42-1.74x faster at n_route>=16
+    # (verify MoE shapes) but ~0.6x at n_route<16 (launch-dominated tiny), so gate on
+    # size. cos=1.0 vs torch. Falls back to the fp16-lean torch path (notes §10bl: do
+    # silu*mul in fp16 directly, 4.3x faster than the old .float() materialize) when the
+    # kernel is absent or n_route is tiny. Kill-switch SGLANG_XPU_NO_SILU_FUSE=1.
+    if (
+        esimd_moe_silu_mul is not None
+        and n_route >= 16
+        and os.environ.get("SGLANG_XPU_NO_SILU_FUSE") != "1"
+    ):
+        inter_states = torch.empty(n_route, inter, dtype=torch.float16, device=dev)
+        esimd_moe_silu_mul(gate_buf, inter_states, 2 * inter, inter, n_route)
+    else:
+        inter_states = (torch.nn.functional.silu(gate_buf[:, :inter])
+                        * gate_buf[:, inter:]).contiguous()
     out_route = torch.zeros(n_route, hidden, dtype=torch.float16, device=dev)
     if down_is_q6:
         _moe_grouped.moe_down_q6k_ggemv(inter_states, d_ql, d_qh, d_sc, out_route,
@@ -1085,6 +1101,20 @@ def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
     # back to [M, top_k] order then do a contiguous weighted reduce. ~1.7x faster,
     # bit-exact (cos=1.0). order is the expert-sort permutation; its argsort is
     # the inverse (sorted-order -> original route order).
+    # combine: out[m] = sum_k out_route[inv[m*topk+k]] * topk_weights[m,k]. The fused
+    # esimd_moe_gather does the gather+weight+reduce in ONE launch (vs torch's
+    # mul+index_select+sum = launch-bound 94x over floor). 1.30-1.40x at verify shapes,
+    # cos>0.9999 (offline 90/90). Gated SGLANG_XPU_NO_COMBINE_FUSE=1.
+    if (
+        esimd_moe_gather is not None
+        and os.environ.get("SGLANG_XPU_NO_COMBINE_FUSE") != "1"
+    ):
+        inv = torch.argsort(order)
+        topk_ids_pos = inv.to(torch.int32).reshape(M, top_k).contiguous()
+        w_sorted = topk_weights.reshape(-1)[order].to(torch.float16).contiguous()
+        final = torch.empty(M, hidden, dtype=torch.float16, device=dev)
+        esimd_moe_gather(out_route, topk_ids_pos, w_sorted, final, hidden, top_k, M)
+        return final.float()
     w_sorted = topk_weights.reshape(-1)[order].to(out_route.dtype)
     contrib = out_route * w_sorted.unsqueeze(1)                # [n_route, hidden] fp16, sorted
     inv = torch.argsort(order)
