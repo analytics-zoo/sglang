@@ -6,11 +6,18 @@ import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
+import os as _os
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+
+
+def _no_organize_opt():
+    # kill-switch for the #129 organize_draft_results all-select short-circuit (A/B)
+    return _os.environ.get("SGLANG_XPU_NO_ORGANIZE_OPT") == "1"
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
@@ -26,10 +33,26 @@ def organize_draft_results(
 ):
     score_list = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
-    top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
-    top_scores_index = top_scores.indices
-    top_scores_index = torch.sort(top_scores_index).values
-    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+    # OPT (#129): at topk=1 chain draft, score_list has exactly num_draft_token-1
+    # columns (num_steps * topk^2 = num_steps, and num_steps == num_draft_token-1),
+    # so topk(.,num_draft_token-1) selects ALL of them and sort(indices) is just
+    # [0,1,..,num_draft_token-2] (single chain, no branching). The score VALUE never
+    # changes WHICH draft is kept — it's dead code. Skip the radixsort+radixselect
+    # (~3.35ms/step device-busy at [216]/[27,256]) and use the identity index.
+    # Guard is strict: only when topk==1 AND the all-select condition holds.
+    if (
+        not _no_organize_opt()
+        and score_list.shape[1] == num_draft_token - 1
+    ):
+        top_scores_index = torch.arange(
+            num_draft_token - 1, device=score_list.device, dtype=torch.int64
+        ).unsqueeze(0).expand(score_list.shape[0], -1)
+        draft_tokens = ss_token_list[:, : num_draft_token - 1]
+    else:
+        top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+        draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)

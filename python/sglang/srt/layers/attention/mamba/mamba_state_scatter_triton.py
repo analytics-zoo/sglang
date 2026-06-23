@@ -114,10 +114,34 @@ def _xpu_mamba_state_scatter_with_mask(
     dst_req_size = dst.shape[1]
     device = dst.device
 
+    # OPT (2026-06-23, #126): the all-layer ssm/conv gather+scatter, originally
+    #   gathered = src[:, v_req, v_step]   # advanced-index MATERIALIZES [L,n_valid,*state]
+    #   dst[:, v_dst] = gathered           # then scatters it
+    # round-trips the full state THREE times on a [30,2,4,32,128,128] fp32 tensor —
+    # profiled ~1.7ms(index)+1.3ms(index_put)/step. The XPU eagle_ops SYCL kernel
+    # mamba_state_scatter does the masked src->dst copy in ONE pass (no materialize,
+    # no host-sync, bounds/mask checked in-kernel — equivalent to the CUDA triton
+    # kernel). Taken BEFORE any .any() so we don't reintroduce a host-sync.
+    # DEFAULT OFF: kernel-bench + clean per-step trace showed it runs at PARITY with the
+    # torch advanced-index path (torch is already at the 1.07× BW floor at the bs=1
+    # verify shape, so there's no headroom to recover). The kernel is correct (10/10
+    # bit-identical) + zero-risk; kept opt-in (SGLANG_XPU_SCATTER_OPT=1) for the bs>1
+    # case where torch may materialize. Default path = torch advanced-index.
+    import os as _os
+    use_sycl = (_os.environ.get("SGLANG_XPU_SCATTER_OPT") == "1"
+                and hasattr(torch.ops, "eagle_ops")
+                and hasattr(torch.ops.eagle_ops, "mamba_state_scatter"))
+    if use_sycl:
+        torch.ops.eagle_ops.mamba_state_scatter(
+            dst, src.contiguous(),
+            dst_indices_raw.to(torch.int32),
+            step_indices_raw.to(torch.int32),
+        )
+        return
+
     dst_idx = dst_indices_raw.to(torch.long)
     step_idx = step_indices_raw.to(torch.long)
     req_idx = torch.arange(total_requests, device=device, dtype=torch.long)
-
     valid = (
         (step_idx >= 0)
         & (dst_idx >= 0)
@@ -127,17 +151,10 @@ def _xpu_mamba_state_scatter_with_mask(
     )
     if not bool(valid.any()):
         return
-
-    v_req = req_idx[valid]      # source request indices
-    v_dst = dst_idx[valid]      # destination cache lines
-    v_step = step_idx[valid]    # per-request accepted step
-
-    # src[:, v_req, v_step, :] -> gather along (req, step) for every layer.
-    # Indexing src[:, v_req, v_step] broadcasts the two index tensors and keeps
-    # the leading layer dim + trailing state dims:
-    #   result shape [num_layers, num_valid, *state_shape]
+    v_req = req_idx[valid]
+    v_dst = dst_idx[valid]
+    v_step = step_idx[valid]
     gathered = src[:, v_req, v_step]
-    # scatter into dst[:, v_dst, :]
     dst[:, v_dst] = gathered
 
 
