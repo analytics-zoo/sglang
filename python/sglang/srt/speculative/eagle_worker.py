@@ -19,6 +19,11 @@ _MTP_PROF_OUT = os.environ.get("SGL_XPU_MTP_PROF_OUT", "/tmp/mtp_prof.txt")
 _MTP_PROF_EVERY = int(os.environ.get("SGL_XPU_MTP_PROF_EVERY", "40"))
 
 
+def _no_argmax_opt():
+    # kill-switch for the #127 topk=1 argmax-instead-of-softmax optimization (A/B)
+    return os.environ.get("SGLANG_XPU_NO_ARGMAX_OPT") == "1"
+
+
 class _MtpProf:
     """Accumulate isolated device-event ms per spec sub-phase."""
 
@@ -394,6 +399,14 @@ class EAGLEWorker(TpModelWorker):
                 logger.info(
                     f"XPU draft-decode graph captured in {time.perf_counter() - tic:.2f}s."
                 )
+            # NOTE (2026-06-23): draft-EXTEND graph capture on XPU was tried
+            # (SGLANG_XPU_DRAFT_EXTEND_GRAPH) and CRASHES — EAGLEDraftExtendCudaGraphRunner's
+            # torch.cuda.* calls are NOT covered by the draft-decode shim; scheduler dies
+            # native (leaked-semaphore, no traceback) right after "capturing draft-EXTEND".
+            # And it's not worth fixing: capture only recovers LAUNCH-GAP, and the Phase-A1
+            # trace shows steady-step kernels are back-to-back (all gaps 1.2µs; the 12%
+            # non-busy is at step/request boundaries, not inside draft). Upper bound on
+            # draft-extend capture gain < 3% tps. Reverted. (notes/mtp_optimization_plan.md)
             return
 
         Device2DraftCudaGraphRunner = {
@@ -1010,8 +1023,20 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            # OPT (#127): at topk=1 (chain draft) the full-vocab softmax is redundant —
+            # its probability VALUE is dead-code downstream (build_tree uses only the
+            # index; greedy verify uses only the token + target argmax; select_top_k /
+            # organize_draft degenerate to identity at topk=1). argmax over logits gives
+            # the same token without the 248320-wide softmax. topk_p kept as a 1.0
+            # placeholder (shape-compatible, NaN-safe). Gated for A/B.
+            if self.topk == 1 and not _no_argmax_opt():
+                topk_index = torch.argmax(
+                    logits_output.next_token_logits, dim=-1, keepdim=True
+                )
+                topk_p = torch.ones_like(topk_index, dtype=logits_output.next_token_logits.dtype)
+            else:
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             maybe_detect_oob(
                 topk_index,
                 0,
@@ -1347,8 +1372,18 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        # OPT (#127): topk=1 argmax fast path — see draft_forward note. softmax value
+        # is dead-code downstream at topk=1; argmax gives the same token id.
+        if self.topk == 1 and not _no_argmax_opt():
+            draft_input.topk_index = torch.argmax(
+                logits_output.next_token_logits, dim=-1, keepdim=True
+            )
+            draft_input.topk_p = torch.ones_like(
+                draft_input.topk_index, dtype=logits_output.next_token_logits.dtype
+            )
+        else:
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
