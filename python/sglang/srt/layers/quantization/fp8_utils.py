@@ -188,6 +188,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    ESIMD = "esimd"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -212,6 +213,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
+
+    def is_esimd(self) -> bool:
+        return self == Fp8GemmRunnerBackend.ESIMD
 
 
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
@@ -438,6 +442,17 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
+
+    elif backend.is_esimd():
+        try:
+            import custom_esimd_kernels  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "ESIMD backend requested via --fp8-gemm-runner-backend=esimd, "
+                "but custom_esimd_kernels is not installed. Install it from "
+                "custom-esimd-kernels with `CXX=icpx pip install -e .`."
+            ) from exc
+        return esimd_w8a8_block_fp8_linear
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
@@ -840,6 +855,50 @@ def triton_w8a8_block_fp8_linear(
     )
     if bias is not None:
         output += bias
+    return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+def esimd_w8a8_block_fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Block-scaled FP8 E4M3 GEMM on Intel BMG GPUs via custom ESIMD kernel.
+
+    Layout (matches the triton path):
+      input         : [..., K]                         bf16/fp16
+      weight        : [N, K]                           fp8_e4m3
+      weight_scale  : [N / block_n, K / block_k]       fp32
+      activations are quantised on the fly with per-token group scales of size
+      block_k along K, producing scale_a of shape [M, K / block_k].
+    """
+    import custom_esimd_kernels
+
+    assert input_scale is None
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    # Per-token group quant (same as triton path).
+    q_input, x_scale = per_token_group_quant_fp8(
+        input_2d, block_size[1], column_major_scales=False
+    )
+
+    output = custom_esimd_kernels.fp8_block_dequant_matmul(
+        q_input,
+        weight,
+        x_scale.to(torch.float32).contiguous(),
+        weight_scale.to(torch.float32).contiguous(),
+        block_size[0],
+        block_size[1],
+        block_size[1],
+        input_2d.dtype,
+    )
+
+    if bias is not None:
+        output = output + bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
