@@ -137,4 +137,8 @@ def chunk_gated_delta_rule_torch(
         last_state[s] = state
 
     o = o.unsqueeze(0)  # [1, T_total, H, V]
-    return o, None, last_state
+    # Return contract: (o, last_recurrent_state, h_aux). The caller in
+    # gdn_backend.forward_extend scatters last_recurrent_state back into
+    # ssm_states[cache_indices] on non-CUDA backends; returning it as the
+    # middle element (not as h_aux) is required for that scatter to run.
+    return o, last_state, None
