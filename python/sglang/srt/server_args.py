@@ -255,6 +255,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "esimd",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -2703,8 +2704,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa() or is_npu()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
+                is_cuda() or is_musa() or is_npu() or is_xpu()
+            ), "Mamba extra_buffer is only supported on CUDA, MUSA, NPU, or Intel XPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert not self.enable_mamba_extra_buffer_lazy(), (
                     "extra_buffer_lazy is not yet supported with speculative decoding. "

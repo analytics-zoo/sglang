@@ -116,6 +116,147 @@ _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 
+# ── XPU custom ESIMD MoE fast path (FP8 e4m3 silu, BMG DPAS) ────────────────
+_ESIMD_MOE_OP = None
+_ESIMD_MOE_OP_LOADED = False
+
+
+def _load_esimd_moe_silu_op():
+    """Lazy-load the moe_forward_full_silu_routed pybind entry point.
+
+    Returns the callable on success, None on failure (then we always fall
+    back to sgl_kernel.fused_experts).
+    """
+    global _ESIMD_MOE_OP, _ESIMD_MOE_OP_LOADED
+    if _ESIMD_MOE_OP_LOADED:
+        return _ESIMD_MOE_OP
+    _ESIMD_MOE_OP_LOADED = True
+    try:
+        from custom_esimd_kernels import (
+            custom_esimd_kernels_moe_batch as _moe_mod,
+        )
+        _ESIMD_MOE_OP = _moe_mod.moe_forward_full_silu_routed
+    except Exception:
+        _ESIMD_MOE_OP = None
+    return _ESIMD_MOE_OP
+
+
+def _maybe_esimd_moe_silu_routed(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_runner_config,
+    *,
+    use_fp8_w8a8: bool,
+    use_mxfp4_w4a16: bool,
+    block_quant: bool,
+) -> Optional[torch.Tensor]:
+    """Drop-in for sgl_kernel.fused_experts when conditions match.
+
+    Conditions (anything else → None, fall back to sgl_kernel.fused_experts):
+      - FP8 e4m3 weights, silu_mul activation, no bias / clamp / gated alpha
+      - small T (decode + tiny chunked-prefill)
+    Block-scale weights are collapsed to per-expert per-tensor scale via the
+    cached mean trick used in `triton_w8a8_block_fp8_linear`.
+    """
+    import os as _os
+    _DEBUG = _os.environ.get("SGLANG_ESIMD_MOE_DEBUG", "0") == "1"
+
+    def _dbg(reason: str) -> None:
+        if _DEBUG:
+            print(f"[esimd-moe] skip: {reason}", flush=True)
+
+    if not use_fp8_w8a8 or use_mxfp4_w4a16:
+        _dbg("dtype mismatch (need fp8 e4m3)")
+        return None
+    if x.device.type != "xpu":
+        _dbg(f"device={x.device.type}")
+        return None
+    if x.shape[0] > 8:
+        _dbg(f"T={x.shape[0]} >8 (prefill — fall back to sgl_kernel)")
+        return None
+    if getattr(moe_runner_config, "activation", "silu") != "silu":
+        _dbg(f"act={getattr(moe_runner_config, 'activation', '?')}")
+        return None
+    if getattr(moe_runner_config, "gemm1_alpha", None) is not None:
+        _dbg("gemm1_alpha set")
+        return None
+    if getattr(moe_runner_config, "gemm1_clamp_limit", None) is not None:
+        _dbg("gemm1_clamp_limit set")
+        return None
+    if getattr(moe_runner_config, "swiglu_limit", None) is not None:
+        _dbg("swiglu_limit set")
+        return None
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
+        _dbg(f"weight dtype: w13={w13.dtype} w2={w2.dtype}")
+        return None
+    if w13.dtype != w2.dtype:
+        _dbg(f"w13/w2 dtype mismatch: {w13.dtype} vs {w2.dtype}")
+        return None
+    if getattr(layer, "w13_weight_bias", None) is not None:
+        _dbg("w13 bias present")
+        return None
+    if getattr(layer, "w2_weight_bias", None) is not None:
+        _dbg("w2 bias present")
+        return None
+
+    op = _load_esimd_moe_silu_op()
+    if op is None:
+        _dbg("op not loaded")
+        return None
+
+    def _per_expert_pt_scale(scale: torch.Tensor) -> torch.Tensor:
+        cached = getattr(scale, "_esimd_pt_per_expert", None)
+        if cached is not None:
+            return cached
+        s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
+        s = s.contiguous()
+        try:
+            scale._esimd_pt_per_expert = s
+        except Exception:
+            pass
+        return s
+
+    if block_quant:
+        w13_scale = layer.w13_weight_scale_inv
+        w2_scale = layer.w2_weight_scale_inv
+    else:
+        w13_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+    if w13_scale is None or w2_scale is None:
+        _dbg("missing scale")
+        return None
+    s13 = _per_expert_pt_scale(w13_scale)
+    s2 = _per_expert_pt_scale(w2_scale)
+
+    if topk_weights.dtype != torch.float16:
+        topk_weights = topk_weights.to(torch.float16)
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+    orig_dtype = x.dtype
+    x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+    top_k = topk_ids.shape[-1]
+    n_routed = w13.shape[0]
+    if _DEBUG:
+        print(
+            f"[esimd-moe] HIT T={x_in.shape[0]} hidden={x_in.shape[1]} "
+            f"top_k={top_k} n_routed={n_routed}",
+            flush=True,
+        )
+    try:
+        out = op(x_in, topk_weights, topk_ids, w13, s13, w2, s2, top_k, n_routed)
+    except Exception as e:
+        _dbg(f"op raised: {e}")
+        return None
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -430,7 +571,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         # Create the weight
         weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
+            fp8_dtype if self.is_checkpoint_fp8_serialized else params_dtype
         )
         weight = ModelWeightParameter(
             data=torch.empty(
@@ -891,7 +1032,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
-            params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+            params_dtype = torch.uint32 if _use_hip_int4 else fp8_dtype
         tp_size = get_tensor_model_parallel_world_size()
 
         w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
@@ -1547,6 +1688,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[fp8-moe-pwfl] block_quant={self.block_quant} "
+            f"is_ckpt_fp8={self.quant_config.is_checkpoint_fp8_serialized} "
+            f"w13.dtype={layer.w13_weight.dtype}\n"
+        )
+        _sys.stderr.flush()
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -1807,7 +1955,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -1860,9 +2007,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
-            use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
+            use_fp8_w8a8 = layer.w13_weight.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
+
             output = fused_experts(
                 x,
                 layer.w13_weight,

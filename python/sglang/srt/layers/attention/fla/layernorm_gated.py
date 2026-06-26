@@ -22,11 +22,27 @@ from sglang.srt.utils import (
     device_context,
     is_cpu,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
+_is_xpu = is_xpu()
+
+
+def _xpu_rms_norm_gated_op_available() -> bool:
+    """Cached check for sgl_kernel.gdn_rms_norm_gated availability on XPU."""
+    if not _is_xpu:
+        return False
+    try:
+        import sgl_kernel  # noqa: F401
+        return hasattr(torch.ops.sgl_kernel, "gdn_rms_norm_gated")
+    except Exception:
+        return False
+
+
+_HAS_XPU_GDN_RMS_NORM_GATED = _xpu_rms_norm_gated_op_available()
 
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
@@ -452,15 +468,46 @@ class RMSNorm(torch.nn.Module):
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
             )
-        else:
-            return layernorm_fn(
-                x,
-                self.weight,
-                self.bias,
-                z=z,
-                eps=self.eps,
-                group_size=self.group_size,
-                norm_before_gate=self.norm_before_gate,
-                is_rms_norm=True,
-                activation=self.activation,
+        # XPU fused SYCL path (Qwen3.5/3.6 GDN output norm config):
+        # norm-before-gate, no group, no bias, swish, fp16 or bf16 IO.
+        # weight is loaded with the model's config-default dtype which may
+        # not match the runtime activation dtype (e.g. config bf16 but
+        # --dtype float16). Lazily cache a weight cast to match x.dtype.
+        if (
+            _HAS_XPU_GDN_RMS_NORM_GATED
+            and z is not None
+            and self.norm_before_gate
+            and self.group_size is None
+            and self.bias is None
+            and self.activation == "swish"
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and z.dtype == x.dtype
+            and x.device.type == "xpu"
+        ):
+            if self.weight.dtype == x.dtype:
+                weight = self.weight
+            else:
+                cached = getattr(self, "_weight_cast_cache", None)
+                if cached is None or cached.dtype != x.dtype:
+                    cached = self.weight.to(x.dtype).contiguous()
+                    self._weight_cast_cache = cached
+                weight = cached
+            x_shape_og = x.shape
+            x2d = x.reshape(-1, x.shape[-1]).contiguous()
+            z2d = z.reshape(-1, z.shape[-1]).contiguous()
+            out = torch.empty_like(x2d)
+            torch.ops.sgl_kernel.gdn_rms_norm_gated(
+                out, x2d, z2d, weight.contiguous(), float(self.eps)
             )
+            return out.reshape(x_shape_og)
+        return layernorm_fn(
+            x,
+            self.weight,
+            self.bias,
+            z=z,
+            eps=self.eps,
+            group_size=self.group_size,
+            norm_before_gate=self.norm_before_gate,
+            is_rms_norm=True,
+            activation=self.activation,
+        )

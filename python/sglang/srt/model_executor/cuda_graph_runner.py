@@ -75,6 +75,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     is_hip,
+    is_xpu,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -83,6 +84,45 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+
+def _xpu_patch_cuda_graph_apis() -> None:
+    """Route torch.cuda.CUDAGraph/graph onto torch.xpu equivalents so the
+    device-agnostic cuda_graph_runner works on XPU unchanged.
+
+    torch.xpu.graph has a different kwarg name (xpu_graph= instead of
+    cuda_graph=); we wrap it so the rest of the code can keep passing
+    cuda_graph=.
+
+    Idempotent. Only runs when torch.xpu is available and torch.cuda
+    hasn't already been patched.
+    """
+    if getattr(torch.cuda, "_sglang_xpu_patched", False):
+        return
+    if not (hasattr(torch, "xpu") and hasattr(torch.xpu, "XPUGraph")):
+        return
+
+    torch.cuda.CUDAGraph = torch.xpu.XPUGraph  # type: ignore[assignment]
+
+    class _XpuGraphCtx:
+        """Mimic torch.cuda.graph signature but forward to torch.xpu.graph."""
+
+        def __init__(self, cuda_graph, pool=None, stream=None, capture_error_mode="global"):
+            # capture_error_mode is a CUDA-only arg; ignore on XPU.
+            self._ctx = torch.xpu.graph(xpu_graph=cuda_graph, pool=pool, stream=stream)
+
+        def __enter__(self):
+            return self._ctx.__enter__()
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._ctx.__exit__(exc_type, exc, tb)
+
+    torch.cuda.graph = _XpuGraphCtx  # type: ignore[assignment]
+    torch.cuda._sglang_xpu_patched = True
+
+
+if is_xpu():
+    _xpu_patch_cuda_graph_apis()
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -818,7 +858,11 @@ class CudaGraphRunner:
             graph_ctx = (
                 partial(memory_saver_adapter.cuda_graph, tag=GPU_MEMORY_TYPE_CUDA_GRAPH)
                 if memory_saver_adapter.enabled
-                else self.device_module.graph
+                # torch.cuda.graph is aliased to a wrapper over torch.xpu.graph
+                # on XPU (see _xpu_patch_cuda_graph_apis above); on CUDA it is
+                # the real torch.cuda.graph. self.device_module.graph would
+                # bypass the wrapper and fail with unknown kwarg on XPU.
+                else torch.cuda.graph if is_xpu() else self.device_module.graph
             )
 
         if self.model_runner.server_args.debug_cuda_graph:

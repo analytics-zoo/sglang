@@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
 
+# XPU ESIMD decode-attention fast path (BMG): operate on sglang's native flat
+# NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
+# paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
+_ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
+    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
+)
+_XPU_ESIMD_DECODE_FN = None
+if _ENABLE_XPU_ESIMD_DECODE:
+    try:
+        from custom_esimd_kernels import (
+            sglang_decode_attn as _XPU_ESIMD_DECODE_FN,
+        )
+    except ImportError:
+        _XPU_ESIMD_DECODE_FN = None
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -161,6 +176,9 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.cuda_graph_max_bs = getattr(
+            model_runner.server_args, "cuda_graph_max_bs", None
+        ) or 1
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
@@ -1379,6 +1397,60 @@ class TritonAttnBackend(AttentionBackend):
             and layer.v_head_dim == self.swa_v_head_dim
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
+
+        if (
+            _XPU_ESIMD_DECODE_FN is not None
+            and not self.use_mla
+            and layer.qk_head_dim == 256
+            and layer.qk_head_dim == layer.v_head_dim
+            and layer.xai_temperature_len <= 0
+            and sinks is None
+            and logits_soft_cap == 0.0
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= 0)
+        ):
+            # XPU ESIMD fast path: native flat NHD layout, no reshape.
+            B = kv_indptr.numel() - 1
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            q_fp16 = q.view(B, layer.tp_q_head_num, layer.qk_head_dim)
+            if q_fp16.dtype != torch.float16:
+                q_fp16 = q_fp16.to(torch.float16)
+            o_fp16 = torch.empty_like(q_fp16)
+            # Pre-allocated phase-1 scratch for XPUGraph capture/replay.
+            # The kernel's hard cap is MAX_SPLITS=256, SPLIT_TILE=64, so the
+            # captured graph can serve sequences up to 16384 tokens; longer
+            # sequences would overrun and must fall back to the legacy path.
+            # Alloc once (sized for cuda_graph_max_bs) and never reallocate
+            # — data_ptr must stay stable across replays.
+            SPLIT_TILE = 64
+            MAX_N_SPLITS = 256
+            ESIMD_GRAPH_MAX_SEQ = SPLIT_TILE * MAX_N_SPLITS  # 16384
+            Hq = layer.tp_q_head_num
+            cached = getattr(self, "_esimd_decode_temp_p", None)
+            B_cap = max(B, self.cuda_graph_max_bs)
+            cache_key = (B_cap, Hq, q_fp16.device.index)
+            if cached is None or cached[0] != cache_key:
+                per_partial = B_cap * Hq * MAX_N_SPLITS
+                temp_numel = per_partial * (1 + 1 + 256)
+                temp_p = torch.empty(
+                    temp_numel,
+                    dtype=torch.float32,
+                    device=q_fp16.device,
+                )
+                self._esimd_decode_temp_p = (cache_key, temp_p)
+            else:
+                temp_p = cached[1]
+            _XPU_ESIMD_DECODE_FN(
+                q_fp16, k_buf, v_buf,
+                kv_indptr.to(torch.int32),
+                kv_indices.to(torch.int32),
+                o_fp16,
+                float(layer.scaling),
+                temp_p,
+                ESIMD_GRAPH_MAX_SEQ,
+            )
+            o.view(B, layer.tp_q_head_num, layer.v_head_dim).copy_(o_fp16)
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
