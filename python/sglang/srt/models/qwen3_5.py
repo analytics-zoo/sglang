@@ -707,34 +707,59 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # The ESIMD kernel is fp16-only — cast inputs/outputs around the call.
         # qkvz/ba already on XPU; cast to fp16.
         orig_dtype = projected_states_qkvz.dtype
+        # Cache the constant fp16 casts of the per-layer weights once. These
+        # never change between calls, so recomputing .to(fp16) each time both
+        # wastes time and allocates fresh tensors mid-graph-capture.
+        wcache = getattr(self, "_esimd_gdn_wconst", None)
+        if wcache is None:
+            wcache = {
+                "conv_w": self._esimd_conv_weights.to(torch.float16),
+                "conv_b": self._esimd_conv_bias_zeros.to(torch.float16),
+                "A_log": (
+                    self.A_log.to(torch.float16)
+                    if self.A_log.dtype != torch.float16
+                    else self.A_log
+                ),
+                "dt_bias": (
+                    self.dt_bias.to(torch.float16)
+                    if self.dt_bias.dtype != torch.float16
+                    else self.dt_bias
+                ),
+            }
+            self._esimd_gdn_wconst = wcache
+        conv_w = wcache["conv_w"]
+        conv_b = wcache["conv_b"]
+        A_log = wcache["A_log"]
+        dt_bias = wcache["dt_bias"]
         if orig_dtype != torch.float16:
             qkvz = projected_states_qkvz.to(torch.float16).contiguous()
             ba = projected_states_ba.to(torch.float16).contiguous()
             conv_state_view = conv_state_view.to(torch.float16)
             ssm_state_view = pool_ssm.to(torch.float16).contiguous()
-            conv_w = self._esimd_conv_weights.to(torch.float16)
-            conv_b = self._esimd_conv_bias_zeros.to(torch.float16)
-            A_log = self.A_log.to(torch.float16) if self.A_log.dtype != torch.float16 else self.A_log
-            dt_bias = self.dt_bias.to(torch.float16) if self.dt_bias.dtype != torch.float16 else self.dt_bias
         else:
             qkvz = projected_states_qkvz.contiguous()
             ba = projected_states_ba.contiguous()
             ssm_state_view = pool_ssm
-            conv_w = self._esimd_conv_weights
-            conv_b = self._esimd_conv_bias_zeros
-            A_log = self.A_log
-            dt_bias = self.dt_bias
 
         N = qkvz.shape[0]
         nk_tp = self.num_k_heads // self.attn_tp_size
         nv_tp = self.num_v_heads // self.attn_tp_size
         scale = float(self.head_k_dim ** -0.5)
 
-        core_attn_out = torch.empty(
-            (N, nv_tp, self.head_v_dim),
-            dtype=torch.float16, device=qkvz.device,
-        )
-        z_out = torch.empty_like(core_attn_out)
+        # Pre-allocate the conv/recurrence output scratch, keyed by token count,
+        # and reuse across XPU-graph replays so the buffers' data ptrs stay
+        # stable. Decode graphs are captured per batch size, so a given replay
+        # always sees the N it was captured with.
+        ocache = getattr(self, "_esimd_gdn_scratch", None)
+        if ocache is None or ocache[0] != N:
+            core_attn_out = torch.empty(
+                (N, nv_tp, self.head_v_dim),
+                dtype=torch.float16, device=qkvz.device,
+            )
+            z_out = torch.empty_like(core_attn_out)
+            self._esimd_gdn_scratch = (N, core_attn_out, z_out)
+        else:
+            _, core_attn_out, z_out = ocache
 
         try:
             esimd_gdn_conv_fused_seq(
@@ -1281,43 +1306,63 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 nTokens = qkv.shape[0]
                 orig_dtype = qkv.dtype
                 qkv_fp16 = qkv.to(torch.float16).contiguous()
-                q_out = torch.empty(
-                    (nTokens, self.num_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
-                )
-                gate_out = (
-                    torch.empty(
+                # Cache the constant fp16 casts (norm weights, cos/sin cache)
+                # once. Recomputing .to(fp16).contiguous() every call both wastes
+                # time and allocates fresh tensors mid-graph-capture.
+                cache = getattr(self, "_esimd_qkv_const", None)
+                if cache is None:
+                    cs = self.rotary_emb.cos_sin_cache
+                    cache = {
+                        "q_norm": self.q_norm.weight.to(torch.float16).contiguous(),
+                        "k_norm": self.k_norm.weight.to(torch.float16).contiguous(),
+                        "cos_sin": cs.to(torch.float16) if cs.dtype != torch.float16 else cs,
+                        "rotary_dim": int(
+                            self.head_dim
+                            * getattr(self.config, "partial_rotary_factor", 1.0)
+                        ),
+                    }
+                    self._esimd_qkv_const = cache
+                # Pre-allocate the q/k/v/gate output scratch, keyed by token
+                # count, and reuse across XPU-graph replays so the buffers' data
+                # ptrs stay stable. Graphs are captured per batch size, so a
+                # given replay always sees the nTokens it was captured with.
+                scratch = getattr(self, "_esimd_qkv_scratch", None)
+                if scratch is None or scratch[0] != nTokens:
+                    q_out = torch.empty(
                         (nTokens, self.num_heads * 256),
                         device=qkv.device, dtype=torch.float16,
                     )
-                    if self.attn_output_gate
-                    else torch.empty(0, device=qkv.device, dtype=torch.float16)
-                )
-                k_out = torch.empty(
-                    (nTokens, self.num_kv_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
-                )
-                v_out = torch.empty(
-                    (nTokens, self.num_kv_heads * 256),
-                    device=qkv.device, dtype=torch.float16,
-                )
+                    gate_out = (
+                        torch.empty(
+                            (nTokens, self.num_heads * 256),
+                            device=qkv.device, dtype=torch.float16,
+                        )
+                        if self.attn_output_gate
+                        else torch.empty(0, device=qkv.device, dtype=torch.float16)
+                    )
+                    k_out = torch.empty(
+                        (nTokens, self.num_kv_heads * 256),
+                        device=qkv.device, dtype=torch.float16,
+                    )
+                    v_out = torch.empty(
+                        (nTokens, self.num_kv_heads * 256),
+                        device=qkv.device, dtype=torch.float16,
+                    )
+                    self._esimd_qkv_scratch = (
+                        nTokens, q_out, gate_out, k_out, v_out
+                    )
+                else:
+                    _, q_out, gate_out, k_out, v_out = scratch
                 pos_i32 = positions.to(torch.int32).contiguous()
-                cs = self.rotary_emb.cos_sin_cache
-                if cs.dtype != torch.float16:
-                    cs = cs.to(torch.float16)
-                rotary_dim_arg = int(
-                    self.head_dim
-                    * getattr(self.config, "partial_rotary_factor", 1.0)
-                )
                 esimd_qkv_split_norm_rope(
                     qkv_fp16,
                     q_out, gate_out, k_out, v_out,
-                    self.q_norm.weight.to(torch.float16).contiguous(),
-                    self.k_norm.weight.to(torch.float16).contiguous(),
+                    cache["q_norm"],
+                    cache["k_norm"],
                     pos_i32,
                     self.num_heads, self.num_kv_heads,
                     self.attn_output_gate,
-                    rotary_dim_arg, cs,
+                    cache["rotary_dim"], cache["cos_sin"],
                 )
                 q = q_out.to(orig_dtype)
                 k = k_out.to(orig_dtype)
