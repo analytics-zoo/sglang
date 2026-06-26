@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_musa,
     is_sm100_supported,
     is_sm120_supported,
+    is_xpu,
     log_info_on_rank0,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -49,6 +50,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -73,6 +75,22 @@ if _is_cuda or _is_musa:
     from sglang.jit_kernel.per_token_group_quant_8bit import (
         per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
     )
+
+if _is_xpu:
+    # sgl-kernel-xpu provides AOT SYCL implementations for these kernels
+    from sgl_kernel import (
+        sgl_per_tensor_quant_fp8,
+        sgl_per_token_quant_fp8,
+    )
+
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        enable_sgl_per_token_group_quant_8bit = True
+    except ImportError:
+        from sgl_kernel import sgl_per_token_group_quant_fp8
+
+        enable_sgl_per_token_group_quant_8bit = False
 
 if _is_hip:
     _has_vllm = False
@@ -127,7 +145,15 @@ if is_fp8_fnuz():
     fp8_dtype = torch.float8_e4m3fnuz
     fp8_max = 224.0
 else:
-    fp8_dtype = torch.float8_e4m3fn
+    # Allow override to e5m2 via SGLANG_FP8_DTYPE=e5m2. Default stays e4m3fn.
+    # e5m2 has wider dynamic range but lower precision; some XPU kernels (the
+    # ESIMD MoE silu-routed-e5m2 variant) are tuned for it.
+    import os as _os_fp8
+    _fp8_dtype_str = _os_fp8.environ.get("SGLANG_FP8_DTYPE", "e4m3").lower()
+    if _fp8_dtype_str == "e5m2":
+        fp8_dtype = torch.float8_e5m2
+    else:
+        fp8_dtype = torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
