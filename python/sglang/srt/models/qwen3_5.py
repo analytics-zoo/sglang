@@ -625,6 +625,136 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _forward_xpu_esimd_gdn_decode(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[torch.Tensor]:
+        """ESIMD fast path for GDN decode.
+
+        Calls custom_esimd_kernels_sglang.esimd_gdn_conv_fused_seq, which
+        fuses conv1d + the GDN recurrence into one ESIMD launch. Accepts
+        sequential [q|k|v|z] layout directly (no gather).
+
+        Kernel is fp16-only; on a bf16 model the implicit cast loses
+        precision in the GDN recurrence and accuracy drops. Restrict to
+        fp16 inputs.
+
+        Returns the layer output on success, or None to fall back.
+        """
+        if projected_states_qkvz.dtype != torch.float16:
+            return None
+        try:
+            from custom_esimd_kernels_sglang import esimd_gdn_conv_fused_seq
+        except ImportError:
+            return None
+
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        try:
+            attn_backend = get_attn_backend()
+        except Exception:
+            return None
+        linear_backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
+        fwd_md = getattr(linear_backend, "forward_metadata", None)
+        if fwd_md is None:
+            return None
+        cache_indices = fwd_md.mamba_cache_indices
+        if cache_indices is None:
+            return None
+
+        mamba_cache_params = linear_backend.req_to_token_pool.mamba2_layer_cache(
+            self.layer_id
+        )
+        # sglang pool conv: (cache, conv_dim, W-1); kernel expects
+        # (cache, W-1, conv_dim) view (per-batch contiguous via stride).
+        pool_conv = mamba_cache_params.conv[0]
+        pool_ssm = mamba_cache_params.temporal
+        conv_state_view = pool_conv.transpose(-1, -2).contiguous()
+        # transpose+contiguous makes a fresh allocation; we'll write back
+        # into the pool below. (The kernel writes the new conv state into
+        # the (cache, W-1, conv_dim) layout it sees.)
+
+        # Cache the conv1d.weight view + zeros bias once per layer.
+        if getattr(self, "_esimd_conv_weights", None) is None:
+            w = self.conv1d.weight
+            self._esimd_conv_weights = w.view(w.size(0), w.size(2)).contiguous()
+            self._esimd_conv_bias_zeros = torch.zeros(
+                w.size(0),
+                dtype=w.dtype,
+                device=w.device,
+            )
+
+        # The ESIMD kernel is fp16-only — cast inputs/outputs around the call.
+        # qkvz/ba already on XPU; cast to fp16.
+        orig_dtype = projected_states_qkvz.dtype
+        if orig_dtype != torch.float16:
+            qkvz = projected_states_qkvz.to(torch.float16).contiguous()
+            ba = projected_states_ba.to(torch.float16).contiguous()
+            conv_state_view = conv_state_view.to(torch.float16)
+            ssm_state_view = pool_ssm.to(torch.float16).contiguous()
+            conv_w = self._esimd_conv_weights.to(torch.float16)
+            conv_b = self._esimd_conv_bias_zeros.to(torch.float16)
+            A_log = self.A_log.to(torch.float16) if self.A_log.dtype != torch.float16 else self.A_log
+            dt_bias = self.dt_bias.to(torch.float16) if self.dt_bias.dtype != torch.float16 else self.dt_bias
+        else:
+            qkvz = projected_states_qkvz.contiguous()
+            ba = projected_states_ba.contiguous()
+            ssm_state_view = pool_ssm
+            conv_w = self._esimd_conv_weights
+            conv_b = self._esimd_conv_bias_zeros
+            A_log = self.A_log
+            dt_bias = self.dt_bias
+
+        N = qkvz.shape[0]
+        nk_tp = self.num_k_heads // self.attn_tp_size
+        nv_tp = self.num_v_heads // self.attn_tp_size
+        scale = float(self.head_k_dim ** -0.5)
+
+        core_attn_out = torch.empty(
+            (N, nv_tp, self.head_v_dim),
+            dtype=torch.float16, device=qkvz.device,
+        )
+        z_out = torch.empty_like(core_attn_out)
+
+        try:
+            esimd_gdn_conv_fused_seq(
+                qkvz, conv_state_view, conv_w, conv_b, cache_indices,
+                A_log, dt_bias, ba,
+                ssm_state_view, cache_indices, core_attn_out, z_out,
+                N, nk_tp, nv_tp, self.head_k_dim, self.head_v_dim, scale,
+            )
+        except Exception:
+            return None
+
+        # Write conv_state back into pool: (cache, W-1, conv_dim) → (cache, conv_dim, W-1)
+        cache_indices_long = cache_indices.to(torch.long)
+        pool_conv.index_copy_(
+            0, cache_indices_long,
+            conv_state_view.index_select(0, cache_indices_long).transpose(-1, -2).contiguous().to(pool_conv.dtype),
+        )
+        if pool_ssm.dtype != torch.float16:
+            pool_ssm.index_copy_(
+                0, cache_indices_long,
+                ssm_state_view.index_select(0, cache_indices_long).to(pool_ssm.dtype),
+            )
+
+        # Norm + out_proj. Mirrors the default path.
+        core_attn_out = core_attn_out.to(orig_dtype)
+        z_out = z_out.to(orig_dtype)
+        z_shape_og = z_out.shape
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z_out = z_out.reshape(-1, z_out.shape[-1])
+        if core_attn_out.shape != z_out.shape:
+            pad = torch.zeros_like(z_out)
+            pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = pad
+        core_attn_out = self.norm(core_attn_out, z_out)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -653,6 +783,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and self.num_v_heads // self.num_k_heads == 1
         ):
             output = self._forward_xpu_fast_path(
+                projected_states_qkvz,
+                projected_states_ba,
+                forward_batch,
+            )
+            if output is not None:
+                return output
+
+        # --- XPU ESIMD GDN decode fast path (esimd_gdn_conv_fused_seq) ---
+        # Calls the BMG-validated ESIMD kernel that fuses conv1d + the GDN
+        # recurrence in one launch. Sequential [q|k|v|z] layout — no gather.
+        # Decode-only; prefill stays on the Triton/PyTorch path.
+        _ENABLE_XPU_GDN_ESIMD = os.environ.get(
+            "SGL_XPU_GDN_ESIMD", "0"
+        ) == "1"
+        if (
+            _ENABLE_XPU_GDN_ESIMD
+            and _is_xpu
+            and forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            output = self._forward_xpu_esimd_gdn_decode(
                 projected_states_qkvz,
                 projected_states_ba,
                 forward_batch,
@@ -1085,15 +1236,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Full attention forward pass."""
         # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
-        # Hard-coded requirements: head_dim=256, fp16, GemmaRMSNorm weight+1.0
-        # (matches Qwen3.5's q_norm/k_norm). Gate with env + shape checks.
+        # Hard-coded requirements: head_dim=256, fp16 model, GemmaRMSNorm
+        # weight+1.0 convention. The kernel is fp16-only; on a bf16 model the
+        # implicit cast loses dynamic range during RoPE and gsm8k drops from
+        # 0.80 to 0.40 (verified). Restrict to fp16 inputs only.
         if (
             os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
             and self.head_dim == 256
             and hidden_states.dim() == 2
+            and hidden_states.dtype == torch.float16
         ):
             try:
-                from custom_esimd_kernels_vllm import esimd_qkv_split_norm_rope
+                # Prefer the BMG sglang variant; fall back to the vllm one
+                # if installed in this env.
+                try:
+                    from custom_esimd_kernels_sglang import (
+                        esimd_qkv_split_norm_rope,
+                    )
+                except ImportError:
+                    from custom_esimd_kernels_vllm import esimd_qkv_split_norm_rope
             except ImportError:
                 esimd_qkv_split_norm_rope = None
             if esimd_qkv_split_norm_rope is not None:
