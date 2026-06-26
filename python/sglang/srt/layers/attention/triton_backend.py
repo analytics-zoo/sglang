@@ -36,6 +36,21 @@ _is_gfx942 = is_gfx942_supported()
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
 
+# XPU ESIMD decode-attention fast path (BMG): operate on sglang's native flat
+# NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
+# paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
+_ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
+    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
+)
+_XPU_ESIMD_DECODE_FN = None
+if _ENABLE_XPU_ESIMD_DECODE:
+    try:
+        from custom_esimd_kernels import (
+            sglang_decode_attn as _XPU_ESIMD_DECODE_FN,
+        )
+    except ImportError:
+        _XPU_ESIMD_DECODE_FN = None
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -1379,6 +1394,34 @@ class TritonAttnBackend(AttentionBackend):
             and layer.v_head_dim == self.swa_v_head_dim
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
+
+        if (
+            _XPU_ESIMD_DECODE_FN is not None
+            and not self.use_mla
+            and layer.qk_head_dim == 256
+            and layer.qk_head_dim == layer.v_head_dim
+            and layer.xai_temperature_len <= 0
+            and sinks is None
+            and logits_soft_cap == 0.0
+            and (layer.sliding_window_size is None or layer.sliding_window_size <= 0)
+        ):
+            # XPU ESIMD fast path: native flat NHD layout, no reshape.
+            B = kv_indptr.numel() - 1
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            q_fp16 = q.view(B, layer.tp_q_head_num, layer.qk_head_dim)
+            if q_fp16.dtype != torch.float16:
+                q_fp16 = q_fp16.to(torch.float16)
+            o_fp16 = torch.empty_like(q_fp16)
+            _XPU_ESIMD_DECODE_FN(
+                q_fp16, k_buf, v_buf,
+                kv_indptr.to(torch.int32),
+                kv_indices.to(torch.int32),
+                o_fp16,
+                float(layer.scaling),
+            )
+            o.view(B, layer.tp_q_head_num, layer.v_head_dim).copy_(o_fp16)
+            return o
 
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
