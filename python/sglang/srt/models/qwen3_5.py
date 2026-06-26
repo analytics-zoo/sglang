@@ -689,10 +689,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # (cache, W-1, conv_dim) view (per-batch contiguous via stride).
         pool_conv = mamba_cache_params.conv[0]
         pool_ssm = mamba_cache_params.temporal
-        conv_state_view = pool_conv.transpose(-1, -2).contiguous()
-        # transpose+contiguous makes a fresh allocation; we'll write back
-        # into the pool below. (The kernel writes the new conv state into
-        # the (cache, W-1, conv_dim) layout it sees.)
+        # The kernel reads conv state in (cache, W-1, conv_dim) layout, which
+        # the pool does not store, so we materialize a transposed-contiguous
+        # copy. Reuse a fixed buffer (copy_ rather than a fresh
+        # transpose().contiguous() each call) so its data ptr stays stable
+        # across XPU-graph replays.
+        cvcache = getattr(self, "_esimd_gdn_conv_view", None)
+        if cvcache is None or cvcache.shape != pool_conv.shape[:1] + pool_conv.shape[1:][::-1]:
+            cvcache = torch.empty(
+                (pool_conv.size(0), pool_conv.size(2), pool_conv.size(1)),
+                dtype=pool_conv.dtype, device=pool_conv.device,
+            )
+            self._esimd_gdn_conv_view = cvcache
+        cvcache.copy_(pool_conv.transpose(-1, -2))
+        conv_state_view = cvcache
 
         # Cache the conv1d.weight view + zeros bias once per layer.
         if getattr(self, "_esimd_conv_weights", None) is None:
@@ -771,7 +781,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         except Exception:
             return None
 
-        # Write conv_state back into pool: (cache, W-1, conv_dim) → (cache, conv_dim, W-1)
+        # Write conv_state back into pool: (cache, W-1, conv_dim) → (cache, conv_dim, W-1).
+        # index_copy_ writes only the touched slots; the conv_state_view above
+        # was a fresh copy of the whole pool, so untouched slots round-trip
+        # unchanged.
         cache_indices_long = cache_indices.to(torch.long)
         pool_conv.index_copy_(
             0, cache_indices_long,
