@@ -238,6 +238,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
+        # conv_weights aliases conv1d.weight's storage; loaders that swap that
+        # storage on a device move must call rebind_device_views() afterwards.
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
             num_q_heads=self.num_k_heads // self.attn_tp_size,
@@ -278,6 +280,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
+
+    def rebind_device_views(self):
+        """Re-derive tensors that alias conv1d.weight's storage.
+
+        ``conv_weights`` (passed to RadixLinearAttention) is a *view* of
+        ``self.conv1d.weight`` captured at construction time. Loaders that
+        load on CPU and then swap ``conv1d.weight.data`` for a device tensor
+        (e.g. ``--load-format layered_fp8``) leave that view pointing at the
+        freed CPU storage, so the conv1d kernel later dereferences an invalid
+        pointer. Rebuild the view from the current weight; the lazily-built
+        ESIMD copy (``_esimd_conv_weights``) self-heals on next forward, so
+        just drop it here.
+        """
+        w = self.conv1d.weight
+        self.attn.conv_weights = w.view(w.size(0), w.size(2))
+        self.attn.bias = self.conv1d.bias
+        self._esimd_conv_weights = None
 
     @staticmethod
     def _override_weight_loader(param, loader):

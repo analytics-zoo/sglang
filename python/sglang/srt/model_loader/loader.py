@@ -963,6 +963,15 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
                     gc.collect()
                     current_platform.empty_cache()
 
+        # Some modules cache views/aliases of a weight's storage at build time
+        # (e.g. a GDN block's conv_weights view of conv1d.weight). Swapping
+        # ``.data`` to a device tensor above leaves those aliases pointing at the
+        # freed CPU storage. Let any module repair them via an opt-in hook.
+        for module in model.modules():
+            rebind = getattr(module, "rebind_device_views", None)
+            if callable(rebind):
+                rebind()
+
         gc.collect()
         current_platform.empty_cache()
 
