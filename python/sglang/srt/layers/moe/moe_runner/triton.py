@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -22,6 +23,144 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
+
+
+# Lazy-loaded esimd MoE op: registers torch.ops.moe_ops.moe_forward_full_silu_routed.
+# Returns the op handle on success, None on failure (so we always fall back to Triton).
+def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
+    """Load the right ESIMD MoE silu-routed kernel for the given fp8 variant.
+
+    fp8_variant: "e4m3" → moe_forward_full_silu_routed_sglang
+                 "e5m2" → moe_forward_full_silu_routed_e5m2
+    """
+    cache = getattr(_load_esimd_moe_op, "_cached", None)
+    if cache is None:
+        cache = {}
+        _load_esimd_moe_op._cached = cache
+    if fp8_variant in cache:
+        return cache[fp8_variant]
+    op = None
+    try:
+        from custom_esimd_kernels import custom_esimd_kernels_moe_batch as _moe_mod
+        if fp8_variant == "e5m2":
+            op = _moe_mod.moe_forward_full_silu_routed_e5m2
+        else:
+            op = _moe_mod.moe_forward_full_silu_routed_sglang
+    except Exception:
+        op = None
+    cache[fp8_variant] = op
+    return op
+
+
+def _try_esimd_moe_silu_routed(
+    runner_input: "TritonRunnerInput",
+    quant_info: "TritonMoeQuantInfo",
+    config,
+) -> Optional[torch.Tensor]:
+    """XPU fast path for FP8 e4m3 silu MoE: dispatch to custom ESIMD kernel.
+
+    Returns the MoE forward output tensor [T, hidden] on success, or None to
+    fall back to the Triton path. Conditions for hitting this path:
+      - hidden_states on XPU
+      - FP8 W8A8 (e4m3) quant
+      - silu activation (Qwen3-style)
+      - small T (decode + small chunked-prefill); large T falls back since the
+        kernel was tuned for small batch
+      - non-gated, non-clamp config (vanilla SwiGLU)
+    """
+    _DEBUG = os.environ.get("SGLANG_ESIMD_MOE_DEBUG", "0") == "1"
+    def _dbg(reason):
+        if _DEBUG:
+            print(f"[esimd-moe-runner] skip: {reason}", flush=True)
+
+    if not quant_info.use_fp8_w8a8:
+        _dbg(f"not fp8_w8a8")
+        return None
+    h = runner_input.hidden_states
+    if h.device.type != "xpu":
+        _dbg(f"device={h.device.type}")
+        return None
+    orig_dtype = h.dtype
+    if h.dtype != torch.float16:
+        # Kernel only supports fp16 — cast input/output once around the call.
+        h = h.to(torch.float16)
+    w13 = quant_info.w13_weight
+    w2 = quant_info.w2_weight
+    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
+        _dbg(f"weight dtype: w13={w13.dtype} w2={w2.dtype}")
+        return None
+    if w13.dtype != w2.dtype:
+        _dbg(f"w13/w2 dtype mismatch: {w13.dtype} vs {w2.dtype}")
+        return None
+    # Only "silu" activation supported; gelu_tanh would need a separate wrapper.
+    if getattr(config, "activation", "silu") != "silu":
+        _dbg(f"act={getattr(config, 'activation', '?')}")
+        return None
+    # No gated/clamp transforms.
+    if getattr(config, "gemm1_alpha", None) is not None:
+        _dbg("gemm1_alpha set")
+        return None
+    if getattr(config, "gemm1_clamp_limit", None) is not None:
+        _dbg("gemm1_clamp_limit set")
+        return None
+    if getattr(config, "swiglu_limit", None) is not None:
+        _dbg("swiglu_limit set")
+        return None
+    T = h.shape[0]
+    if T > 8:  # Tuned for decode + tiny prefill chunks
+        _dbg(f"T={T} > 8")
+        return None
+    fp8_variant = "e5m2" if w13.dtype == torch.float8_e5m2 else "e4m3"
+    op = _load_esimd_moe_op(fp8_variant)
+    if op is None:
+        _dbg(f"op not loaded ({fp8_variant})")
+        return None
+    if _DEBUG:
+        print(f"[esimd-moe] HIT T={T} hidden={h.shape[1]} top_k={runner_input.topk_ids.shape[-1]} fp8={fp8_variant}", flush=True)
+
+    # Collapse per-block weight_scale to per-expert per-tensor (mean), cached
+    # on the parameter tensor to amortise across calls.
+    def _per_expert_pt_scale(scale: torch.Tensor) -> torch.Tensor:
+        cached = getattr(scale, "_esimd_pt_per_expert", None)
+        if cached is not None:
+            return cached
+        # scale: [E, *block_dims] → per-expert mean → [E] fp32
+        s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
+        s = s.contiguous()
+        try:
+            scale._esimd_pt_per_expert = s
+        except Exception:
+            pass
+        return s
+
+    if quant_info.w13_scale is None or quant_info.w2_scale is None:
+        return None
+    s13 = _per_expert_pt_scale(quant_info.w13_scale)
+    s2 = _per_expert_pt_scale(quant_info.w2_scale)
+
+    # We use the `_sglang` kernel variant which accepts w13 directly in
+    # sglang's [E, 2*intermediate, hidden] layout — no transpose / copy
+    # required, no extra memory cost, and the Triton fallback can still read
+    # the same parameter unchanged.
+    w13_kernel = w13
+
+    topk_w = runner_input.topk_weights
+    topk_i = runner_input.topk_ids
+    if topk_w.dtype != torch.float16:
+        topk_w = topk_w.to(torch.float16)
+    if topk_i.dtype != torch.int32:
+        topk_i = topk_i.to(torch.int32)
+
+    top_k = topk_i.shape[-1]
+    n_routed = w13.shape[0]
+    try:
+        out = op(h, topk_w, topk_i, w13_kernel, s13, w2, s2, top_k, n_routed)
+    except Exception:
+        return None
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out
 
 
 @dataclass
@@ -81,6 +220,15 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
+        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
+        # path (`fused_experts_none_to_triton`) is the one that actually fires
+        # under the default runner config; this branch is here for the future
+        # case where a runner_input gets routed straight into the runner_core.
+        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+            out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
+            if out is not None:
+                return TritonRunnerOutput(hidden_states=out)
+
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
             _fused_moe_kernel_sequence,
         )
@@ -136,6 +284,86 @@ class TritonRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.TRITON
 
 
+def _maybe_esimd_moe_silu_fused(
+    dispatch_output,
+    quant_info,
+    runner_config,
+):
+    """Small-T fast path for the `fused_experts_none_to_triton` entry point.
+
+    Returns the MoE output tensor on success, or None to fall back. Mirrors
+    the conditions in `_try_esimd_moe_silu_routed` plus extracts the topk
+    weights/ids from the StandardDispatchOutput.
+    """
+    if not quant_info.use_fp8_w8a8:
+        return None
+    h = dispatch_output.hidden_states
+    if h.device.type != "xpu":
+        return None
+    w13 = quant_info.w13_weight
+    w2 = quant_info.w2_weight
+    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
+        return None
+    if w13.dtype != w2.dtype:
+        return None
+    if getattr(runner_config, "activation", "silu") != "silu":
+        return None
+    if getattr(runner_config, "gemm1_alpha", None) is not None:
+        return None
+    if getattr(runner_config, "gemm1_clamp_limit", None) is not None:
+        return None
+    if getattr(runner_config, "swiglu_limit", None) is not None:
+        return None
+    if quant_info.b13 is not None or quant_info.b2 is not None:
+        return None
+    if h.shape[0] > 8:
+        return None
+    fp8_variant = "e5m2" if w13.dtype == torch.float8_e5m2 else "e4m3"
+    op = _load_esimd_moe_op(fp8_variant)
+    if op is None:
+        return None
+
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+    def _per_expert_pt_scale(scale):
+        cached = getattr(scale, "_esimd_pt_per_expert", None)
+        if cached is not None:
+            return cached
+        s = scale.to(torch.float32).reshape(scale.shape[0], -1).mean(dim=-1)
+        s = s.contiguous()
+        try:
+            scale._esimd_pt_per_expert = s
+        except Exception:
+            pass
+        return s
+
+    if quant_info.w13_scale is None or quant_info.w2_scale is None:
+        return None
+    s13 = _per_expert_pt_scale(quant_info.w13_scale)
+    s2 = _per_expert_pt_scale(quant_info.w2_scale)
+
+    # Use the `_sglang` kernel variant: accepts w13 in [E, 2*inter, hidden]
+    # directly, no transpose required.
+    w13_kernel = w13
+
+    if topk_weights.dtype != torch.float16:
+        topk_weights = topk_weights.to(torch.float16)
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+    orig_dtype = h.dtype
+    x_in = h if h.dtype == torch.float16 else h.to(torch.float16)
+    top_k = topk_ids.shape[-1]
+    n_routed = w13.shape[0]
+    try:
+        out = op(x_in, topk_weights, topk_ids, w13_kernel, s13, w2, s2, top_k, n_routed)
+    except Exception:
+        return None
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out
+
+
 @register_fused_func("none", "triton")
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,
@@ -144,6 +372,21 @@ def fused_experts_none_to_triton(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    # XPU fast path: small-T (decode) FP8 e4m3 silu MoE → custom ESIMD kernel.
+    # DISABLED — collapsing the per-block weight scale to a per-expert mean
+    # (the trick that worked for the GEMM fast path) destroys accuracy on
+    # MoE: gsm8k fell from 70% to 0% (output degraded to garbage tokens).
+    # The 256 experts span a wider scale range than the per-block scales of
+    # a single linear layer, so a single scalar per expert is too lossy.
+    # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
+    # (or feed 2D scale through a future kernel variant) before re-enabling.
+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+        esimd_out = _maybe_esimd_moe_silu_fused(
+            dispatch_output, quant_info, runner_config
+        )
+        if esimd_out is not None:
+            return StandardCombineInput(hidden_states=esimd_out)
 
     output = fused_experts(
         hidden_states=dispatch_output.hidden_states,
