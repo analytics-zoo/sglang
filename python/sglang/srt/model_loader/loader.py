@@ -131,6 +131,23 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 
+def _move_module_tensors_to_device(
+    module: torch.nn.Module, target_device: torch.device
+) -> None:
+    """Move a module's *own* (non-recursive) params/buffers onto target_device.
+
+    Used by the low-memory FP8 loader for leaves without a quant_method (norms,
+    embeddings, rotary caches). recurse=False so child modules — which are moved
+    in their own iteration step — are not touched twice.
+    """
+    for name, p in module.named_parameters(recurse=False):
+        if p.device != target_device:
+            p.data = p.data.to(target_device)
+    for name, b in module.named_buffers(recurse=False):
+        if b is not None and b.device != target_device:
+            b.data = b.data.to(target_device)
+
+
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
     if target_device.type == "cpu":
@@ -856,6 +873,98 @@ class LayeredModelLoader(DefaultModelLoader):
             model.torchao_applied = True
 
         return model.eval()
+
+
+class LowMemFp8ModelLoader(DefaultModelLoader):
+    """Online-FP8 loader that keeps the load-time memory envelope low.
+
+    The default loader copies the *entire* bf16/fp16 checkpoint onto the device
+    and only afterwards walks the modules to quantize them. For a model whose
+    bf16 footprint nearly fills the device (e.g. a 31B model at TP=2 → ~31 GB on
+    a 32 GB card), that first full-precision residency OOMs before any
+    quantization runs.
+
+    This loader instead:
+      1. Builds the model on CPU and loads the full bf16 checkpoint into CPU
+         parameters (host RAM is plentiful; the device is untouched).
+      2. Walks the modules and moves each one onto the device just-in-time:
+         quantized modules are moved, run through
+         ``process_weights_after_loading`` (which replaces the bf16 weight with
+         an fp8 one), and the transient bf16 device copy is freed when the bf16
+         parameter is dropped (reclaimed by a periodic ``empty_cache``);
+         non-quantized modules (norms, embeddings, rotary caches) are simply
+         moved and kept.
+
+    Peak device memory is therefore ``fp8 weights + one module's bf16`` instead
+    of ``full bf16 model``. Reuses the model's existing ``load_weights`` verbatim
+    (all fused-QKV / gate-up / tied-embedding / tower-remap logic intact), so it
+    is model-agnostic — any model whose ``Fp8LinearMethod`` path runs per module
+    benefits without model-side changes.
+    """
+
+    def __init__(self, load_config: LoadConfig):
+        # The "layered_fp8" format only selects this loader class; weight files
+        # are still read via the standard safetensors/bin path. Reset to AUTO so
+        # the inherited _prepare_weights / _get_weights_iterator accept it
+        # (mirrors LayeredModelLoader).
+        load_config.load_format = LoadFormat.AUTO
+        super().__init__(load_config)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+        target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
+
+        with set_default_torch_dtype(model_config.dtype):
+            # 1. Build the model on CPU so loading the bf16 checkpoint never
+            #    touches the device.
+            with torch.device("cpu"):
+                model = _initialize_model(model_config, self.load_config, quant_config)
+
+            # 2. Load the full bf16 checkpoint into the CPU parameters using the
+            #    model's own load_weights (keeps all stacked / tied / remap
+            #    handling). No device memory used yet.
+            model.load_weights(self._get_all_weights(model_config, model))
+
+            # 3. Move each module onto the device just-in-time, quantizing as we
+            #    go so only one module's bf16 is ever resident on the device.
+            self._move_and_quantize_per_module(model, target_device)
+
+        self.counter_after_loading_weights = time.perf_counter()
+        return model.eval()
+
+    @staticmethod
+    def _move_and_quantize_per_module(
+        model: nn.Module, target_device: torch.device
+    ) -> None:
+        # Move every module's own (non-recursive) tensors to the device, then —
+        # for modules with a quant_method — quantize in place. Unlike
+        # device_loading_context (which restores params back to their CPU origin
+        # for the offload case), here we deliberately KEEP everything on device:
+        # the fp8 weight installed by process_weights_after_loading and the moved
+        # norm/embedding tensors all stay resident. The transient bf16 device
+        # copy of a quantized weight is dropped when process_weights replaces
+        # layer.weight, then reclaimed by the periodic empty_cache.
+        processed = 0
+        for module in model.modules():
+            # Move this module's own params/buffers onto the device (recurse=False
+            # so child modules are handled in their own iteration step).
+            _move_module_tensors_to_device(module, target_device)
+
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                quant_method.process_weights_after_loading(module)
+                processed += 1
+                if processed % 8 == 0:
+                    gc.collect()
+                    current_platform.empty_cache()
+
+        gc.collect()
+        current_platform.empty_cache()
 
 
 class QuantizedRLModelLoader(DefaultModelLoader):
@@ -3113,6 +3222,9 @@ def get_model_loader(
 
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
+
+    if load_config.load_format == LoadFormat.LAYERED_FP8:
+        return LowMemFp8ModelLoader(load_config)
 
     # Check for FLASH_RL format early
     # FP8 approach: BF16/FP16 model with native FP8 quantization

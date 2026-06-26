@@ -25,6 +25,7 @@ class LoadFormat(str, enum.Enum):
     BITSANDBYTES = "bitsandbytes"
     MISTRAL = "mistral"
     LAYERED = "layered"
+    LAYERED_FP8 = "layered_fp8"  # Low-memory online-FP8: CPU load, per-module quant
     FLASH_RL = "flash_rl"  # For RL training with quantized models
     JAX = "jax"
     REMOTE = "remote"
