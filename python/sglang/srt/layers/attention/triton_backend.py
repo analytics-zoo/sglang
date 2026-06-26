@@ -176,6 +176,9 @@ class TritonAttnBackend(AttentionBackend):
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self.cuda_graph_max_bs = getattr(
+            model_runner.server_args, "cuda_graph_max_bs", None
+        ) or 1
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
@@ -1413,12 +1416,38 @@ class TritonAttnBackend(AttentionBackend):
             if q_fp16.dtype != torch.float16:
                 q_fp16 = q_fp16.to(torch.float16)
             o_fp16 = torch.empty_like(q_fp16)
+            # Pre-allocated phase-1 scratch for XPUGraph capture/replay.
+            # The kernel's hard cap is MAX_SPLITS=256, SPLIT_TILE=64, so the
+            # captured graph can serve sequences up to 16384 tokens; longer
+            # sequences would overrun and must fall back to the legacy path.
+            # Alloc once (sized for cuda_graph_max_bs) and never reallocate
+            # — data_ptr must stay stable across replays.
+            SPLIT_TILE = 64
+            MAX_N_SPLITS = 256
+            ESIMD_GRAPH_MAX_SEQ = SPLIT_TILE * MAX_N_SPLITS  # 16384
+            Hq = layer.tp_q_head_num
+            cached = getattr(self, "_esimd_decode_temp_p", None)
+            B_cap = max(B, self.cuda_graph_max_bs)
+            cache_key = (B_cap, Hq, q_fp16.device.index)
+            if cached is None or cached[0] != cache_key:
+                per_partial = B_cap * Hq * MAX_N_SPLITS
+                temp_numel = per_partial * (1 + 1 + 256)
+                temp_p = torch.empty(
+                    temp_numel,
+                    dtype=torch.float32,
+                    device=q_fp16.device,
+                )
+                self._esimd_decode_temp_p = (cache_key, temp_p)
+            else:
+                temp_p = cached[1]
             _XPU_ESIMD_DECODE_FN(
                 q_fp16, k_buf, v_buf,
                 kv_indptr.to(torch.int32),
                 kv_indices.to(torch.int32),
                 o_fp16,
                 float(layer.scaling),
+                temp_p,
+                ESIMD_GRAPH_MAX_SEQ,
             )
             o.view(B, layer.tp_q_head_num, layer.v_head_dim).copy_(o_fp16)
             return o
