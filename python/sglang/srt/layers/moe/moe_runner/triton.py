@@ -435,19 +435,23 @@ def _maybe_esimd_moe_silu_prefill(
     # u_acc*=s_up): online fp8 w13_scale is [E,2] (gate=w1, up=w3) and
     # averaging the two to one scalar is too lossy (gsm8k garbage). Pass the
     # [E,2] tensor straight through; w2_scale is [E].
+    # Online fp8 here uses requantize_with_max_scale, so w1 and w3 are
+    # requantized to a SINGLE common per-expert scale: w13_scale is [E] meaning
+    # the same scale for gate and up. Accept [E] (expand to [E,2], exact) and
+    # [E,2] (separate). w2_scale is [E] scalar.
     def _f32c(scale, want_2d):
         key = "_esimd_prefill_w13" if want_2d else "_esimd_prefill_w2"
         cached = getattr(scale, key, None)
         if cached is not None:
             return cached
-        s = scale.to(torch.float32)
+        s = scale.to(torch.float32).reshape(scale.shape[0], -1)
         if want_2d:
-            s = s.reshape(scale.shape[0], -1)  # [E,2]
-            if s.shape[1] != 2:
-                # not the expected online-fp8 [E,2] layout — bail (avoid lossy collapse)
+            if s.shape[1] == 1:
+                s = s.expand(s.shape[0], 2)  # [E] -> [E,2], gate==up (max-scale requant)
+            elif s.shape[1] != 2:
                 return None
         else:
-            s = s.reshape(scale.shape[0], -1).mean(dim=-1)  # [E] (w2 already scalar)
+            s = s.mean(dim=-1)  # [E]
         s = s.contiguous()
         try:
             setattr(scale, key, s)
@@ -459,6 +463,11 @@ def _maybe_esimd_moe_silu_prefill(
     s2 = _f32c(quant_info.w2_scale, want_2d=False)
     if s13 is None or s2 is None:
         return None
+    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
+    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
+    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
+    # off until the shared expert contribution is added. Kept wired + scale-fixed
+    # for when that lands.
 
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     if topk_weights.dtype != torch.float16:
