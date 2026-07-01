@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 # Split-K decode: number of KV splits for the hd512 (gemma4 global) ESIMD kernel.
-# Overridable via env for A/B testing the "TPOT grows with ctx" fix. Under XPU
-# graph the kernel's internal chunk = ceil(max_seq/G) with max_seq pinned to the
-# preallocated page-table width (~70016), so G=4 leaves only 1 active split for
-# any real ctx => single-WI O(ctx) serial KV scan. Raising G restores parallelism.
-_SPLITK_G = int(os.environ.get("SGLANG_SPLITK_G", "4"))
+# The kernel now derives its per-split chunk from the REAL seqlen (seqLens[b]) —
+# see splitk_decode.h — so a single high G is optimal across ALL context lengths
+# (idle splits early-return; each active split scans ceil(seqlen/G) tokens). G=64
+# = 16 q-heads * 64 = 1024 work-items ≈ BMG's ~960 HW-thread ceiling; measured
+# near-flat TPOT to 64k (44ms@32k, 50ms@64k) vs G=4/16 which grow with ctx.
+# Overridable via env for A/B.
+_SPLITK_G = int(os.environ.get("SGLANG_SPLITK_G", "64"))
 
 # Debug gate: force the ESIMD decode fast paths (page_attn_decode + split-K) OFF
 # so decode routes through flash_attn_with_kvcache (the fp16->bf16-casting wrapper).
