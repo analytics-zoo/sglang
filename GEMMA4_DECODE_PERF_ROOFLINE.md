@@ -73,24 +73,45 @@ skill's known-issue note + observed variance).
 Sanity: raw compute self-time (excl. allreduce) sums to 36.65 ms/step < real
 TPOT 46 ms → raw compute times are physically consistent.
 
-| kernel (disaggregated)              | ms/step | %busy | calls/step | µs/call |
-|-------------------------------------|---------|-------|------------|---------|
-| **FP8 GEMV** (4 modules, see §3)    | 25.44   | 62.4  | 240        | 106     |
-| oneDNN GEMM lm_head                 |  4.78   | 11.7  | 1          | 4639    |
-| oneCCL allreduce `[UNRELIABLE]`     | (3.98)  | (9.8) | 120        | —       |
-| norm: FusedNorm (RMSNorm)           |  1.16   | 2.8   | 201        | 5.7     |
-| attention: page_attn sliding (3-phase) | 1.49 | 4.0   | 150        | ~10     |
-| attention: split-K global (2-phase) | 1.02    | 2.5   | 22         | ~50     |
-| norm: RmsNormResidualScalar         |  0.78   | 1.9   | 60         | 12.9    |
-| norm: FusedAddRmsNorm               |  0.57   | 1.4   | 60         | 9.6     |
-| act: silu/gelu-mul                  |  0.50   | 1.2   | 60         | 8.3     |
-| SYCL index/scatter                  |  0.49   | 1.2   | 135        | 3.6     |
-| SYCL elem/copy/cast                 |  0.38   | 0.9   | 235        | 1.6     |
-| ESIMD qkv_split_norm_rope           |  0.08   | 0.2   | 50         | 1.7     |
-| RoPE                                |  0.03   | 0.1   | 10         | 3.3     |
+Columns: `ms/step` = raw device self-time (accurate); `%TPOT` = share of the real
+42.9 ms/step TPOT; `bytes/step` = DRAM traffic (weight/KV = read; small = rw);
+`floor` = bytes ÷ measured BW (630 read / 640 copy-rw); `roofline%` = floor/ms;
+`bound` = what limits it.
 
-Grouped: **FP8 GEMV 62%**, lm_head 12%, [allreduce ~unreliable], **norm TOTAL
-(3 kernels) 2.51 ms/step (6.1%)**, **attention TOTAL 2.50 ms/step (6.5%)**, act/
+| kernel (disaggregated)              | ms/step | %TPOT | calls/step | µs/call | bytes/step | floor ms | roofline% | bound |
+|-------------------------------------|---------|-------|------------|---------|------------|----------|-----------|-------|
+| **FP8 GEMV** (4 modules, see §3)    | 25.44   | 59.3  | 240        | 106     | 14.70 GB   | 23.33    | **92%**   | **MEM-read (wall)** |
+| oneDNN GEMM lm_head                 |  4.78   | 11.1  | 1          | 4639    | 1.41 GB    | 2.24     | **47%**   | MEM-read (headroom) |
+| oneCCL allreduce `[UNRELIABLE]`     | (3.98)  | (9.3) | 120        | —       | comm       | —        | — (n/a)   | comm (PCIe); not roofline'd |
+| attention: page_attn sliding (3-ph) | 1.49    | 3.5   | 150        | ~10     | 419 MB     | 0.67     | 45%       | MEM-read (small abs) |
+| norm: FusedNorm (RMSNorm)           | 1.16    | 2.7   | 201        | 5.7     | 6.5 MB     | 0.010    | **0.9%**  | **launch/latency** |
+| attention: split-K global (2-ph)    | 1.02    | 2.4   | 22         | ~50     | 168 MB     | 0.27     | 26%       | MEM-read (small abs) |
+| norm: RmsNormResidualScalar         | 0.78    | 1.8   | 60         | 12.9    | 1.9 MB     | 0.003    | **0.4%**  | **launch/latency** |
+| norm: FusedAddRmsNorm               | 0.57    | 1.3   | 60         | 9.6     | 1.9 MB     | 0.003    | **0.5%**  | **launch/latency** |
+| act: silu/gelu-mul                  | 0.50    | 1.2   | 60         | 8.3     | 3.9 MB     | 0.006    | **1.2%**  | **launch/latency** |
+| SYCL index/scatter                  | 0.49    | 1.1   | 135        | 3.6     | 2.2 MB     | 0.003    | **0.7%**  | **launch/latency** |
+| SYCL elem/copy/cast                 | 0.38    | 0.9   | 235        | 1.6     | 5.1 MB     | 0.008    | **2.1%**  | **launch/latency** |
+| ESIMD qkv_split_norm_rope           | 0.08    | 0.2   | 50         | 1.7     | 1.6 MB     | 0.003    | 3.2%      | launch/latency |
+| RoPE                                | 0.03    | 0.1   | 10         | 3.3     | 0.3 MB     | 0.001    | 1.7%      | launch/latency |
+| **compute subtotal (excl allreduce)** | **36.65** | 85.4 | —        | —       | 16.73 GB   | **26.6** | **73%**   | — |
+| **+ real allreduce + host-gap**    | ~6.2    | 14.4  | —          | —       | —          | —        | —         | comm + idle |
+| **= measured TPOT @4k**             | **42.9**| 100   | —          | —       | —          | —        | **62% (E2E)** | — |
+
+Reading the two roofline regimes:
+- **MEM-read rows** (FP8 GEMV, lm_head, attention): roofline% is meaningful.
+  FP8 GEMV 92% = at the bandwidth wall. lm_head 47% and split-K 26% have headroom
+  but lm_head's is the only one worth chasing (4.8 ms abs vs attention's 2.5 ms).
+- **launch/latency rows** (all norms, act, index, elem, rope, qkv_norm_rope):
+  roofline% is **0.4–3%** — they move almost no data; their ms/step is host-launch +
+  kernel-invocation latency of many µs-scale kernels (201+60+60+135+235… calls/step),
+  NOT bandwidth. Their combined ~3.9 ms/step is recovered by **kernel fusion or a
+  working XPU graph** (host-gap reclaim), not by any memory optimization.
+
+(compute subtotal 36.65 ms at 73% of its 26.6 ms memory floor; the E2E 62% in §4
+is lower because it also carries the comm + host-gap residual.)
+
+Grouped roll-ups: **FP8 GEMV 25.44 ms**, lm_head 4.78 ms, [allreduce ~unreliable],
+**norm TOTAL (3 kernels) 2.51 ms/step**, **attention TOTAL 2.50 ms/step**, act/
 index/elem/rope the rest. Device-busy ≈ 81% (≈8.6 ms/step host-gap that a working
 XPU graph would reclaim — but graph currently deadlocks, see
 `GEMMA4_XPU_GRAPH_STATUS.md`).
