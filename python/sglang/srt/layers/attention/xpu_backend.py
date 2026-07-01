@@ -175,10 +175,22 @@ class XPUAttentionBackend(AttentionBackend):
         max_len = int(seq_lens.max().item()) if seq_lens.numel() else 1
         metadata.max_seq_len_k = max_len
 
-        # Populate page_table
+        # Populate page_table. NOTE on ordering (must match eager
+        # init_forward_metadata): the SWA translation
+        # (translate_loc_from_full_to_swa) maps full-pool KV *slot* indices ->
+        # SWA-pool slot indices, so it MUST be applied to the RAW req_to_token
+        # slot values BEFORE dividing by page_size. The earlier version divided
+        # first and then translated page-granularity indices through a slot-index
+        # map -> wrong SWA page table -> the 50 sliding layers read the wrong KV
+        # -> decode garbled from the first step. Build raw slots first, translate,
+        # then stride + //page_size for both full and SWA tables.
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
         if max_seq_pages > 0:
             req_pool_indices = forward_batch.req_pool_indices[:bs]
+            # Raw token-granularity KV slots for [0, max_len).
+            raw_slots = self.req_to_token[req_pool_indices, :max_len]
+
+            # Full-pool page table: stride by page_size then divide.
             strided_indices = state["strided_indices"][:max_seq_pages]
             pt = (
                 self.req_to_token[req_pool_indices[:, None], strided_indices[None, :]]
@@ -186,27 +198,26 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.page_table[:bs, :max_seq_pages].copy_(pt)
 
-        # SWA: translate page_table and out_cache_loc for sliding-window layers.
-        # Write into the PERSISTENT graph buffer in-place: the captured sliding
-        # layers (50/60) read swa_page_table by its capture-time address, so a
-        # fresh tensor here lands at a different address on replay and feeds the
-        # wrong KV pages -> garbled decode. state["swa_page_table"] is preallocated
-        # in init_cuda_graph_state for exactly this.
-        if self.use_sliding_window_kv_pool:
-            swa_full = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                metadata.page_table
-            ).to(torch.int32)
-            swa_buf = state["swa_page_table"][:bs, :]
-            swa_buf.copy_(swa_full)
-            metadata.swa_page_table = swa_buf
-            if forward_batch.out_cache_loc is not None:
-                swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
-                )
-                n = swa_loc.shape[0]
-                loc_buf = state["swa_out_cache_loc"][:n]
-                loc_buf.copy_(swa_loc)
-                metadata.swa_out_cache_loc = loc_buf
+            # SWA page table: translate RAW slots first, then stride + divide.
+            if self.use_sliding_window_kv_pool:
+                swa_slots = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    raw_slots
+                ).to(torch.int32)
+                swa_pt = swa_slots[:, ::self.page_size] // self.page_size
+                swa_buf = state["swa_page_table"][:bs, :]
+                # Write into the persistent (address-stable) graph buffer so the
+                # captured sliding layers read it at a fixed address across replays.
+                swa_buf[:, :swa_pt.shape[1]].copy_(swa_pt)
+                metadata.swa_page_table = swa_buf
+
+        if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
+            swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+            n = swa_loc.shape[0]
+            loc_buf = state["swa_out_cache_loc"][:n]
+            loc_buf.copy_(swa_loc)
+            metadata.swa_out_cache_loc = loc_buf
 
         self.forward_metadata = metadata
 

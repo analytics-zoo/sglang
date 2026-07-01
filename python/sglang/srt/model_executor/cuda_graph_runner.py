@@ -143,6 +143,12 @@ if not _is_hip:
         eager_on_graph,
     )
 
+# XPU breakable graph (no cuda-python dep); safe to import on any platform.
+from sglang.srt.model_executor.breakable_cuda_graph.xpu_breakable_graph import (
+    XpuBreakableGraph,
+    XpuBreakableGraphCapture,
+)
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -851,7 +857,9 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
+            graph_ctx = XpuBreakableGraphCapture
+        elif envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if memory_saver_adapter.enabled:
                 raise NotImplementedError(
                     "Breakable CUDA graph is not compatible with memory saver mode"
@@ -883,6 +891,8 @@ class CudaGraphRunner:
         return out
 
     def _create_device_graph(self):
+        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
+            return XpuBreakableGraph()
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
