@@ -1,8 +1,27 @@
 from __future__ import annotations
 
+import os
+
 from typing import TYPE_CHECKING, Optional
 
 import torch
+
+# Split-K decode: number of KV splits for the hd512 (gemma4 global) ESIMD kernel.
+# Overridable via env for A/B testing the "TPOT grows with ctx" fix. Under XPU
+# graph the kernel's internal chunk = ceil(max_seq/G) with max_seq pinned to the
+# preallocated page-table width (~70016), so G=4 leaves only 1 active split for
+# any real ctx => single-WI O(ctx) serial KV scan. Raising G restores parallelism.
+_SPLITK_G = int(os.environ.get("SGLANG_SPLITK_G", "4"))
+
+# Debug gate: force the ESIMD decode fast paths (page_attn_decode + split-K) OFF
+# so decode routes through flash_attn_with_kvcache (the fp16->bf16-casting wrapper).
+# Used to localize the fp16+graph decode garble.
+_DISABLE_ESIMD_DECODE = os.environ.get("SGLANG_DISABLE_ESIMD_DECODE", "0") == "1"
+
+# Debug gate: force the hd256 page_attn_decode path OFF so sliding layers also use
+# split-K (which accepts head_dim 256). Both are no-SLM/graph-capturable. Isolates
+# whether the graph garble is in page_attn_decode vs split-K.
+_DISABLE_PAGE_ATTN = os.environ.get("SGLANG_DISABLE_PAGE_ATTN", "0") == "1"
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -22,6 +41,14 @@ if TYPE_CHECKING:
 
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+_esimd_page_attn_decode = None
+_splitk_decode_attention = None
+try:
+    from custom_esimd_kernels_sglang import eagle_page_attn_decode as _esimd_page_attn_decode
+    from custom_esimd_kernels_sglang import splitk_decode_attention as _splitk_decode_attention
+except ImportError:
+    pass
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -103,6 +130,89 @@ class XPUAttentionBackend(AttentionBackend):
         self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        """Pre-allocate stable device buffers for XPU graph capture + replay."""
+        max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+        device = self.device
+
+        self._graph_state = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=device),
+            "cu_seqlens_q": torch.arange(0, max_bs + 1, dtype=torch.int32, device=device),
+            "page_table": torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=device),
+            "strided_indices": torch.arange(0, self.max_context_len, self.page_size, device=device),
+        }
+        if self.use_sliding_window_kv_pool:
+            self._graph_state["swa_page_table"] = torch.zeros(
+                max_bs, max_num_pages, dtype=torch.int32, device=device,
+            )
+            # SWA-pool KV write location (one slot per request per decode step).
+            # Must be address-stable for graph capture/replay (the captured
+            # set_kv_buffer writes to its capture-time address).
+            self._graph_state["swa_out_cache_loc"] = torch.zeros(
+                max_bs, dtype=torch.int64, device=device,
+            )
+
+    def init_forward_metadata_out_graph(self, forward_batch: ForwardBatch, in_capture: bool = False):
+        """Prepare forward_metadata for graph capture or replay (runs outside graph.capture())."""
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return
+        if not hasattr(self, "_graph_state") or not self._graph_state:
+            return
+
+        bs = forward_batch.batch_size
+        state = self._graph_state
+        seq_lens = forward_batch.seq_lens[:bs]
+
+        metadata = FlashAttentionMetadata()
+        metadata.cache_seqlens_int32 = state["cache_seqlens"][:bs]
+        metadata.cu_seqlens_q = state["cu_seqlens_q"][:bs + 1]
+        metadata.page_table = state["page_table"][:bs, :]
+        metadata.max_seq_len_q = 1
+
+        # Populate cache_seqlens from real seq_lens
+        metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        max_len = int(seq_lens.max().item()) if seq_lens.numel() else 1
+        metadata.max_seq_len_k = max_len
+
+        # Populate page_table
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        if max_seq_pages > 0:
+            req_pool_indices = forward_batch.req_pool_indices[:bs]
+            strided_indices = state["strided_indices"][:max_seq_pages]
+            pt = (
+                self.req_to_token[req_pool_indices[:, None], strided_indices[None, :]]
+                // self.page_size
+            )
+            metadata.page_table[:bs, :max_seq_pages].copy_(pt)
+
+        # SWA: translate page_table and out_cache_loc for sliding-window layers.
+        # Write into the PERSISTENT graph buffer in-place: the captured sliding
+        # layers (50/60) read swa_page_table by its capture-time address, so a
+        # fresh tensor here lands at a different address on replay and feeds the
+        # wrong KV pages -> garbled decode. state["swa_page_table"] is preallocated
+        # in init_cuda_graph_state for exactly this.
+        if self.use_sliding_window_kv_pool:
+            swa_full = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                metadata.page_table
+            ).to(torch.int32)
+            swa_buf = state["swa_page_table"][:bs, :]
+            swa_buf.copy_(swa_full)
+            metadata.swa_page_table = swa_buf
+            if forward_batch.out_cache_loc is not None:
+                swa_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+                n = swa_loc.shape[0]
+                loc_buf = state["swa_out_cache_loc"][:n]
+                loc_buf.copy_(swa_loc)
+                metadata.swa_out_cache_loc = loc_buf
+
+        self.forward_metadata = metadata
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        """No-op: metadata already set by init_forward_metadata_out_graph."""
+        pass
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -929,25 +1039,123 @@ class XPUAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # Default: single-token self-attention
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=None,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    return_softmax_lse=use_cascade_attn,
-                    **kwargs,
+                # ESIMD page_attn_decode fast path: no SLM, graph-capturable.
+                # Only non-SWA layers with head_dim==256 (gemma4 global layers
+                # have head_dim=512 so this currently only fires if a future model
+                # has non-SWA head_dim=256 layers). SWA layers need separate
+                # debugging (SWA pool page_table format mismatch).
+                _use_esimd_pa = (
+                    not _DISABLE_ESIMD_DECODE
+                    and not _DISABLE_PAGE_ATTN
+                    and _esimd_page_attn_decode is not None
+                    and layer.head_dim == 256
+                    and max_seqlen_q == 1
+                    and not use_cascade_attn
+                    and layer.logit_cap == 0.0
+                    and q_reshaped.dtype == torch.float16
                 )
+                if _use_esimd_pa:
+                    bs = forward_batch.batch_size
+                    # Persistent per-layer buffers: under XPU graph, capture bakes
+                    # tensor addresses, so fresh torch.empty()/elementwise temporaries
+                    # get unstable addresses across replay and corrupt decode. Reuse
+                    # stable buffers + in-place ops so capture and replay match.
+                    out_pa = self._decode_buf(
+                        ("pa_out", layer.layer_id), (bs, layer.tp_q_head_num, layer.head_dim),
+                        torch.float16, q_reshaped.device,
+                    )
+                    pa_seqlens = cache_seqlens
+                    if is_swa_layer and layer.sliding_window_size is not None:
+                        pa_seqlens = torch.clamp(cache_seqlens, max=layer.sliding_window_size + 1)
+                        max_seq = layer.sliding_window_size + 1
+                    else:
+                        max_seq = page_table.shape[1] * self.page_size
+                    # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
+                    # Compensate for the model's actual scaling factor.
+                    if layer.scaling != 0.0625:
+                        q_scaled = self._decode_buf(
+                            ("pa_q", layer.layer_id), q_reshaped.shape,
+                            q_reshaped.dtype, q_reshaped.device,
+                        )
+                        torch.mul(q_reshaped, layer.scaling / 0.0625, out=q_scaled)
+                    else:
+                        q_scaled = q_reshaped
+                    _esimd_page_attn_decode(
+                        q_scaled,
+                        key_cache,
+                        value_cache,
+                        page_table,
+                        pa_seqlens,
+                        out_pa,
+                        max_seqlen_q,
+                        max_seq,
+                        None,
+                    )
+                    result = out_pa
+                else:
+                    # Split-K ESIMD decode (no SLM, graph-capturable) for hd512.
+                    # Falls back to flash_attn for non-decode or unsupported configs.
+                    if (
+                        not _DISABLE_ESIMD_DECODE
+                        and _splitk_decode_attention is not None
+                        and max_seqlen_q == 1
+                        and not use_cascade_attn
+                        and layer.logit_cap == 0.0
+                        and q_reshaped.dtype == torch.float16
+                        and layer.head_dim in (256, 512)
+                    ):
+                        bs = forward_batch.batch_size
+                        G = _SPLITK_G  # num KV splits (env SGLANG_SPLITK_G, default 4)
+                        nTG = bs * layer.tp_q_head_num * G
+                        hd = layer.head_dim
+                        # Persistent PER-LAYER scratch + output: under XPU graph the
+                        # 10 global layers are all captured; a single shared scratch
+                        # (or fresh torch.empty per call) gives unstable/aliased
+                        # addresses across replay and corrupts decode. One stable
+                        # buffer per layer_id keyed by size.
+                        out_sk = self._decode_buf(
+                            ("sk_out", layer.layer_id), (bs, layer.tp_q_head_num, hd),
+                            torch.float16, q_reshaped.device,
+                        )
+                        scratch = self._decode_buf(
+                            ("sk_scratch", layer.layer_id), (nTG * (hd + 2),),
+                            torch.float32, q_reshaped.device,
+                        )
+                        max_seq = page_table.shape[1] * self.page_size
+                        # Split-K kernel has built-in 1/sqrt(HD) scaling
+                        if layer.scaling != hd ** -0.5:
+                            q_scaled = self._decode_buf(
+                                ("sk_q", layer.layer_id), q_reshaped.shape,
+                                q_reshaped.dtype, q_reshaped.device,
+                            )
+                            torch.mul(q_reshaped, layer.scaling / (hd ** -0.5), out=q_scaled)
+                        else:
+                            q_scaled = q_reshaped
+                        _splitk_decode_attention(
+                            q_scaled, key_cache, value_cache,
+                            page_table, cache_seqlens,
+                            out_sk, scratch, max_seq, G,
+                        )
+                        result = out_sk
+                    else:
+                        result = flash_attn_with_kvcache(
+                            q=q_reshaped,
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            page_table=page_table,
+                            cache_seqlens=cache_seqlens,
+                            cu_seqlens_q=metadata.cu_seqlens_q,
+                            cu_seqlens_k_new=None,
+                            max_seqlen_q=max_seqlen_q,
+                            softmax_scale=layer.scaling,
+                            causal=False if use_cascade_attn else causal,
+                            window_size=window_size,
+                            softcap=layer.logit_cap,
+                            k_descale=k_descale,
+                            v_descale=v_descale,
+                            return_softmax_lse=use_cascade_attn,
+                            **kwargs,
+                        )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
@@ -1005,6 +1213,27 @@ class XPUAttentionBackend(AttentionBackend):
 
         out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         return out
+
+    def _decode_buf(self, key, shape, dtype, device):
+        """Return a persistent, address-stable buffer for the given (key, shape).
+
+        XPU graph capture bakes tensor data pointers; allocating fresh tensors
+        (torch.empty) or elementwise temporaries inside the captured decode
+        forward yields addresses that differ at replay -> silent corruption.
+        Caching one buffer per key (e.g. per layer_id + role) keeps the address
+        stable across capture and replay. Reallocates only if a larger shape is
+        ever requested.
+        """
+        if not hasattr(self, "_decode_bufs"):
+            self._decode_bufs = {}
+        buf = self._decode_bufs.get(key)
+        numel = 1
+        for s in shape:
+            numel *= s
+        if buf is None or buf.numel() < numel or buf.dtype != dtype:
+            buf = torch.zeros(numel, dtype=dtype, device=device)
+            self._decode_bufs[key] = buf
+        return buf[:numel].view(*shape)
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""

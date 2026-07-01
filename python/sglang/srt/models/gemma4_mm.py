@@ -606,12 +606,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         # so non-first ranks must skip this and pull per_layer_inputs from the
         # PP proxy (forwarded by Gemma4TextModel).
         if is_first_rank and input_ids is not None:
-            ple_ids = input_ids.clone()
-            pad_id = self.config.text_config.pad_token_id
-            ple_ids[input_ids == self.config.image_token_id] = pad_id
-            ple_ids[input_ids == self.config.video_token_id] = pad_id
-            ple_ids[input_ids == self.config.audio_token_id] = pad_id
-            per_layer_inputs = self.get_per_layer_inputs(ple_ids)
+            if forward_batch.forward_mode.is_decode_or_idle():
+                # Decode: no image/video/audio tokens possible; skip boolean
+                # indexing (not capturable in XPU graph).
+                per_layer_inputs = self.get_per_layer_inputs(input_ids)
+            else:
+                ple_ids = input_ids.clone()
+                pad_id = self.config.text_config.pad_token_id
+                ple_ids[input_ids == self.config.image_token_id] = pad_id
+                ple_ids[input_ids == self.config.video_token_id] = pad_id
+                ple_ids[input_ids == self.config.audio_token_id] = pad_id
+                per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
         # Prepare bidirectional attention masks for image tokens during prefill.
         # mm_inputs is preserved on every PP rank up to the first-rank embed

@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import os
 import re
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -64,6 +65,19 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 logger = logging.getLogger(__name__)
+
+# Lazy-loaded ESIMD kernels (fp16 decode fast paths).
+_esimd_qkv_split_norm_rope = None
+_esimd_fused_add_rms_norm = None
+_esimd_rmsnorm_residual_scalar = None
+try:
+    from custom_esimd_kernels_sglang import (
+        esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
+        esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
+        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
+    )
+except ImportError:
+    pass
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -404,6 +418,20 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _init_esimd_qkv_cache(self):
+        """Lazily build precomputed buffers for the ESIMD QKV+norm+rope kernel."""
+        if hasattr(self, "_esimd_qkv_cache"):
+            return self._esimd_qkv_cache
+        dev = self.q_norm.weight.device
+        dtype = torch.float16
+        cache = {
+            "wq": (self.q_norm.weight.data.to(dtype) - 1.0).contiguous(),
+            "wk": (self.k_norm.weight.data.to(dtype) - 1.0).contiguous(),
+            "gate": torch.empty((1, self.q_size), dtype=dtype, device=dev),
+        }
+        self._esimd_qkv_cache = cache
+        return cache
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -412,6 +440,55 @@ class Gemma4Attention(nn.Module):
         **kwargs,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
+
+        # ESIMD fast path: fused QKV split + Q/K RMSNorm + RoPE in one kernel.
+        # Eligible when: head_dim==256, fp16, non-kv-shared, decode (M small).
+        is_kv_shared = (
+            self.is_kv_shared_layer and self.kv_shared_layer_index is not None
+        )
+        _use_esimd_qkv = (
+            _esimd_qkv_split_norm_rope is not None
+            and self.head_dim == 256
+            and qkv.dtype == torch.float16
+            and not is_kv_shared
+            and qkv.is_contiguous()
+            and os.environ.get("SGLANG_DISABLE_ESIMD_QKV", "0") != "1"
+        )
+        if _use_esimd_qkv:
+            cache = self._init_esimd_qkv_cache()
+            n_tok = qkv.shape[0]
+            dev = qkv.device
+            q = torch.empty(n_tok, self.q_size, dtype=torch.float16, device=dev)
+            k = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
+            v = torch.empty(n_tok, self.kv_size, dtype=torch.float16, device=dev)
+            self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            cs_cache = self.rotary_emb.cos_sin_cache
+            rotary_dim = cs_cache.shape[-1]  # already = head_dim for sliding
+            _esimd_qkv_split_norm_rope(
+                qkv, q, cache["gate"], k, v,
+                cache["wq"], cache["wk"],
+                positions.to(torch.int32),
+                self.num_heads, self.num_kv_heads,
+                False,  # attn_output_gate
+                rotary_dim,
+                cs_cache,
+            )
+            # Kernel handles Q/K norm + RoPE but not V norm.
+            # Gemma4 v_norm is with_scale=False (pure RMSNorm, no weight multiply).
+            v_3d = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v_3d = self.v_norm(v_3d)
+            # Reshape for attention: q [n_tok, num_heads, head_dim], k/v [n_tok, kv_heads, head_dim]
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+            v = v_3d
+            attn_output = self.attn(
+                q, k, v, forward_batch=forward_batch, save_kv_cache=True,
+            )
+            if attn_output.dim() == 3:
+                attn_output = attn_output.flatten(-2, -1)
+            output, _ = self.o_proj(attn_output)
+            return output
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
@@ -424,9 +501,11 @@ class Gemma4Attention(nn.Module):
         )
         can_fuse_qkv_norm = (
             (q.is_cuda or q.is_xpu)
+            and self.head_dim == 256
             and self.q_norm.scale_shift == 0.0
             and self.k_norm.scale_shift == 0.0
             and not self.v_norm.with_scale
+            and os.environ.get("SGLANG_GEMMA4_DISABLE_FUSED_QKV_NORM", "0") != "1"
         )
         if can_fuse_qkv_norm:
             if is_kv_shared:
@@ -715,9 +794,21 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
         else:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
+            if (
+                _esimd_fused_add_rms_norm is not None
+                and hidden_states.shape[0] == 1
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+            ):
+                norm = self.pre_feedforward_layernorm
+                if not hasattr(norm, "_esimd_w"):
+                    norm._esimd_w = norm.weight.data.to(torch.float16).contiguous()
+                _esimd_fused_add_rms_norm(hidden_states, residual, norm._esimd_w, norm.variance_epsilon)
+            else:
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
             hidden_states = self.mlp(hidden_states)
 
         if (
@@ -726,15 +817,32 @@ class Gemma4DecoderLayer(nn.Module):
             and (hidden_states.is_cuda or hidden_states.is_xpu)
             and hidden_states.dim() == 2
         ):
-            # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
-            hidden_states = gemma_rmsnorm_residual_scalar(
-                hidden_states,
-                norm.weight.data,
-                residual,
-                self.layer_scalar,
-                norm.variance_epsilon,
-            )
+            if (
+                _esimd_rmsnorm_residual_scalar is not None
+                and hidden_states.shape[0] == 1
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+            ):
+                if not hasattr(norm, "_esimd_w"):
+                    norm._esimd_w = (norm.weight.data.to(torch.float16) - 1.0).contiguous()
+                if not hasattr(self, "_rrs_scalar"):
+                    self._rrs_scalar = float(self.layer_scalar.item())
+                if not hasattr(self, "_rrs_buf"):
+                    self._rrs_buf = torch.empty_like(hidden_states)
+                hidden_states = _esimd_rmsnorm_residual_scalar(
+                    hidden_states, norm._esimd_w, residual, self._rrs_buf,
+                    norm.variance_epsilon, self._rrs_scalar,
+                )
+            else:
+                hidden_states = gemma_rmsnorm_residual_scalar(
+                    hidden_states,
+                    norm.weight.data,
+                    residual,
+                    self.layer_scalar,
+                    norm.variance_epsilon,
+                )
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = hidden_states + residual

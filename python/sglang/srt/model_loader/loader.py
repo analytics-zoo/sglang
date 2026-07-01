@@ -949,8 +949,18 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
         # norm/embedding tensors all stay resident. The transient bf16 device
         # copy of a quantized weight is dropped when process_weights replaces
         # layer.weight, then reclaimed by the periodic empty_cache.
+        skip_vision = os.environ.get("SGLANG_SKIP_VISION_GPU", "0") == "1"
+        # Build set of modules to skip (vision_tower subtree)
+        _skip_modules = set()
+        if skip_vision:
+            for name, mod in model.named_modules():
+                if "vision_tower" in name or "embed_vision" in name:
+                    _skip_modules.add(id(mod))
+
         processed = 0
         for module in model.modules():
+            if id(module) in _skip_modules:
+                continue
             # Move this module's own params/buffers onto the device (recurse=False
             # so child modules are handled in their own iteration step).
             _move_module_tensors_to_device(module, target_device)

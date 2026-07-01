@@ -118,6 +118,9 @@ def _xpu_patch_cuda_graph_apis() -> None:
             return self._ctx.__exit__(exc_type, exc, tb)
 
     torch.cuda.graph = _XpuGraphCtx  # type: ignore[assignment]
+    torch.cuda.stream = torch.xpu.stream  # type: ignore[assignment]
+    torch.cuda.current_stream = torch.xpu.current_stream  # type: ignore[assignment]
+    torch.cuda.synchronize = torch.xpu.synchronize  # type: ignore[assignment]
     torch.cuda._sglang_xpu_patched = True
 
 
@@ -871,7 +874,12 @@ class CudaGraphRunner:
             captured_fn = run_once_fn
 
         with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-            out = captured_fn()
+            try:
+                out = captured_fn()
+            except RuntimeError as e:
+                import traceback
+                traceback.print_exc()
+                raise
         return out
 
     def _create_device_graph(self):
