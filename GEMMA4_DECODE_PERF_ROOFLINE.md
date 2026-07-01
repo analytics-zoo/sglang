@@ -141,7 +141,48 @@ The single "FP8 GEMV" row is actually **4 distinct kernel instantiations** by sh
 
 ---
 
-## 4. Optimization levers, by ROI
+## 4. E2E: measured TPOT vs memory roofline (4k ctx, current config)
+
+Bytes that MUST be read from DRAM per decode step (weight-stream + KV):
+
+| source                    | GB/step |
+|---------------------------|---------|
+| FP8 GEMV weights (fp8)    | 14.70   |
+| lm_head weight (bf16)     | 1.41    |
+| KV cache (attention read) | 0.59    |
+| activations (norm/act rw) | ~0.03   |
+| **total**                 | **16.73** |
+
+**Memory-roofline E2E floor** = 16.73 GB ÷ 630 GB/s (measured read ceiling) =
+**26.6 ms/step**.
+
+**Measured TPOT @4k (current: in-kernel-chunk, G=64, eager)** = **42.9 ms/step**.
+
+→ **E2E efficiency = 26.6 / 42.9 = 62% of the memory roofline.**
+
+Caveat: the 26.6 ms floor is a *pure memory-bound ideal* — it assumes zero TP
+communication and perfect kernel/host overlap. Decode also carries an irreducible
+**TP allreduce (communication-bound, NOT memory-bound)** cost and host-launch
+overhead, so 62% is expected, not a defect. Gap decomposition (accurate compute
+device self-times; TPOT 42.9 ms):
+
+| bucket                         | ms/step | note |
+|--------------------------------|---------|------|
+| FP8 GEMV                       | 25.4    | 92% roofline — at the wall |
+| lm_head                        |  4.8    | 48% roofline — recoverable ~2.5 ms |
+| attention (page_attn+split-K)  |  2.5    | small; 37% roofline |
+| norm ×3 + act + index + elem   |  ~4.5   | LAUNCH-bound (µs kernels), not BW — reclaim via fusion / XPU graph |
+| TP allreduce (comm) + host-gap |  ~5.7   | comm-bound + idle; graph would reclaim the host-gap part |
+
+So of the 42.9 − 26.6 = **16.3 ms/step above the memory floor**, roughly: ~2.1 ms is
+FP8 GEMV's own 8% inefficiency (near-irreducible), ~2.5 ms lm_head, ~4.5 ms
+launch-bound small kernels, ~1.6 ms attention, and ~5.7 ms TP-comm + host-gap. The
+**realistically recoverable** portion is the launch-bound kernels + host-gap
+(~8–9 ms, needs working XPU graph / kernel fusion) and lm_head (~2.5 ms) — i.e. a
+well-optimized decode could approach ~32–34 ms/step (≈78–83% of roofline); the last
+~26.6 ms (FP8 GEMV + weight/KV reads) is a hard memory-bandwidth wall on this DRAM.
+
+## 5. Optimization levers, by ROI
 
 1. **TP allreduce** — real cost ~4–7 ms/step (unitrace-inflated, not roofline'd
    here). Rides **PCIe not XeLink** (`oneccl_allreduce_pcie`). Algorithmic/
