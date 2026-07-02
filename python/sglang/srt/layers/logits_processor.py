@@ -911,7 +911,7 @@ class LogitsProcessor(nn.Module):
                 _esimd_gemv_fp16 is not None
                 and hidden_states.is_xpu
                 and hidden_states.shape[0] == 1
-                and False  # DISABLED: oneDNN bf16 GEMM faster at N=131072
+                # oneDNN picks a slow kernel variant ({32,2,8}) at N=131072 in steady-state decode
             ):
                 if not hasattr(lm_head, "_esimd_fp16_weight"):
                     lm_head._esimd_fp16_weight = lm_head.weight.to(torch.float16).contiguous()
