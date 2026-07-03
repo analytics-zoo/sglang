@@ -70,11 +70,13 @@ logger = logging.getLogger(__name__)
 _esimd_qkv_split_norm_rope = None
 _esimd_fused_add_rms_norm = None
 _esimd_rmsnorm_residual_scalar = None
+_esimd_norm_add_norm = None
 try:
     from custom_esimd_kernels_sglang import (
         esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
         esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
         esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
+        esimd_norm_add_norm as _esimd_norm_add_norm,
     )
 except ImportError:
     pass
@@ -464,19 +466,29 @@ class Gemma4Attention(nn.Module):
             self.rotary_emb._match_cos_sin_cache_dtype(qkv)
             cs_cache = self.rotary_emb.cos_sin_cache
             rotary_dim = cs_cache.shape[-1]  # already = head_dim for sliding
+            # positions.to(int32) is identical across all decoder layers in a
+            # step; cache it on forward_batch (shared per step, fresh each step)
+            # to drop ~1 redundant cast kernel per layer.
+            pos_i32 = getattr(forward_batch, "_gemma4_positions_i32", None)
+            if (
+                pos_i32 is None
+                or getattr(forward_batch, "_gemma4_positions_src", None) is not positions
+            ):
+                pos_i32 = positions.to(torch.int32)
+                forward_batch._gemma4_positions_i32 = pos_i32
+                forward_batch._gemma4_positions_src = positions
             _esimd_qkv_split_norm_rope(
                 qkv, q, cache["gate"], k, v,
                 cache["wq"], cache["wk"],
-                positions.to(torch.int32),
+                pos_i32,
                 self.num_heads, self.num_kv_heads,
                 False,  # attn_output_gate
                 rotary_dim,
                 cs_cache,
             )
-            # Kernel handles Q/K norm + RoPE but not V norm.
-            # Gemma4 v_norm is with_scale=False (pure RMSNorm, no weight multiply).
+            # V norm is now fused into the ESIMD kernel (V branch does RMSNorm,
+            # with_scale=False → pure norm, no weight multiply). No separate call.
             v_3d = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v_3d = self.v_norm(v_3d)
             # Reshape for attention: q [n_tok, num_heads, head_dim], k/v [n_tok, kv_heads, head_dim]
             q = q.unflatten(-1, (self.num_heads, self.head_dim))
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
@@ -744,9 +756,10 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.enable_moe_block:
+            # MoE path keeps the standalone post-attention norm.
+            hidden_states = self.post_attention_layernorm(hidden_states)
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
             # Also need raw (unfused) residual for router and pre_ff_norm_2
             hidden_states, residual = self.pre_feedforward_layernorm(
@@ -793,22 +806,53 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+            # Dense path. Fuse the standalone post_attention_layernorm, the
+            # residual add, and pre_feedforward_layernorm into ONE kernel:
+            #   residual = post_attn_norm(attn_out) + residual
+            #   hidden   = pre_ff_norm(residual)
+            # (RMSNorm here uses raw weight, so pass weights as-is; `out` may
+            #  safely alias `attn_out` since the kernel reads it before writing.)
             if (
-                _esimd_fused_add_rms_norm is not None
+                _esimd_norm_add_norm is not None
                 and hidden_states.shape[0] == 1
                 and hidden_states.dtype == torch.float16
                 and hidden_states.is_contiguous()
                 and residual.is_contiguous()
             ):
-                norm = self.pre_feedforward_layernorm
-                if not hasattr(norm, "_esimd_w"):
-                    norm._esimd_w = norm.weight.data.to(torch.float16).contiguous()
-                _esimd_fused_add_rms_norm(hidden_states, residual, norm._esimd_w, norm.variance_epsilon)
-            else:
-                hidden_states, residual = self.pre_feedforward_layernorm(
-                    hidden_states, residual
+                if not hasattr(self, "_nan_w1"):
+                    self._nan_w1 = (
+                        self.post_attention_layernorm.weight.data.to(torch.float16).contiguous()
+                    )
+                    self._nan_w2 = (
+                        self.pre_feedforward_layernorm.weight.data.to(torch.float16).contiguous()
+                    )
+                _esimd_norm_add_norm(
+                    hidden_states,
+                    residual,
+                    self._nan_w1,
+                    self._nan_w2,
+                    hidden_states,
+                    self.post_attention_layernorm.variance_epsilon,
+                    self.pre_feedforward_layernorm.variance_epsilon,
                 )
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+                if (
+                    _esimd_fused_add_rms_norm is not None
+                    and hidden_states.shape[0] == 1
+                    and hidden_states.dtype == torch.float16
+                    and hidden_states.is_contiguous()
+                    and residual.is_contiguous()
+                ):
+                    norm = self.pre_feedforward_layernorm
+                    if not hasattr(norm, "_esimd_w"):
+                        norm._esimd_w = norm.weight.data.to(torch.float16).contiguous()
+                    _esimd_fused_add_rms_norm(hidden_states, residual, norm._esimd_w, norm.variance_epsilon)
+                else:
+                    hidden_states, residual = self.pre_feedforward_layernorm(
+                        hidden_states, residual
+                    )
             hidden_states = self.mlp(hidden_states)
 
         if (
