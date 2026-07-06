@@ -13,6 +13,7 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -60,6 +61,21 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
+        # XPU/qwen35 GGUF bypass: transformers' GGUF config parser
+        # (load_gguf_checkpoint) rejects arch "qwen35"/"qwen35moe" with
+        # "not supported yet". When SGLANG_GGUF_HF_CONFIG_DIR points at a sibling
+        # HF checkpoint dir (config.json + tokenizer), read the config straight
+        # from there and never hand transformers the .gguf path. The GGUF weights
+        # are still loaded by the GGUF model loader; only the *config* is sourced
+        # from HF here. Matches the _get_gguf_weights_map_xpu_qwen35 name-map
+        # bypass in loader.py.
+        import os as _os
+
+        _hf_cfg_dir = _os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if _hf_cfg_dir and str(model).endswith(".gguf"):
+            model = _hf_cfg_dir
+            kwargs.pop("gguf_file", None)
+
         config = AutoConfig.from_pretrained(
             model,
             trust_remote_code=trust_remote_code,
@@ -227,9 +243,21 @@ def get_config(
                 f"model_config_parser={model_config_parser!r} is incompatible "
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
-        _ensure_gguf_version()
-        kwargs["gguf_file"] = model
-        model = Path(model).parent
+        # XPU/qwen35 GGUF bypass: transformers' GGUF config parser
+        # (load_gguf_checkpoint) rejects arch "qwen35"/"qwen35moe" with
+        # "not supported yet". When SGLANG_GGUF_HF_CONFIG_DIR points at a sibling
+        # HF checkpoint dir (config.json + tokenizer), read the config straight
+        # from there and NEVER pass gguf_file= to transformers. The GGUF weights
+        # are still loaded by the GGUF model loader; only the *config* is sourced
+        # from HF here. Matches the _get_gguf_weights_map_xpu_qwen35 name-map
+        # bypass in loader.py.
+        _hf_cfg_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if _hf_cfg_dir:
+            model = _hf_cfg_dir
+        else:
+            _ensure_gguf_version()
+            kwargs["gguf_file"] = model
+            model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
         model_config_parser = "hf"
@@ -253,7 +281,13 @@ def get_config(
     if model_override_args:
         config.update(model_override_args)
 
-    if is_gguf:
+    if is_gguf and not os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR"):
+        # Normal GGUF path: transformers' CausalLM name map gives the runtime
+        # arch. Skipped under SGLANG_GGUF_HF_CONFIG_DIR — there we already read
+        # the correct architectures (e.g. Qwen3_5MoeForConditionalGeneration)
+        # straight from the sibling HF config.json and must NOT clobber it with
+        # transformers' text-only CausalLM name (qwen3_5_moe →
+        # Qwen3_5MoeForCausalLM, which has no SGLang registry entry).
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
