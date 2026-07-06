@@ -11,13 +11,19 @@ checked. Do NOT enable XPU graph until the allreduce fix lands.
 verified 2026-07-01: gsm8k chat 0.950 (38/40, 0 invalid), coherent output, and
 BETTER TPOT-vs-ctx than the (broken) graph at every length:
 
-| Metric | bf16 baseline | EAGER fp16+ESIMD (SHIPPABLE) | fp16+ESIMD+XPU Graph (BROKEN — garbles) |
+> ⚠️ **2026-07-06：下表 eager 列是 2026-07-01 的旧值（融合优化前）。** ①②③④ decode 融合 +
+> HD512 FMHA tile 调优 + GEMV VL 调优落地后，**当前 shippable eager TPOT 已降到 ~37.7ms
+> (1k) / 37.7ms (4k) / 38.4ms (8k)**（out=512，gsm8k 0.975）。**以最新性能矩阵为准**（见本文
+> "刷新的完整性能矩阵 …（2026-07-03）" 节）。下表仅用于说明 "eager 优于坏掉的 graph" 这一对比关系，
+> 其绝对数值已过时。
+
+| Metric | bf16 baseline | EAGER fp16+ESIMD (2026-07-01 旧值) | fp16+ESIMD+XPU Graph (BROKEN — garbles) |
 |--------|--------------|------------------------------|------------------------------------------|
-| TPOT (1K ctx) | 65.5ms | **40.5ms** | 45.8ms |
-| TPOT (4K ctx) | — | **46.2ms** | 72.0ms |
-| TPOT (8K ctx) | — | **54.8ms** | 106.9ms |
-| gsm8k accuracy | 0.990 | **0.950** (chat n=40) | ~0 (garbled decode) |
-| Decode tok/s (1K) | 15.3 | 24.7 | 21.8 |
+| TPOT (1K ctx) | 65.5ms | ~~40.5ms~~ → **37.7ms (当前)** | 45.8ms |
+| TPOT (4K ctx) | — | ~~46.2ms~~ → **37.7ms (当前)** | 72.0ms |
+| TPOT (8K ctx) | — | ~~54.8ms~~ → **38.4ms (当前)** | 106.9ms |
+| gsm8k accuracy | 0.990 | **0.975** (chat, 当前) | ~0 (garbled decode) |
+| Decode tok/s (1K) | 15.3 | 26.6 (当前) | 21.8 |
 
 A *working* graph should beat eager (removes ~420 kernel host-launches/step);
 "graph slower" here is purely a symptom of the xccl-captured-allreduce stale-replay bug
@@ -54,15 +60,21 @@ known-good（gemm `.so` md5 `42e28795`，sglang `.so` `3806e20f`）。
 
 ### 刷新的 clean-bench 性能矩阵（known-good VL512，eager，1k–64k × out256）
 
+> ⚠️ **2026-07-03 已被取代（此表为 out=256、VL512、①②③④ 融合前的中间基线）。** 后续
+> ①②③④ decode 融合 + GEMV VL512→256 + HD512 FMHA tile 调优落地后，TPOT 再降 ~1.5ms
+> (1k/4k = 37.7ms)、TTFT 大幅下降（长 input −20~38%）。**以本文最后一张矩阵为准**
+> （"刷新的完整性能矩阵（HD512 FMHA tile-tuned + GEMV VL256 全生效…2026-07-03）"）。
+> 下表保留仅为记录该阶段的 clean-bench 复现事实（~39.2ms 可复现，非 unitrace 的 42-43ms 假象）。
+
 | input | TTFT (ms) | TPOT (ms) | tok/s | E2E (s) |
 |-------|-----------|-----------|-------|---------|
-| 1024  | 621       | **39.23** | 25.5 | 10.63 |
-| 2048  | 1276      | **39.25** | 25.5 | 11.28 |
-| 4096  | 2644      | **39.22** | 25.5 | 12.64 |
-| 8192  | 5721      | **39.27** | 25.5 | 15.73 |
-| 16384 | 12805     | **40.99** | 24.4 | 23.26 |
-| 32768 | 31100     | **44.16** | 22.6 | 42.36 |
-| 65536 | 84143     | **50.45** | 19.8 | 97.01 |
+| 1024  | 621       | 39.23 | 25.5 | 10.63 |
+| 2048  | 1276      | 39.25 | 25.5 | 11.28 |
+| 4096  | 2644      | 39.22 | 25.5 | 12.64 |
+| 8192  | 5721      | 39.27 | 25.5 | 15.73 |
+| 16384 | 12805     | 40.99 | 24.4 | 23.26 |
+| 32768 | 31100     | 44.16 | 22.6 | 42.36 |
+| 65536 | 84143     | 50.45 | 19.8 | 97.01 |
 
 - TPOT 1k–8k **平坦 ~39.2ms**（spread 0.05ms，极稳），16k 起因 10 层 global split-K 扫全 KV 上升。
 - out=64 对照：40.1/40.5/40.2 @ 1k/4k/8k（少 token → 首 token 暖机权重大，比 out256 高 ~1ms）。
@@ -699,14 +711,95 @@ v_cache[indices] = v   # advanced-index scatter #2
 - TTFT 收益随 input 单调放大（FMHA O(n²) 占 TTFT 比例随 input 上升）：短 prompt（1k-4k）由固定 GEMM/量化开销主导、收益有限；16k 起显著，64k 近 −38%。
 - 现存 TTFT 大头：短 input 为 oneDNN/W8A16 GEMM，长 input 为 HD512 FMHA（现 10.1% peak，仍有 XMX 余量）+ allreduce。
 
+## Scheduler 侧配置调查 + Overlap Schedule A/B（2026-07-06）
+
+> 目的：排查 sglang scheduler 侧是否还有可启用/可调的配置能改善 gemma4-31B（dense、TP2、XPU、eager、bsz=1）。
+> 结论：**唯一相关的旋钮 = overlap schedule，实测保持 ON（默认）已最优**；其余旋钮对本 workload 无效或不可用。
+
+### Overlap Schedule ON/OFF A/B（同一容器、干净重启、节点空闲、bsz=1、out=256、warmup2/trials3）
+
+| input | TTFT ON | TTFT OFF | **TPOT ON** | **TPOT OFF** | tok/s ON | tok/s OFF |
+|------|---------|----------|-------------|--------------|----------|-----------|
+| 1k | 346.9 | 310.7 | **37.64** | 39.02 | 26.6 | 25.6 |
+| 4k | 1382.9 | 1349.1 | **37.65** | 39.11 | 26.6 | 25.6 |
+| 8k | 2913.0 | 2883.5 | **38.43** | 39.89 | 26.0 | 25.1 |
+
+- **TPOT：overlap ON 快 ~1.4ms/step（~3.7%）**，三 ctx 一致（gap 稳定、非噪声）。即便 bsz=1，overlap 把**下一步 CPU 侧调度/采样与本步 GPU forward 重叠**，压低 per-step host 开销。
+- **TTFT：overlap OFF 略优 ~30-36ms**（1k 最明显，8k 收敛到 ~30ms）——overlap 流水线给首 token 加一步延迟；绝对量小，随 input 增大占比可忽略。
+- **⚠️ 修正**：`GEMMA4_FP16_OPTIMIZATION_PLAN.md` 旧论断"overlap_schedule helps prefill **not decode**"被本实测**推翻**——在 host-dispatch 敏感的 bsz=1 decode 上 overlap ON 反而更好；之前担心的"overlap 抢 CPU 致 decode 变慢"在空闲节点未出现（那是共享节点争用的独立现象）。
+- **决策：保持 overlap ON（默认，`disable_overlap_schedule=False`），无需改动。**
+
+### 其余 scheduler 旋钮：无效 / 不可用（勿浪费时间）
+- **`--num-continuous-decode-steps`**：**本版本已成 dead flag**——`scheduler.py` 0 引用（全树仅 `server_args.py` 定义 + `auto_benchmark_lib.py` 列名）。本欲"每次跑多 decode step 减调度开销"，正对口 host-overhead，但此版已移除，设了无效。
+- **`--enable-two-batch-overlap` / `--enable-single-batch-overlap`**：断言要求 `moe_a2a_backend != none`（`server_args.py:7552`）；gemma4 dense 无 MoE → 直接报错。
+- **`--enable-mixed-chunk` / radix cache（去 `--disable-radix-cache`）/ `--max-running-requests >1`**：仅对**真实并发 serving**（多 in-flight / 共享前缀）有意义，bsz=1 latency bench 不触发。XPU 均已验证支持（continuous batching 设备无关，session 存档）。
+- 已测并否决：`--chunked-prefill-size 1024→8192`、SWA-pool ratio 调优（BMG 显存不可行）。
+
+## CCL 环境变量复核（2026-07-06，同一容器、干净重启、节点空闲）
+
+> 背景：旧 `_claude_tmp/docs/PERF_CCL_AB_TP2.md`（2026-06-26，**bf16 栈** TPOT 70ms）曾测出 4 个
+> `CCL_SYCL_*_SIMPLE_THRESHOLD=4GiB` env 带来 TTFT −50~61%、TPOT 中性。但当前是 fp16+W8A16 栈，
+> prefill 构成已变（W8A16 大幅削 GEMM），故复核该结论是否仍成立。
+
+### A/B：当前 W8A16 栈，有/无 4 个 CCL SYCL threshold env（overlap 均 ON）
+| input/out | TTFT ON | TTFT OFF | TPOT ON | TPOT OFF |
+|-----------|---------|----------|---------|----------|
+| 1024/256  | 347.2 | 347.1 | 37.65 | 37.65 |
+| 4096/256  | 1383.0 | 1383.9 | 37.66 | 37.66 |
+| 8192/256  | 2915.4 | 2916.2 | 38.44 | 38.44 |
+| 16384/128 | 6445.9 | 6440.4 | 40.01 | 40.00 |
+
+- **结论：当前栈上这 4 个 CCL env 已是 no-op**——TTFT/TPOT 有/无**逐字节一致**（差 <1ms 噪声）。
+  **旧 bf16 A/B 的 TTFT −50~61% 收益在当前 W8A16 + oneCCL 2021.17 栈上不再复现**（大概率：新 oneCCL 默认 simple-threshold 已够高，chunked-prefill=1024 的 ~11MB allreduce 消息默认就走 simple；或旧测未用 chunked-prefill、单发大消息才命中旧默认阈值）。
+- **保留无害**（正确性不受影响），但**不再作为性能项**；`PERF_CCL_AB_TP2.md` 的结论仅适用旧 bf16 栈。
+
+### 硬件层面：allreduce 是 PCIe 通信墙，env 无法突破
+- `xpu-smi topology -m`：GPU0↔GPU1 = **`NODE`（PCIe host bridge），无 `XL`（XeLink）**。坐实 trace 里的 `oneccl_allreduce_pcie`。
+- **BMG 双卡无 XeLink** → allreduce（decode 第 2 大项，21.7% device / ~11.8ms/step traced；prefill ~11%）是 **PCIe 硬件墙**，换 transport 类 env 无从优化。
+- oneCCL `2021.17`，`CCL_CONFIGURATION=cpu_gpu_dpcpp`。可试但低 ROI：`CCL_ALLREDUCE=<algo>` 算法选择、`CCL_WORKER_COUNT/AFFINITY`（decode 小消息本就 simple，预期无感）。真正压 allreduce 需算法/互联层（如图安全 custom SYCL allreduce 把它捕进图省 launch，但不动 PCIe 带宽本体）。
+
+## TP=4 评估：未被正常支持（2026-07-06，同一容器、干净重启、4 卡空闲）
+
+> 目的：评估 TP=4（GPU 0,1,2,3）能否降 TPOT / 扩 KV 容量。结论：**TP=4 不可交付**——server 能起且
+> READY，但短 input prefill 的 TTFT 出现物理上不可能的反转，判定 prefill/comm path 不稳定。
+
+- 启动成功：`launch_tp.sh TP=4 AFFINITY=0,1,2,3`，`max_total_num_tokens=603200`（TP2 的 3.3×，KV 容量确实更大）。
+- 全矩阵（out=512，warmup2/trials3）实测 TTFT：
+
+  | input | TTFT (ms) | 与相邻 input 关系 |
+  |-------|-----------|------------------|
+  | 1024  | **10979** | ❌ 反常：比 4k 大 11× |
+  | 2048  | **13538** | ❌ 反常：比 4k 大 14× |
+  | 4096  | 962       | 正常 |
+  | 8192  | 2004      | 正常 |
+  | 16384 | 4316      | 正常 |
+  | 32768 | 9860      | 正常 |
+  | 65536 | 24668     | 正常 |
+
+- **1k/2k 的 TTFT（~11s/13.5s）比 4k（~0.96s）大一个数量级**，在 warmup=2 之后仍出现 → 物理上不可能，
+  指向 TP=4 的 prefill/首批 comm path 在小 shape 上不稳定（疑似 4-way PCIe allreduce 的 JIT/warmup 未收敛，
+  或 per-shape kernel 首次编译集中在小 input）。**TPOT 正常**（全程 ~34ms，甚至略优于 TP=2 的 37.7ms），
+  说明 decode path 本身能跑，问题在 prefill。
+- **决策：不采用 TP=4。** shippable 仍为 **TP=2**。若未来要复活 TP=4，需先根因 1k/2k TTFT 反转
+  （逐 shape 追首批 prefill 的 kernel-compile / allreduce 建链耗时），在小 input 稳定前不可交付。
+- 服务已按显式 PID kill 关闭，4 卡显存均回落到 ~42MiB。
+
 ## Launch Configuration
 
+> ⚠️ **2026-07-06 修正**：旧启动块曾写 `SGLANG_XPU_ENABLE_GRAPH=1` + `--cuda-graph-bs 1`，
+> 与本文结论（**XPU graph 坏、ship EAGER**）直接矛盾，且缺 `SGLANG_USE_SGL_XPU` /
+> `SGLANG_SPLITK_G` / `SGLANG_XPU_FP8_W8A16_PREFILL` 三个 known-good env。以下为本 session
+> 实测在用的 **shippable eager 配置**（TP=2，graph OFF，W8A16 prefill 默认），与
+> `cc_workspace/gemma_splitk/launch_tp.sh`（`TP=2`）一致。
+
 ```bash
-export SGLANG_XPU_ENABLE_GRAPH=1
-export SGLANG_SKIP_VISION_GPU=1
 export ZE_AFFINITY_MASK=0,1
 export SGLANG_USE_SGL_XPU=1
+export SGLANG_SKIP_VISION_GPU=1
 export SGLANG_FP8_IGNORED_LAYERS=vision_tower,embed_vision
+export SGLANG_SPLITK_G=64                 # split-K decode attn（§1 已调好）
+export SGLANG_XPU_FP8_W8A16_PREFILL=1     # opt#2：W8A16 prefill 默认路径
+# 下面 4 个 CCL env 在当前 W8A16 栈上已是 no-op（见 "CCL 环境变量复核"），保留无害，非性能项
 export CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296
 export CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296
 export CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296
@@ -722,11 +815,15 @@ python3 -m sglang.launch_server \
   --disable-radix-cache \
   --max-running-requests 1 \
   --context-length 70000 \
-  --cuda-graph-bs 1 \
-  --skip-server-warmup \
+  --disable-cuda-graph \                  # EAGER：graph 在 TP>1 坏（Known Issue #2）
+  --skip-server-warmup --watchdog-timeout 3600 \
   --trust-remote-code --model-impl sglang \
   --host 0.0.0.0 --port 30000
 ```
+
+> **TP：只用 TP=2。** TP=4 经 2026-07-06 实测**未被正常支持**：server 能起且 READY，但
+> 1k/2k prefill 的 TTFT 反常（1k≈11s、2k≈13.5s，远大于 4k 的 ~0.96s，物理上不可能的反转），
+> TPOT 虽正常（~34ms）。判定 TP=4 prefill/comm path 不稳定，不可交付。详见 "TP=4 评估" 节。
 
 ## Files Modified
 

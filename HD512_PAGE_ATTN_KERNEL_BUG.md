@@ -1,5 +1,14 @@
 # hd512 page_attn_decode & XPU Graph TODO
 
+> ⚠️ **状态横幅（2026-07-06）**：本文是 2026-06-30 的 **kernel-bug + piecewise-graph 调查记录**，两点已过时：
+> (1) 文末 "Current State" 的 **TPOT=49ms 是融合优化前的旧值**，当前 shippable eager 已到 ~37.7ms
+> （见 `GEMMA4_BMG_OPTIMIZATION_STATUS.md` 最新矩阵）。
+> (2) 本文的 hd512-ESIMD / piecewise-graph 是为**启用 XPU graph** 服务的，但 XPU graph 现被一个**更底层的
+> blocker** 拦住——captured **oneCCL allreduce 在本栈 replay stale**（见 `GEMMA4_XPU_GRAPH_STATUS.md`
+> "captured-collective staleness"）。即便 hd512 attention 修好、piecewise 打通，graph decode 仍会
+> deadlock。**故本文 TODO 对当前交付（eager）无影响**，仅作 kernel bug 存档；除非先解决 collective 捕获问题，
+> 否则不必推进 hd512/piecewise。
+
 ## Goal
 Enable XPU Graph capture for gemma4-31B decode by replacing `sgl_kernel.fwd` (flash attention using SLM/work_group_scratch) with ESIMD `page_attn_decode` (no SLM, graph-capturable).
 

@@ -97,4 +97,4 @@ from custom_esimd_kernels_sglang import esimd_fused_add_rms_norm
 | 5 | XPU Graph decode capture | Bundle all decode-step kernels into one launch | ~5-10% (kills 38% inter-op gap) | Needs SGLANG_XPU_ENABLE_GRAPH validation for gemma4 |
 | 6 | `esimd_norm_add_norm` | post_attn + pre_ff double-norm in one kernel | ~1% | Op not in container (vLLM has it) |
 | 7 | `esimd_fused_scaled_add_rms_norm` | Cross-layer: defer scalar×add to next layer's input_norm | ~0.5% | Op not in container |
-| 8 | Allreduce overlap with compute | Overlap TP comm with non-dependent kernels | ~5-10% | Algorithmic; sglang's overlap_schedule helps prefill not decode |
+| 8 | Allreduce overlap with compute | Overlap TP comm with non-dependent kernels | ~5-10% | Algorithmic; ⚠️ **修正 2026-07-06**：`overlap_schedule` 实测在 bsz=1 **decode 上有收益（TPOT −1.4ms/~3.7%）**，对 prefill(TTFT) 反而略有负担（见 STATUS 文档 "Overlap Schedule A/B"）。此处旧论断"helps prefill not decode"已被推翻。保持 overlap ON（默认）。 |
