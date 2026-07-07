@@ -45,7 +45,7 @@ _ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
 _XPU_ESIMD_DECODE_FN = None
 if _ENABLE_XPU_ESIMD_DECODE:
     try:
-        from custom_esimd_kernels import (
+        from custom_esimd_kernels_sglang import (
             sglang_decode_attn as _XPU_ESIMD_DECODE_FN,
         )
     except ImportError:

@@ -41,7 +41,7 @@ def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
         return cache[fp8_variant]
     op = None
     try:
-        from custom_esimd_kernels import custom_esimd_kernels_moe_batch as _moe_mod
+        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
         if fp8_variant == "e5m2":
             op = _moe_mod.moe_forward_full_silu_routed_e5m2
         else:
@@ -371,9 +371,7 @@ def _load_esimd_moe_prefill_op():
         return cache
     op = None
     try:
-        from custom_esimd_kernels import (  # noqa: F401
-            custom_esimd_kernels_moe_prefill,
-        )
+        from custom_esimd_kernels_sglang import moe_fp8_prefill_ops  # noqa: F401
 
         op = torch.ops.moe_fp8_prefill_ops.moe_prefill_full_fp8
     except Exception:

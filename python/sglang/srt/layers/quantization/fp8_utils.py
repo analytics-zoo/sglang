@@ -62,16 +62,14 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
-# Lazy-loaded handle to the new custom_esimd_kernels esimd_gemm_fp8_pert kernel.
+# Lazy-loaded handle to the merged custom_esimd_kernels_sglang
+# esimd_gemm_fp8_pert kernel wrapper.
 # Only initialised on XPU; None elsewhere or if the package is missing.
 _esimd_gemm_fp8_pert = None
 if _is_xpu:
     try:
-        # Trigger op registration via the gemm extension so that
-        # torch.ops.custom_esimd_kernels.esimd_gemm_fp8_pert exists.
-        from custom_esimd_kernels import custom_esimd_kernels_gemm  # noqa: F401
-        _esimd_gemm_fp8_pert = (
-            torch.ops.custom_esimd_kernels.esimd_gemm_fp8_pert
+        from custom_esimd_kernels_sglang import (
+            esimd_gemm_fp8_pert as _esimd_gemm_fp8_pert,
         )
     except Exception:
         _esimd_gemm_fp8_pert = None
@@ -461,11 +459,11 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_esimd():
         try:
-            import custom_esimd_kernels  # noqa: F401
+            import custom_esimd_kernels_sglang  # noqa: F401
         except ImportError as exc:
             raise RuntimeError(
                 "ESIMD backend requested via --fp8-gemm-runner-backend=esimd, "
-                "but custom_esimd_kernels is not installed. Install it from "
+                "but custom_esimd_kernels_sglang is not installed. Install it from "
                 "custom-esimd-kernels with `CXX=icpx pip install -e .`."
             ) from exc
         return esimd_w8a8_block_fp8_linear
@@ -908,9 +906,7 @@ def triton_w8a8_block_fp8_linear(
         M = input_fp16.shape[0]
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
-        torch.ops.custom_esimd_kernels.esimd_gemm_fp8_pert(
-            input_fp16, weight_nk, scale_pt, output
-        )
+        _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_pt, output)
         return output.to(input.dtype).view(*output_shape)
 
     q_input, x_scale = per_token_group_quant_fp8(
@@ -1653,9 +1649,7 @@ def apply_fp8_linear(
         M = input_fp16.shape[0]
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
-        torch.ops.custom_esimd_kernels.esimd_gemm_fp8_pert(
-            input_fp16, weight_nk, scale_1d, output
-        )
+        _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
         return output.to(input.dtype).view(*output_shape)
 
     if compressed_tensor_quant:
