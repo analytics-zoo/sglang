@@ -107,12 +107,27 @@ python3 -m sglang.launch_server \
    
    BFCL 单条请求共生成 654 tokens、88 个 unique token，top 30 里几乎全是 `_ = ' ( 'pdf' 'report' 'final' Year` 之类 payload/语法，**结构上就是"低 self-consistency"的高熵序列**——每个 token 都在 encoding 独有信息，assistant 猜不到不是 bug，是 draft 模型自身能力上限（`num_hidden_layers=4`, `hidden=1024`）+ workload 特性。
 
-2. **bs=8 + BFCL hang（bs≤4 相同 workload 不 hang）**：BFCL bs=4 accept 也塌到 1.00，但没 hang（93s 跑完 10 例）。所以 hang 是 `max_running_requests=8` + BFCL 长累积 context（每 turn 追加 tool_call 结果，10 turn 后单请求 context 数千 tok，8 并发就是数万活跃 KV）触发的**资源/调度**问题，不是 spec 逻辑。**未做**：bs=8 用简单 gsm8k prompt 单独测能否复现，用以区分 "bs=8 特有" vs "bs=8 + 长 context 特有"。
+2. **bs=8 + BFCL hang（bs≤4 相同 workload 不 hang；同 bs=8 但 gsm8k workload 不 hang）**：BFCL bs=4 accept 也塌到 1.00，但没 hang（93s 跑完 10 例）；后续用 gsm8k n=200 parallel=8 复测，**同 server config 但换 gsm8k workload 也不 hang**（299.9s 顺跑，见下 §gsm8k bs=8 A/B）。所以 hang **同时需要 bs=8 + BFCL 长累积 context**（每 turn 追加 tool_call 结果，10 turn 后单请求 context 数千 tok，8 并发就是数万活跃 KV），不是纯 bs=8 或纯 spec 逻辑问题。
+
+### gsm8k n=200 parallel=8 MTP vs baseline A/B (2026-07-08)
+
+同 build、同 `max_running_requests=8, swa_full_tokens_ratio=0.2, radix on, mem_fraction_static=0.85`、背靠背，仅 `--speculative-*` 4 flags 有无为唯一变量：
+
+| Metric | Baseline (non-MTP) | MTP | Delta |
+|---|---|---|---|
+| gsm8k acc (n=200) | 0.990 (198/200) | 0.990 (198/200) | ✅ 完全一致 |
+| Invalid | 0 | 0 | — |
+| Wall-clock latency | 358.2s | **299.9s** | **1.19× faster** |
+| Server avg gen throughput | 151.4 tok/s (158 samples) | **172.4 tok/s** (80 samples) | +14% |
+| Server avg accept_len | — | **1.82 / 4** | — |
+
+**关键观察**：MTP 在 bs=8 上仍 net-positive（+19% E2E），但 accept_len 从 bs=1 的 3.5-3.9 掉到 bs=8 的 1.82（同 workload），把潜在收益打折约 60%。这是**独立于 workload 的 bs-scaling 问题**，不是 workload 或正确性 bug。**详见 open item `invest-bs8-accept-drop`**：待调查方向包括 `FrozenKVMTPWorker` draft loop per-req step-id 处理、SWA windowing 在 spec-decode 的 per-req 长度差异、draft attn backend metadata 在 8 并发之间的共享、target-verify batch 展开（bs*n=32 q-tokens）的 DPAS 分片效率。
 
 **当前建议：**
-- **MTP + bs≤4 明确可用**（gsm8k + BFCL 都跑完，正确性与聚合吞吐健康）。
-- **BFCL/tool-call workload 下 MTP 收益微弱** (accept_len≈1)——预期：这类 workload 上 MTP 不该关（bs=1 时仍有偶尔命中），但也不必期待明显加速。
-- **bs=8 长 context + tool-call 场景暂避免** ——需要单独调查是并发数问题还是 KV/scheduling 问题。
+- **MTP + bs≤4 完全推荐**（gsm8k + BFCL 都跑完，accept 与吞吐健康）。
+- **MTP + bs=8 gsm8k-style workload 可用**（+19% E2E，但 accept_len 已经打折）。
+- **MTP + bs=8 BFCL-style workload 暂避免**（会 hang）——需要看是 8 并发 × 长 tool-call context 的资源竞争还是别的问题。
+- **BFCL/tool-call workload 下 MTP 收益微弱** (accept_len≈1)——这类 workload 上 MTP 不该关（bs=1 时仍有偶尔命中），但也不必期待明显加速。
 
 **外部独立复现（不同硬件/后端同一模型家族）**：LocalLLaMA 用户在 M4 Max (mlx-vlm) 上跑 gemma-4-26B-A4B MTP，观察到与我们完全一致的 workload 依赖模式：
 - Code generation：1.53× 加速，66% 接受率
