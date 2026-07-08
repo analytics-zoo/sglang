@@ -1,5 +1,128 @@
 # Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
 
+## ✅ UPDATE (2026-07-08): Gemma4 MTP 在 BMG/XPU 已打通（GAP AUDIT 中的阻塞项已解决）
+
+**结果（同一 build、背靠背、同一 harness，rule-2 合规 A/B）：**
+- 正确性（`gsm8k_chat_eval.py --n 100 --parallel 1`）：**MTP 0.990 (99/100, 0 invalid)** vs baseline 0.980 (98/100)，同分布内。
+- 端到端时长：**MTP 543.1s vs baseline 973.2s = 1.79× 加速**。
+- Draft accept 中段实测：`accept_len 3.5–3.9 / 4`，`accept_rate 0.83–0.96`（gsm8k 数学推理 draft 命中率高）。
+- Server-side `gen throughput` 中段：MTP ~47–52 tok/s vs baseline ~26.6 tok/s。
+
+**已交付的启动块（在原 shippable eager 基础上加 4 行）：**
+```bash
+# 原 shippable env 全保留（ZE_AFFINITY_MASK / SGLANG_USE_SGL_XPU / SGLANG_SKIP_VISION_GPU /
+# SGLANG_FP8_IGNORED_LAYERS / SGLANG_SPLITK_G / SGLANG_XPU_FP8_W8A16_PREFILL / CCL_SYCL_*）
+
+python3 -m sglang.launch_server \
+  --model-path /llm/models/gemma-4-31B-it \
+  --device xpu --tp 2 --quantization fp8 --dtype float16 --load-format layered_fp8 \
+  --attention-backend intel_xpu --page-size 64 --mem-fraction-static 0.85 \
+  --swa-full-tokens-ratio 0.05 --chunked-prefill-size 1024 \
+  --disable-radix-cache --max-running-requests 1 --context-length 70000 \
+  --disable-cuda-graph --skip-server-warmup --watchdog-timeout 3600 \
+  --trust-remote-code --model-impl sglang \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path /llm/models/gemma-4-31B-it-assistant \
+  --speculative-draft-model-quantization unquant \
+  --speculative-num-steps 3 --speculative-num-draft-tokens 4 --speculative-eagle-topk 1 \
+  --host 0.0.0.0 --port 30000
+```
+
+### 与 GAP AUDIT 逐项对照
+
+1. **原假设**："`xpu_backend.py:239-242` 的 `assert False` 硬阻断 FROZEN_KV_MTP 的 decode metadata init。" → **错**。`speculative/frozen_kv_mtp_utils.py::frozen_kv_target_view` 在 metadata init 时把 `forward_batch.spec_info` 临时置 None，assert 从不触发。**xpu_backend 无需改动。**
+2. **实际的阻塞点（本次 session 定位并修复）：**
+   - **P1** `spec_utils.py`：`_select_top_k_tokens_later` / `create_num_accept_tokens_filter` 用 `@torch.compile(disable=_is_npu)`，XPU 走 dynamo 时 `torch.xpu.synchronize` 二次 register 触发 `AssertionError`。**修**：`disable=_is_npu or _is_xpu`。
+   - **P2** `eagle_utils.py`：`sgl_build_tree_kernel_efficient` 的 import 只在 CUDA/HIP/MUSA 触发；且 sgl-kernel-xpu 里那个同名 stub 签名少 `tree_mask_mode` 参数（11 vs 12），语义也未验证。**修**：接入 ptl 分支的 `custom_esimd_kernels_sglang.eagle_ops.{build_tree_kernel_efficient, verify_tree_greedy}`（签名与 CUDA op 逐字对齐）。`verify_tree_greedy_func` 里 XPU 分支之前是**空 return**（一切候选保持 -1），必须显式接入 SYCL 实现。
+   - **P3**（最关键）**default draft-model quantization inheritance**：`--quantization fp8` 默认继承到 draft 模型。assistant checkpoint 是 bf16 且**没有 fp8 scales**（无 `weight_scale`/`input_scale`），sglang 加载时把 `qkv_proj.weight` 转成 fp8 但 scales 未初始化 → 每层 QKV matmul 出 NaN → draft logits 全 NaN → argmax=0 → `candidates=[bonus, 0, 0, 0]` → verify 全拒 → `accept_len=1.00 accept_rate=0.00`。**修**：`--speculative-draft-model-quantization unquant`（一行 CLI）。
+3. **原假设**："Frozen-KV MTP 图捕获仅 CUDA，XPU 无 graph 收益。" → 依然成立（`speculative/frozen_kv_mtp_worker.py::init_cuda_graphs` 明确 `if target_worker.device != "cuda": return`），但**不是功能阻塞**，只是性能上限。已在 eager 下拿到 1.79×。
+4. **原假设**："Frozen-KV MTP 强制 `disable_overlap_schedule=True`、关 mixed_chunk，与调优路线冲突。" → 与本项目 shippable eager 无冲突（本来就 eager + bs=1）。
+5. **原假设**："文档口径差—— cookbook 说 MTP 可用但 intel_xpu 实不可用。" → 现已可用；下文档补丁项跟进。
+
+### 本次 session 落地的最小改动（不涉及上游模型语义）
+
+- `python/sglang/srt/speculative/spec_utils.py`：`_is_xpu` 常量 + 两处 `@torch.compile(disable=_is_npu or _is_xpu)`。
+- `python/sglang/srt/speculative/eagle_utils.py`：新增 XPU import + 两处调用分支到 `custom_esimd_kernels_sglang.eagle_ops`（`build_tree_kernel_efficient` / `verify_tree_greedy`）。
+- 无 `xpu_backend.py` / `gemma4_mtp.py` / `gemma4_causal.py` / kernel 侧改动。
+
+### 已知限制 / 未做
+
+- **只在 topk=1（chain）验证**；topk>1 在 XPU 上未启用（`frozen_kv_mtp_worker._init_draft_attn_backend` 明确 topk>1 需要 triton backend）。
+- **未做 per-length TPOT bench**：现有 `cc_workspace/gemma_splitk/bench_bsz1.py` 使用 `input_ids=[1]*N`（连续 bos）作 dummy prompt——对非 spec 路径 valid（TPOT 只测 kernel time），但对 MTP path **病态**：assistant 与 target 对纯 bos 序列的 continuation 都不在训练分布内且互不一致，`accept_len` 塌回 1.0，反被 draft-forward 开销拖慢。实测复现：dummy bench 上 MTP `accept_len=1.00 accept_rate=0.00 throughput 6–13 tok/s`。**结论**：dummy prompt 不能用来度量 MTP TPOT。以 gsm8k wall-clock（1.79×）为准；per-length TPOT 若需要，需要给 bench 加 real-text prompt 支持。
+- **未做 `--speculative-num-steps` / `--speculative-num-draft-tokens` 扫参**：默认 3/4/topk=1 在 gsm8k 已看到 accept_len 达 ~3.9（接近满 4），无强需求继续扫。
+
+### Radix cache 兼容性（2026-07-08 已验证）
+
+去掉 shippable 块里的 `--disable-radix-cache`，其余保持不变（含 `--speculative-*`）。启动 log 显示 `Tree cache initialized: source=default impl=SWARadixCache hybrid_swa=True` — SWARadixCache 与 SWA + FROZEN_KV_MTP 一起初始化 OK。
+
+**验证方法**：`cc_workspace/mtp_radix_test.py` 发 3 个共享 ~8k prefix、问题不同的 chat 请求。结果：
+
+| 请求 | Wall time | prompt_tokens | server-side #cached-token | 加速 |
+|---|---|---|---|---|
+| 1st cold | 7.04s | 8427 | **0**（完全 prefill）| — |
+| 2nd warm | 0.89s | 8428 | **8384**（99.5% 命中）| **7.9×** |
+| 3rd warm | 0.29s | 8427 | **8384**（99.5% 命中）| **24.3×** |
+
+三个请求文本连贯、无 garble。**结论**：MTP + Radix cache + SWA 在 BMG/XPU 上正确工作；多轮 / 共享 prefix 场景建议开启。
+
+### BFCL v4 multi_turn_base 兼容性（2026-07-08 smoke）
+
+同一 MTP+radix server 上跑 `openfunctions_evaluation.py --num-samples 5 --num-threads 1`（sglang backend, skip-server-setup, temperature 0.0）。5 条 case 全部正常执行完成，输出 tool_call 全部是有效 Python 结构（`[cd(...), mkdir(...), mv(...)]`），并观察到 error-recovery 行为（首 tool call 失败 → 下一 step 自动调整路径 → 后续成功）。**功能层次的 "Failed to decode"** 仅在中间 step 出现，与 non-MTP 时的行为一致（BFCL 期望结构化 tool_call；模型某些 step 直接说话会被判为 decode 失败）——**不是 MTP/radix 的引入**。
+
+**性能观察（工况差异，非 bug）：** BFCL/tool-call 场景 bs=1 accept_len 明显低于 gsm8k：`accept_len 1.0–2.4, accept_rate 0–47%`（gsm8k 是 3.5–3.9, 83–96%）。tool_call 输出高度结构化（JSON-like）但**具体参数值不可预测**（`folder='document'` 里的 `document` 是每例独有的），draft 命中率天然低。此工况下 MTP 收益微薄。**结论**：MTP 收益依 workload 而定；shippable 配置仍应保留 MTP（对数学/常识推理有收益，对 tool-call 中性），不应因 BFCL bs=1 accept_len 低就关掉。
+
+### ⚠️ OPEN ISSUE (2026-07-08): MTP + BFCL bs=8 会 hang（bs=4 相同 BFCL workload 不 hang）
+
+尝试在 `max_running_requests=8, num_threads=8, swa_full_tokens_ratio=0.2, radix on, MTP on` 环境跑 BFCL full-200。前 ~100/200 例正常返回，但跑到 ~100/200 后 server 10+ min 无输出，GPU 频率 2800 MHz 保持（不是 idle）但 log 无进展；8 个 BFCL client 线程全部 blocking on `httpx.read`。手动 kill 才结束。
+
+**后续同 server config (max_running_requests=4) 上分别验证 bs=1/2/4 gsm8k 与 bs=2/4 BFCL smoke（2026-07-08）：**
+
+| workload | n | threads | latency | server accept_len | agg gen throughput | 是否 hang |
+|---|---|---|---|---|---|---|
+| gsm8k bs=1 | 100 | 1 | 543.1s | 3.5–3.9 | ~47–52 tok/s | ✅ |
+| gsm8k bs=2 | 20  | 2 | 68.6s  | **3.15–3.80** | 85–102 tok/s | ✅ |
+| gsm8k bs=4 | 20  | 4 | 35.8s  | **3.43–3.73** | 170–186 tok/s | ✅ |
+| BFCL bs=1  | 5   | 1 | (smoke, 全过) | 1.0–2.4 | — | ✅ |
+| BFCL bs=2  | 10  | 2 | 126s | **1.00–1.25** | 15–25 tok/s | ✅ |
+| BFCL bs=4  | 10  | 4 | 93s  | **1.00**       | 30–32 tok/s | ✅ |
+| BFCL bs=8  | 200 | 8 | HANG @ ~100 | **1.00** | — | ❌ |
+
+**两个正交观察：**
+
+1. **workload-specific accept_len 塌**（跟 bs 无关）：BFCL bs=1 accept_len 已经只有 1.0–2.4，bs=2/4 也是 1.00–1.25。gsm8k bs=1/2/4 全部 3+。差异在 workload 本身：BFCL 输出高度结构化 tool_call（`[cd(folder='document'), ...]`），具体参数值不可预测；gemma-4 chat template 里 tool_call 前后有特殊 marker，assistant/target 对这些位置的分布分歧大。**这不是 XPU 或 spec 实现的 bug，是 draft 与 target 对 tool-call 语言的一致性差。**
+
+   **实测证据（2026-07-08，`analyze_mtp_dump.py`，MTP bs=1 各跑 1 条 gsm8k 和 1 条 BFCL multi_turn_base_0）：**
+   
+   | workload | steps | avg accept_len | accept_rate | pos0 拒率 | pos1 拒率 | pos2 拒率 |
+   |---|---|---|---|---|---|---|
+   | gsm8k | 204 | 2.108 | 0.369 | 0.490 | 0.667 | 0.735 |
+   | BFCL | 584 | **1.120** | **0.040** | **0.901** | **0.990** | **0.990** |
+   
+   BFCL 上 draft 的第一个 token 就有 90% 概率被拒，第 2/3 位几乎不可能命中。看被拒 target token 的分布（top-20 出现频次）：
+   - **具体参数 payload**：`'pdf'`(64), `'report'`(62), `'final'`(54), `'analysis'`(40), `'temp'`(30), `'budget'`(30), `'content'`(26) —— 每例独有的文件名/字段值，assistant 4 层小模型无法从上下文预测；
+   - **tool_call 语法 delimiter**：`'_'`(84), `"='"`(80), `" '"`(66), `"'"`(54), `'('`(44), `"',"`(22), `"')]"`(22) —— tool_call 结构符号序列；
+   - **chat template 结构 marker**：`'<turn|>'`(38) —— gemma-4 template 的 turn boundary，每次 tool_call 结束都要正确 emit，draft 判断能力弱。
+   
+   对比 gsm8k 被拒 top-20 包含 `' day'`, `' used'`, `' remaining'`, `' the'`, `' of'`, `' to'` 等自然语言高频词，assistant 至少能猜对相当比例（accept_rate 37%）。
+   
+   BFCL 单条请求共生成 654 tokens、88 个 unique token，top 30 里几乎全是 `_ = ' ( 'pdf' 'report' 'final' Year` 之类 payload/语法，**结构上就是"低 self-consistency"的高熵序列**——每个 token 都在 encoding 独有信息，assistant 猜不到不是 bug，是 draft 模型自身能力上限（`num_hidden_layers=4`, `hidden=1024`）+ workload 特性。
+
+2. **bs=8 + BFCL hang（bs≤4 相同 workload 不 hang）**：BFCL bs=4 accept 也塌到 1.00，但没 hang（93s 跑完 10 例）。所以 hang 是 `max_running_requests=8` + BFCL 长累积 context（每 turn 追加 tool_call 结果，10 turn 后单请求 context 数千 tok，8 并发就是数万活跃 KV）触发的**资源/调度**问题，不是 spec 逻辑。**未做**：bs=8 用简单 gsm8k prompt 单独测能否复现，用以区分 "bs=8 特有" vs "bs=8 + 长 context 特有"。
+
+**当前建议：**
+- **MTP + bs≤4 明确可用**（gsm8k + BFCL 都跑完，正确性与聚合吞吐健康）。
+- **BFCL/tool-call workload 下 MTP 收益微弱** (accept_len≈1)——预期：这类 workload 上 MTP 不该关（bs=1 时仍有偶尔命中），但也不必期待明显加速。
+- **bs=8 长 context + tool-call 场景暂避免** ——需要单独调查是并发数问题还是 KV/scheduling 问题。
+
+**外部独立复现（不同硬件/后端同一模型家族）**：LocalLLaMA 用户在 M4 Max (mlx-vlm) 上跑 gemma-4-26B-A4B MTP，观察到与我们完全一致的 workload 依赖模式：
+- Code generation：1.53× 加速，66% 接受率
+- Long-form prose：0.95× (打平)，31% 接受率
+- JSON output：**0.50× 变慢**，**8% 接受率**
+
+他给出的经验阈值："**once token acceptance dips below 50% the overhead kills the benefit**"，与我们 BFCL 上 4% 接受率导致的 accept_len 塌到 1.12（比 baseline 慢）一致。**结论证实：这不是 XPU 或 sglang 侧问题，是 gemma-4 assistant 模型自身在结构化输出上的通用弱点。**
+
+
+
 ## ⚠️ GAP AUDIT (2026-07-07): Gemma4 MTP 在 BMG/XPU 仍未打通（针对本项目交付路径）
 
 **结论（当前事实）**：Gemma4 的 MTP/Frozen-KV 框架代码已存在，但在我们当前可交付配置

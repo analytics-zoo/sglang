@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
@@ -17,11 +17,30 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+# XPU uses the SYCL implementation shipped by custom_esimd_kernels_sglang
+# (ptl branch). Its signature matches the CUDA op exactly (8 tensors + 4 ints
+# including tree_mask_mode), unlike the sgl-kernel-xpu stub which is missing
+# tree_mask_mode. Import lazily so the module is optional at import time.
+_xpu_build_tree_kernel_efficient = None
+_xpu_verify_tree_greedy = None
+if _is_xpu:
+    try:
+        from custom_esimd_kernels_sglang.eagle_ops import (
+            build_tree_kernel_efficient as _xpu_build_tree_kernel_efficient,
+        )
+        from custom_esimd_kernels_sglang.eagle_ops import (
+            verify_tree_greedy as _xpu_verify_tree_greedy,
+        )
+    except ImportError:
+        _xpu_build_tree_kernel_efficient = None
+        _xpu_verify_tree_greedy = None
 
 
 def per_step_draft_out_cache_loc(
@@ -189,6 +208,29 @@ def build_tree_kernel_efficient(
             num_verify_tokens,
             tree_mask_mode,
         )
+    elif _is_xpu:
+        # SYCL impl from custom_esimd_kernels_sglang (ptl branch). Same 12-arg
+        # signature as the CUDA op (tree_mask_mode included).
+        if _xpu_build_tree_kernel_efficient is None:
+            raise RuntimeError(
+                "XPU speculative decoding requires custom_esimd_kernels_sglang "
+                "with the eagle_ops extension (provides build_tree_kernel_efficient); "
+                "the module could not be imported."
+            )
+        _xpu_build_tree_kernel_efficient(
+            parent_list,
+            top_scores_index,
+            seq_lens,
+            tree_mask,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            topk,
+            spec_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
     else:
         sgl_build_tree_kernel_efficient(
             parent_list,
@@ -253,6 +295,25 @@ def verify_tree_greedy_func(
             retrive_next_token=retrieve_next_token,
             retrive_next_sibling=retrieve_next_sibling,
             target_predict=target_predict,
+        )
+    elif _is_xpu:
+        # SYCL impl from custom_esimd_kernels_sglang (ptl branch); positional
+        # signature matches the CUDA op.
+        if _xpu_verify_tree_greedy is None:
+            raise RuntimeError(
+                "XPU speculative decoding requires custom_esimd_kernels_sglang "
+                "with the eagle_ops extension (provides verify_tree_greedy); "
+                "the module could not be imported."
+            )
+        _xpu_verify_tree_greedy(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
         )
     return predicts, accept_index, accept_token_num
 
