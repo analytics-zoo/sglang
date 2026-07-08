@@ -62,6 +62,53 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 
+# XPU: for per-tensor-weight FP8 linears, quantise the (prefill) activation per-tensor
+# instead of per-token, so the subsequent torch._scaled_mm uses its FUSED dequant epilogue
+# (the per_tensor_weights & per_tensor_activations branch in apply_fp8_linear) rather than
+# the unfused fp32 dequant `output * x_scale * weight_scale.t()` — the latter cost ~17% of
+# prefill per unitrace. fp8 e4m3 is floating-point so per-tensor vs per-token granularity is
+# numerically near-equivalent (kernel-validated: cos delta <5e-5). Decode (M<=64) is untouched
+# because it early-returns via the ESIMD fast path above. Set env=0 to revert to per-token.
+_XPU_FP8_PERTENSOR_PREFILL = _is_xpu and get_bool_env_var(
+    "SGLANG_XPU_FP8_PERTENSOR_PREFILL", "true"
+)
+if _is_xpu:
+    logger.info(
+        "[opt#1] XPU FP8 per-tensor prefill dequant fusion = %s",
+        "ON" if _XPU_FP8_PERTENSOR_PREFILL else "OFF",
+    )
+
+# opt#2 (W8A16): XPU prefill keeps the activation in fp16 (NO activation quant) and runs
+# a mixed f16 x f8 oneDNN matmul (fp8_gemm_w8a16, ported from analytics-zoo/vllm-xpu-kernels
+# and built standalone as mini_fp8_C). This drops the ENTIRE activation quant + dequant chain
+# (vs opt#1's per-tensor quant + fused _scaled_mm epilogue) AND dispatches to a faster oneDNN
+# GEMM primitive (in-server 1.87x faster GEMM than torch._scaled_mm). Server A/B: gsm8k 0.975
+# (neutral), TTFT -32..37% vs opt#1, HITS the 4k=1500 / 8k=3500 targets. Decode (M<=64) still
+# early-returns via the ESIMD fast path (weight-only fp8, unaffected). This SUPERSEDES opt#1 and
+# is the DEFAULT XPU prefill path; it takes priority over opt#1 when both are on (checked first
+# in apply_fp8_linear). Falls back gracefully to opt#1 if mini_fp8_C.so is missing. Set
+# SGLANG_XPU_FP8_W8A16_PREFILL=0 to disable and revert to opt#1.
+_XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
+    "SGLANG_XPU_FP8_W8A16_PREFILL", "true"
+)
+_fp8_gemm_w8a16 = None
+if _is_xpu and _XPU_FP8_W8A16_PREFILL:
+    try:
+        import glob as _glob
+
+        _cands = _glob.glob(
+            "/llm/workspace/sgl_gemma/fp8gemm_bench/mini_fp8_C*.so"
+        )
+        if _cands:
+            torch.ops.load_library(_cands[0])
+            _fp8_gemm_w8a16 = torch.ops.mini_fp8.fp8_gemm_w8a16
+            logger.info("[opt#2] XPU FP8 W8A16 prefill = ON (mini_fp8_C loaded)")
+        else:
+            logger.warning("[opt#2] W8A16 requested but mini_fp8_C.so not found")
+    except Exception as _e:
+        logger.warning("[opt#2] W8A16 load failed, falling back to opt#1: %s", _e)
+        _fp8_gemm_w8a16 = None
+
 # Lazy-loaded handle to the new custom_esimd_kernels esimd_gemm_fp8_pert kernel.
 # Only initialised on XPU; None elsewhere or if the package is missing.
 _esimd_gemm_fp8_pert = None
@@ -1658,6 +1705,24 @@ def apply_fp8_linear(
         )
         return output.to(input.dtype).view(*output_shape)
 
+    # opt#2 XPU W8A16 prefill (alternative to opt#1): skip activation quant entirely
+    # and run a mixed f16 x f8 oneDNN matmul. Decode (M<=64) already returned above via
+    # the ESIMD fast path, so this only fires for prefill-shaped M>64, per-tensor weight,
+    # no compressed-tensor. weight is [K, N] fp8 (kernel adapts layout via is_nt).
+    if (
+        _is_xpu
+        and _fp8_gemm_w8a16 is not None
+        and not compressed_tensor_quant
+        and weight_scale.numel() == 1
+        and input_2d.shape[0] > 64
+    ):
+        x_fp16 = (
+            input_2d if input_2d.dtype == torch.float16
+            else input_2d.to(torch.float16)
+        )
+        output = _fp8_gemm_w8a16(x_fp16, weight, weight_scale, bias)
+        return output.to(input.dtype).view(*output_shape)
+
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__
         num_token_padding = output_padding
@@ -1710,6 +1775,15 @@ def apply_fp8_linear(
                         input_2d,
                         input_scale,
                         use_per_token_if_dynamic=use_per_token_if_dynamic,
+                    )
+                elif _XPU_FP8_PERTENSOR_PREFILL and weight_scale.numel() == 1:
+                    # XPU prefill (decode M<=64 already returned via the ESIMD fast path):
+                    # per-tensor activation quant -> hit the fused torch._scaled_mm epilogue
+                    # below, dropping the unfused fp32 dequant (~17% of prefill).
+                    qinput, x_scale = scaled_fp8_quant(
+                        input_2d,
+                        input_scale,
+                        use_per_token_if_dynamic=False,
                     )
                 else:
                     qinput, x_scale = per_token_group_quant_fp8(

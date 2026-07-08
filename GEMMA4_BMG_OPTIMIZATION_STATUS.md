@@ -1,5 +1,316 @@
 # Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
 
+## ⚠️ GAP AUDIT (2026-07-07): Gemma4 MTP 在 BMG/XPU 仍未打通（针对本项目交付路径）
+
+**结论（当前事实）**：Gemma4 的 MTP/Frozen-KV 框架代码已存在，但在我们当前可交付配置
+（`--attention-backend intel_xpu`）上不可用；因此“Gemma4 + MTP on BMG/XPU”仍是未完成项。
+
+### 1) 已具备的基础能力（不是 gap）
+
+- Gemma4 assistant 模型已接入：`python/sglang/srt/models/gemma4_mtp.py`
+  (`Gemma4AssistantForCausalLM`, `Gemma4UnifiedAssistantForCausalLM`)。
+- 参数路由已接入：`NEXTN/EAGLE + Gemma4 assistant` 会在
+  `python/sglang/srt/arg_groups/speculative_hook.py` 中被提升为
+  `FROZEN_KV_MTP`；`EAGLE3` 对该草稿架构被显式拒绝。
+
+### 2) 阻塞本项目交付的核心 gap
+
+1. **intel_xpu attention backend 对 speculative 仍硬阻断**  
+   `python/sglang/srt/layers/attention/xpu_backend.py` 在 decode 分支中，当
+   `forward_batch.spec_info is not None` 时直接 `assert False`，报错
+   “XPUAttentionBackend doesn't support speculative decoding yet...”。  
+   这意味着只要走 `intel_xpu` backend，就无法跑 MTP/Frozen-KV。
+
+2. **与本项目 shippable 启动块冲突**  
+   本文 “Launch Configuration” 的已交付命令固定使用
+   `--attention-backend intel_xpu`（TP=2 eager 路径）。  
+   因为上面第 1 条，该交付路径与 Gemma4 MTP 当前不可兼容。
+
+3. **Frozen-KV MTP 在调度能力上仍是 spec-v1 语义**  
+   `speculative_hook.py::_handle_frozen_kv_mtp` 与
+   `spec_info.py` 明确：  
+   - 不支持 spec v2 overlap（会强制 `disable_overlap_schedule=True`）；  
+   - 会关闭 mixed chunk；  
+   - 采用独立的 FrozenKVMTPWorker 路径。  
+   这与我们当前对 overlap/chunk 的性能调优路线存在结构性差异，后续需单独评估。
+
+4. **Frozen-KV MTP 的图捕获仅支持 CUDA，不支持 XPU graph**  
+   `speculative/frozen_kv_mtp_worker.py::init_cuda_graphs` 明确仅在
+   `target_worker.device == "cuda"` 时启用 draft CUDA graph；在 XPU 只走 eager draft loop。  
+   即便功能打通，XPU 侧仍缺少 draft/verify 图化收益。
+
+5. **文档与本项目现实能力存在“可用性口径差”**  
+   - `docs_new/cookbook/autoregressive/Google/Gemma4.mdx` 给出 Gemma4 + NEXTN 命令；  
+   - 交互部署片段 `docs_new/src/snippets/autoregressive/gemma4-deployment.jsx`
+     也提供 MTP 开关（仅对 MI300X 隐藏），但没有 Intel XPU/BMG 专项限制说明。  
+   对本项目而言，这会造成“文档看似可开 MTP，但 intel_xpu 路径实不可用”的认知偏差。
+
+### 3) 尚未完成的验证 gap（必须补测）
+
+- **未有本机 BMG 上 “intel_xpu + ESIMD 路径 + Gemma4 assistant + NEXTN(FROZEN_KV_MTP)” 的正确性门禁结果**  
+  （至少应有 chat harness 正确性 gate；不以 Triton 作为目标实现）。
+- **未有同口径性能数据**：  
+  目前没有 “MTP(intel_xpu+ESIMD 路径) vs 非 MTP(intel_xpu shippable 路径)” 的对齐 A/B。
+- **未形成 XPU 迁移方案的代码级拆解任务**：  
+  例如：`xpu_backend` speculative metadata/verify/draft 扩展、与 SWA/full pool 的一致性、
+  topk/page_size 组合约束、以及是否借鉴 ptl 分支的 XPU speculative kernel 资产。
+
+### 4) 建议的收敛顺序（后续执行项）
+
+1. 先做 **intel_xpu 后端 speculative 打通**：移除当前 assert 路障，补齐 metadata/verify/draft 路径，目标实现为 ESIMD 内核方案（不引入 Triton 目标依赖）。  
+2. 做 **功能可用性最小闭环**：在 BMG 上跑通 `intel_xpu + NEXTN + gemma4-31B-assistant`，拿到正确性 gate。  
+3. 再做 **同口径性能 A/B**：与当前 `intel_xpu` 非 MTP shippable 路径做对齐对比。  
+4. 最后补文档：明确“Gemma4 MTP 在 Intel XPU（ESIMD 路径）的已验证组合与限制”。
+
+## ✅ FIXED (2026-07-06): SWA seq>1024 decode garble — host-side page-aligned windowing
+
+**Bug:** decode output garbled once total sequence length crossed the
+`sliding_window=1024` boundary. Root cause: the intel_xpu ESIMD `page_attn_decode`
+path read the FULL `[0, seq_len)` SWA page table. Once seq_len > window, positions
+older than the window are evicted from the SWA KV pool and their
+`full_to_swa_index_mapping` entry is reset to **slot 0** (see
+`allocator/swa.py::free_swa` → `mapping[free_index]=0`), i.e. another token's KV
+= garbage. The old `torch.clamp(cache_seqlens, max=window+1)` hack was ALSO wrong:
+it kept the FIRST window+1 columns (the OLDEST/evicted positions), so it read
+garbage too. FA3 fallback (`SGLANG_DISABLE_ESIMD_DECODE=1`) was verified correct
+past 1024 and used as the reference.
+
+**Fix (NO kernel change):** in `xpu_backend.py` forward_decode SWA branch,
+page-align the SWA page table to the LAST `window` tokens and pass the reduced
+seq_len, so the ESIMD kernel only ever reads resident, in-window KV. page_size=64,
+window_tokens=1024 → gather/slice `n_win_pages = (window-1)//ps + 2 = 17` pages
+starting at `start_page = clamp(seq_len-window,0)//ps`. Floor-aligning the start
+reads only resident slots (may attend ≤page_size-1 extra still-resident slightly
+older tokens — a benign SUPERSET of FA3's `window_size=(sliding_window_size,0)`;
+the SWA pool evicts per page, so the boundary page is resident whenever it holds
+any in-window token). Computed ONCE per step, cached on the (per-step-fresh)
+metadata object, reused across all ~50 SWA layers. **The kernel sources
+(page.attn.gqa2.h / eagle.sycl / ops.py) are PRISTINE — no `window` param.**
+
+- **bs==1 fast path (shippable `--max-running-requests 1`):** the window is a
+  CONTIGUOUS page span, so SLICE the page table (`page_table[:, s:e]`, a zero-copy
+  view) + one device sub for seqlens. `start_page` derived from
+  `metadata.max_seq_len_k` (already a host int → NO new device→host sync, rule 14).
+  Microbench: 74us (gather) → **8us (slice)**, pt/seqlens cross-checked equal.
+- **bs>1 path:** keep gather (per-batch start pages differ).
+
+**Verified (2026-07-06, TP2 eager, pristine .so + xpu_backend windowing):**
+- Correctness — BFCL v4 multi_turn_base real cases with cumulative history well
+  past 1024: entry0 (4 turns, prompt 8491-8681 tok) and entry2 (5 turns,
+  7049-7350 tok) → ALL structurally-correct tool calls, `finish=stop`, no garble.
+  Pure-decode counting test coherent to ~1150 tokens. bs=1-slice output byte-identical to gather.
+- Perf — bench_bsz1 (out=512) vs 2026-07-03 baseline: 1k **37.55** (−0.11), 2k
+  37.74 (+0.48), 4k 38.14 (+0.48), 8k 38.93 (+0.50). At 1k (windowing mostly
+  inactive) we MATCH/beat baseline; the ~+0.5ms appears only when windowing is
+  active.
+- **⚠️ REFUTED attribution:** the +0.5ms is NOT the windowing host ops. Proven:
+  slice cut host cost 74us→8us (9×) yet E2E was byte-for-byte unchanged (gather
+  run 37.60/37.78/38.19/38.97 vs slice run 37.55/37.74/38.14/38.93). Residual
+  sub-ms is either small per-layer python dispatch (~0.1ms, 50× getattr+unpack) or
+  measurement drift vs the (garbled, full-KV-scan) baseline. NOT yet localized —
+  needs a decode kernel breakdown before further optimization (rule 6).
+
+**ESIMD AOT build note (why the kernel-mask alternative was abandoned):** an
+earlier attempt added a `window` param + `kvStart` lower-bound mask INSIDE
+`sdpaDecodeGqa2Phase1`. It failed the BMG AOT device-link with
+`The list of SPIR-V modules contains more than one module with an entry point!`
+(ocloc -11). Single-variable bisection: keeping the `window` PARAM + full
+plumbing but reverting the Phase1 BODY to pristine → **builds fine**; the mask
+BODY is the trigger. These ESIMD kernels sit at the GRF ceiling (see VL512 note:
+208 GRF > 128 → large-GRF/spill), and the extra `kvStart`+compound-`simd_mask`
+comparisons perturb module splitting past what the AOT flow accepts (per_kernel
+split is already on). Host-side windowing sidesteps this entirely.
+
+## ✅ BFCL v4 multi_turn_base FORMAL BENCHMARK (2026-07-06): FULL 200 = 72.50% (radix on)
+
+Ran the official BFCL kit pipeline (`bfcl generate` → tool execution → `bfcl
+evaluate` state/response check), NOT a hand-rolled "looks-reasonable" check. Server
+= swa_full_tokens_ratio=0.2, **radix cache ENABLED**, ESIMD decode, `--num-threads 8`
+(running-req=8, multi-concurrent). Kit vendored at `cc_workspace/gemma_splitk/_bfcl_vendor`.
+
+**FINAL RESULT: full multi_turn_base (all 200) = 72.50% (145/200), official full
+eval (no --partial).** Generation took 782s (~13min) thanks to radix prefix reuse
++ 8-way concurrency. Failures (55): 37 instance_state_mismatch + 12
+execution_response_mismatch + 6 empty_turn (genuine multi-step reasoning errors;
+empty_turn down to 3% from the 20% seen before the tool-result fix).
+
+Getting a valid score required root-causing TWO setup bugs (rule 12: suspect your
+own setup before blaming the model — the raw score was 6.67% and it would have been
+wrong to conclude "gemma-4 is bad at tool use"):
+
+1. **`thought\n` leak → 6.67% (2/30).** The vendored `GemmaHandler._format_prompt`
+   used the OLD gemma-3 hand-rolled `<start_of_turn>` template. gemma-4 uses
+   `<|turn>`/`<|channel>thought` markers, so the model leaked a `thought\n...`
+   prefix that broke BFCL's response decoder. FIX: render the REAL gemma-4 template
+   via `tokenizer.apply_chat_template(..., enable_thinking=False)` (injects the empty
+   `<|channel>thought\n<channel|>` block that suppresses reasoning; matches the
+   verified /v1/chat/completions path). Rename handler's "model" role → "assistant".
+
+2. **Tool results invisible → still low (the REAL root cause).** gemma-4's
+   apply_chat_template SILENTLY DROPS BFCL's plain `{"role":"tool","name":..,
+   "content":..}` messages (it expects structured tool_calls/tool_response). So the
+   model NEVER saw execution results → asked for clarification (empty_turn) or
+   looped (force_terminated). FIX: in `_format_prompt`, fold tool results into a
+   user turn (`"Tool execution result:\n"+content`) and merge consecutive user
+   turns. This took first-30 **6.67% → 63.33% (9.5×)**; the empty_turn and
+   force_terminated failure classes largely VANISHED. Full-200 landed at 72.50%.
+
+## ✅ RADIX CACHE VALIDATED ON XPU (2026-07-06): enable it for multi-turn / shared-prefix serving
+
+Prior configs all set `--disable-radix-cache` — but per facts note this was only
+"radix+SWA on XPU UNVALIDATED", not known-broken (code has `SWARadixCache` for
+hybrid SWA). Tested by dropping the flag (keeping swa_full_tokens_ratio=0.2):
+- **Server starts fine** — SWARadixCache initializes, `disable_radix_cache=False`, ready.
+- **Prefix reuse works**: two requests sharing an 8k prefix → 2nd TTFT 6255ms →
+  **100ms (98% / 62× faster)**. Multi-turn generation logs show #cached-token in the
+  thousands (system prompt + func docs + accumulated history reused each turn).
+- **Zero correctness loss**: BFCL multi_turn_base accuracy IDENTICAL with/without
+  radix (first-30 = 63.33% both). Full-200 (radix on) = 72.50%.
+- **~10× faster multi-turn generation**: 30-entry BFCL gen 782s→107s vs the
+  no-radix run; full 200 in 782s.
+**Recommendation: for real multi-request / multi-turn / shared-prefix serving, REMOVE
+`--disable-radix-cache`.** (bsz=1 single-shot latency bench is unaffected either way.)
+
+Other setup notes: added a `/llm/models/gemma-4-31B-it` ModelConfig → GemmaHandler
+entry; made model_config.py's ~50 handler imports tolerant (`_try` + placeholder)
+so missing optional API SDKs (cohere/anthropic/...) don't crash import; made the
+tree-sitter java/js parser init tolerant (version/module mismatch); `pip install
+overrides`. NOTE: an earlier `pip install --no-deps` of API SDKs POLLUTED the env
+(boto3 without botocore broke accelerate import) — uninstalled; use the tolerant
+imports instead. All edits are in `_bfcl_vendor` (test kit), NOT product code.
+
+Correctness cross-check (same server): gsm8k_chat_eval --parallel 16 (running-req
+16) = **0.990 (99/100), 0 invalid** — the swa_ratio=0.2 concurrency fix does NOT
+hurt correctness under 16-way concurrency.
+
+## ⚠️ OPEN ISSUE (2026-07-06): DECODE DOES NOT SCALE WITH BATCH — batch>1 has a real perf problem
+
+**Batch perf matrix (TP2 eager, out=512, SWA-windowing fix active, bs=16-capable server).**
+⚠️ Collected on a SHARED node with a confirmed other tenant at ~99% CPU; sglang
+scheduler is CPU-bound so TPOT is inflated and noisy (`*` = obvious contention
+artifact — non-monotonic). Trends + aggregate-throughput direction are reliable;
+absolute TPOT is high. Re-collect on an idle node for shippable numbers.
+
+bsz=4:
+| input | TTFT(ms) | TPOT(ms) | dec tps/req | agg dec tps | E2E(s) | E2E tps |
+|-------|----------|----------|-------------|-------------|--------|---------|
+| 1024  |   923    | 94.0*    | 10.6 | 42.5 | 48.97  | 41.8 |
+| 2048  |  1760    | 95.3*    | 10.5 | 42.0 | 50.44  | 40.6 |
+| 4096  |  3626    | 63.8     | 15.7 | 62.7 | 36.21  | 56.5 |
+| 8192  |  7420    | 68.2     | 14.7 | 58.7 | 42.24  | 48.4 |
+| 16384 | 16224    | 102.3    | 9.8  | 39.1 | 68.51  | 29.9 |
+| 32768 | 38437    | 141.4    | 7.1  | 28.3 | 110.67 | 18.5 |
+| 65536 | 117554   | 103.9    | 9.6  | 38.5 | 170.65 | 9.0  |
+
+bsz=8:
+| input | TTFT(ms) | TPOT(ms) | dec tps/req | agg dec tps | E2E(s) | E2E tps |
+|-------|----------|----------|-------------|-------------|--------|---------|
+| 1024  |  1531    | 59.9     | 16.7 | 133.6 | 31.18  | 83.3 |
+| 2048  |  3064    | 87.0*    | 11.5 | 92.0  | 47.76  | 60.9 |
+| 4096  |  6550    | 159.9    | 6.3  | 50.0  | 88.95  | 35.1 |
+| 8192  | 13545    | 204.2    | 4.9  | 39.2  | 127.00 | 28.5 |
+| 16384 | 29354    | 365.3    | 2.7  | 21.9  | 221.52 | 17.1 |
+| 32768 | 69691    | 134.8    | 7.4  | 59.3  | 146.74 | 19.6 |
+| 65536 | 231313   | 103.9    | 9.6  | 77.0  | 284.38 | 9.0  |
+
+**⚠️ CORRECTION of an earlier wrong call (2026-07-06).** After the first bs=8 8k
+trace I claimed "the bs>1 slowdown is mostly TTFT/scheduling; the decode kernels
+are healthy and per-token DPAS GEMM has no bs>1 bug." **That was wrong.** The
+matrix shows decode itself does NOT scale with batch:
+- bs=1→8 @ 8k: TPOT 39 → 204ms = **5.2× slower per token** even though batch is 8×.
+- agg decode tps does not rise with batch and even regresses: bs=8 @ 8k = 39 tps,
+  no better than bs=4 @ 16k. A healthy batched decode would keep per-token latency
+  ~flat and grow aggregate tps ~linearly; it does neither.
+- What IS true from the trace: the SWA windowing fix works (50 SWA layers read a
+  constant ~1088 tokens, not full ctx) and there is no per-token-GEMV dispatch bug
+  (M=8 correctly hits FP8_GEMM_DPAS_V9 batched GEMM). So the batch scaling loss is
+  elsewhere — TBD by a bs=4 8k decode trace (in progress). Candidate suspects:
+  FP8 DPAS GEMM efficiency at M=4/8, allreduce cost per step, or split-K global
+  layers doing O(bs×ctx) work. Do NOT attribute to TTFT again without trace proof.
+- 32k/64k TPOT DROPS vs 16k (bs8: 365→135→104ms) because KV memory caps concurrent
+  decode (at 64k only ~2-3 of the 8 requests are resident/decoding at once; the
+  rest queue), so effective batch shrinks — a memory-capacity artifact, not a speedup.
+
+### Aligned bs=1 vs bs=4 @8k decode A/B (both traced, same analyzer, 2026-07-06)
+
+Steps derived from the documented cadence **allreduce = 120/step** (60 layers × 2:
+post-attn + post-FFN), NOT guessed. bs=1: 19303/120=160.9 steps; bs=4: 15787/120=131.6.
+Both at 8k ctx (ctx confounder removed vs the earlier bs=1@4k ROOFLINE §2 table).
+
+| family        | bs1 ms/step | bs4 ms/step | bs4/bs1 |
+|---------------|-------------|-------------|---------|
+| FP8 weights   | 25.34       | 35.19       | **1.39×** |
+| allreduce     |  5.05       |  4.75       | 0.94×   |
+| lm_head       |  4.66       |  4.69       | 1.01×   |
+| page_attn SWA |  2.11       |  4.13       | **1.96×** |
+| splitK global |  1.81       |  4.19       | **2.32×** |
+| RMSNorm       |  1.32       |  2.13       | 1.61×   |
+| **SUM device**|  40.27      | 55.08       | **1.37×** |
+
+**Corrected conclusion (supersedes my earlier wrong calls in this section):**
+- The bs=1→4 device scaling is actually MILD: 1.37× device-busy for 4× batch —
+  close to ideal for a memory-bound-weights-dominated decode. My earlier "decode
+  is 5.2× slower / batch is badly broken" framing conflated bs=8 with bs=4 and
+  mixed in TTFT/contention.
+- **What scales worst is attention** (splitK global 2.32×, page_attn SWA 1.96×):
+  compute-bound, per-request KV, NO cross-batch amortization → grows ~linearly with
+  batch. But absolute cost is small (bs4: 8.3ms combined).
+- **FP8 weight GEMM scales WELL (1.39×)** — memory-bound, weight shared across the
+  batch; kernel microbench (esimd_gemm_fp8_pert / FP8_GEMM_DPAS_V9, weight-pool
+  cold-HBM) confirms per-row cost drops to 0.14–0.29× from M=1→8 (adding tokens is
+  nearly free). So my even-earlier "FP8 GEMM 63% = the bottleneck to fix" was also
+  wrong: it is the biggest ABSOLUTE cost but it batches the BEST. Do NOT chase it
+  for batch scaling.
+- bench TPOT bs1→bs4 = 39→68ms = 1.74×, vs device 1.37×. The extra ~0.37× is
+  host-gap (more kernel launches/step at bs>1) + shared-node CPU contention.
+
+### ✅ ROOT-CAUSED + FIXED (2026-07-06): bs=8/16 collapse = SWA KV pool too small → retract
+
+The bs=8/16 TPOT collapse (154–365ms) is **NOT** a decode-kernel / FP8-GEMM /
+attention / TTFT problem. Root cause found in the **scheduler's own logs** (not
+inferred): the SWA KV pool is tiny and overflows under many concurrent long inputs,
+forcing the scheduler to retract requests and cap the running batch.
+
+Evidence (bs=8, 8k input, out=1024, `swa_full_tokens_ratio=0.05`):
+- Startup: `Use sliding window memory pool. full_layer_tokens=181760,
+  swa_layer_tokens=9088`. The 50 SWA layers get their OWN small pool sized
+  `swa_tokens = full_tokens × swa_full_tokens_ratio` = 181760 × 0.05 = **9088**.
+- `swa token usage` peaks at **1.00 (100% full)** while `full token usage` is only
+  **0.31** → the SWA pool is the bottleneck, the full pool is oversized.
+- `KV cache pool is full. Retract requests` fired **104×** during the run.
+- Scheduler `#running-req` never reaches 8 (peaks 5–6, sustained ~5); `#queue-req`
+  sits at 4–7 (requests waiting, not admitted). Confirmed independently by the
+  KVScatter grid-dim0 (= per-step active decode batch) which maxes at 6, never 8.
+- Why: 9088 SWA tokens ≈ 8×1024 (window) with ZERO prefill headroom. During prefill
+  (before window eviction) 8×8k requests transiently need more → overflow → retract.
+
+**Fix (config only, ZERO kernel change): raise `swa_full_tokens_ratio`.** It
+rebalances the SAME memory budget: bigger SWA pool, smaller (still-sufficient) full
+pool. A/B at `swa_full_tokens_ratio=0.2` (SWA pool 9088→18176, full 181760→90880,
+90880 still ≫ 8×8192):
+
+| bs=8 @8k out=512      | ratio=0.05 (old) | ratio=0.2 (fixed) | gain   |
+|-----------------------|------------------|-------------------|--------|
+| running-req (decode)  | 5–6 (never 8)    | **8 (all 51 batches)** | —  |
+| retracts              | 104              | **4**             | —      |
+| TPOT                  | 204.2 ms         | **91.0 ms**       | 2.24×  |
+| agg decode tps        | 39.2             | **87.9**          | 2.24×  |
+| E2E tps               | 28.5             | **68.6**          | 2.41×  |
+| E2E time              | 127.0 s          | **59.6 s**        | 2.13×  |
+
+So decode DOES scale with batch once the SWA pool can actually hold the concurrent
+requests. **Recommendation: for multi-request long-input serving, raise
+`--swa-full-tokens-ratio` (0.05→~0.2; default upstream is 0.8). 0.05 was tuned for
+bs=1 memory frugality and starves concurrency.** Tune per target (bs, input len):
+SWA pool must hold ≈ concurrent_reqs × (window + prefill_headroom); full pool must
+stay ≥ concurrent_reqs × max_input_len.
+
+Methodology note (self-correction): earlier in this session I mis-attributed the
+collapse three times (TTFT/scheduling; then "FP8 GEMM 63% bottleneck"; then a
+bogus per-step A/B from an unaligned bs=8 trace giving "bs=8 cheaper"). All wrong.
+The fix came only from reading the scheduler's retract/running-req/swa-usage logs +
+KVScatter grid for definitive per-step active-batch — not from step-count guesses.
+
 ## ⚠️ STATUS (2026-07-01): XPU GRAPH IS BROKEN — SHIP EAGER FOR NOW
 
 The "XPU Graph" column below was measured on a config whose decode output is

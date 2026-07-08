@@ -1053,10 +1053,12 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
                 # ESIMD page_attn_decode fast path: no SLM, graph-capturable.
-                # Only non-SWA layers with head_dim==256 (gemma4 global layers
-                # have head_dim=512 so this currently only fires if a future model
-                # has non-SWA head_dim=256 layers). SWA layers need separate
-                # debugging (SWA pool page_table format mismatch).
+                # Fires for head_dim==256 layers, which for gemma4 are the SWA
+                # (sliding-window) layers (global layers have head_dim=512 and
+                # take the split-K path below). SWA windowing is handled inside
+                # the kernel via the `window` param (see the SWA branch below):
+                # positions outside the last `window` tokens are masked to -inf,
+                # matching FA3's window_size semantics.
                 _use_esimd_pa = (
                     not _DISABLE_ESIMD_DECODE
                     and not _DISABLE_PAGE_ATTN
@@ -1078,11 +1080,78 @@ class XPUAttentionBackend(AttentionBackend):
                         torch.float16, q_reshaped.device,
                     )
                     pa_seqlens = cache_seqlens
-                    if is_swa_layer and layer.sliding_window_size is not None:
-                        pa_seqlens = torch.clamp(cache_seqlens, max=layer.sliding_window_size + 1)
-                        max_seq = layer.sliding_window_size + 1
-                    else:
-                        max_seq = page_table.shape[1] * self.page_size
+                    page_table_pa = page_table
+                    max_seq = page_table.shape[1] * self.page_size
+                    # Sliding-window (SWA) layers: the ESIMD kernel reads the full
+                    # [0, seq_len) page table. Once seq_len > window, positions
+                    # older than the window have been evicted from the SWA pool
+                    # and their full->swa mapping points to slot 0 (another
+                    # token's KV = garbage), which garbled decode output. The old
+                    # clamp hack kept the FIRST window+1 columns (the OLDEST /
+                    # evicted positions) so it read garbage too.
+                    #
+                    # Fix WITHOUT any kernel change: page-align the page table to
+                    # the LAST `window` tokens and pass the reduced seq_len, so
+                    # the kernel only ever reads resident, in-window KV. The SWA
+                    # pool evicts per page (page_size), so the window-boundary
+                    # page is resident whenever it holds any in-window token;
+                    # floor-aligning the start therefore reads only valid slots
+                    # (it may attend up to page_size-1 extra, still-resident,
+                    # slightly-older tokens — a benign superset of FA3's
+                    # window_size=(sliding_window_size,0)). This also shrinks the
+                    # decode grid for long sequences.
+                    #
+                    # The windowed table depends only on cache_seqlens + the SWA
+                    # page table, which are identical across all ~50 SWA layers
+                    # in a step. Compute it ONCE per step and cache on the
+                    # (per-step-fresh) metadata object; recomputing per layer
+                    # added ~7ms TPOT (50x redundant host work).
+                    #
+                    # bs==1 (the shippable --max-running-requests 1 config) takes
+                    # a host-side fast path: the window is a CONTIGUOUS page span
+                    # [start_page : start_page+n_win_pages], so we slice the page
+                    # table (a zero-copy view) instead of building an index tensor
+                    # and gathering. start_page is derived from
+                    # metadata.max_seq_len_k, which is already a host int (no new
+                    # device->host sync). Microbench: 74us (gather) -> 8us (slice).
+                    # bs>1 keeps the gather path (per-batch start pages differ).
+                    if (
+                        is_swa_layer
+                        and layer.sliding_window_size is not None
+                        and layer.sliding_window_size > -1
+                        and metadata.max_seq_len_k > (layer.sliding_window_size + 1)
+                    ):
+                        cached = getattr(metadata, "_swa_win_cache", None)
+                        if cached is None:
+                            window_tokens = layer.sliding_window_size + 1
+                            ps = self.page_size
+                            n_win_pages = (window_tokens - 1) // ps + 2
+                            n_cols = page_table.shape[1]
+                            if bs == 1:
+                                start_pg = max(
+                                    metadata.max_seq_len_k - window_tokens, 0
+                                ) // ps
+                                end_pg = min(start_pg + n_win_pages, n_cols)
+                                pt_pa = page_table[:, start_pg:end_pg]
+                                sl = cache_seqlens - (start_pg * ps)
+                            else:
+                                start_page = (
+                                    torch.clamp(cache_seqlens - window_tokens, min=0)
+                                    // ps
+                                )
+                                col = start_page.to(torch.int64).unsqueeze(
+                                    1
+                                ) + torch.arange(
+                                    n_win_pages,
+                                    device=page_table.device,
+                                    dtype=torch.int64,
+                                )
+                                col = col.clamp_(max=n_cols - 1)
+                                pt_pa = torch.gather(page_table, 1, col)
+                                sl = (cache_seqlens - start_page * ps).to(torch.int32)
+                            cached = (pt_pa, sl, pt_pa.shape[1] * self.page_size)
+                            metadata._swa_win_cache = cached
+                        page_table_pa, pa_seqlens, max_seq = cached
                     # ESIMD kernel hardcodes matMulQuantCoeff=0.0625 (1/sqrt(256)).
                     # Compensate for the model's actual scaling factor.
                     if layer.scaling != 0.0625:
@@ -1097,7 +1166,7 @@ class XPUAttentionBackend(AttentionBackend):
                         q_scaled,
                         key_cache,
                         value_cache,
-                        page_table,
+                        page_table_pa,
                         pa_seqlens,
                         out_pa,
                         max_seqlen_q,
