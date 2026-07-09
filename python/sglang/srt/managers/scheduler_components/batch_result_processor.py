@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -28,6 +29,15 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import is_xpu
+
+# On XPU with TP>1 and decode graph enabled, per-rank greedy argmax over
+# graph-captured logits can diverge at near-ties, so ranks disagree on the
+# sampled token and thus on EOS/finish -> decode step-count desync -> the TP
+# collective inside the next graph replay deadlocks. Broadcasting rank0's
+# authoritative next_token_ids each decode step keeps all ranks identical.
+_XPU_TP_SYNC_TOKENS = is_xpu() and os.environ.get("SGLANG_XPU_TP_SYNC_TOKENS", "1") == "1"
+
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -614,6 +624,8 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
+        next_token_ids = self._maybe_sync_tp_decode_tokens(batch, next_token_ids)
+
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
@@ -700,6 +712,39 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+
+    def _maybe_sync_tp_decode_tokens(self, batch, next_token_ids):
+        """Broadcast rank0's decode tokens to all TP ranks (XPU graph fix).
+
+        Without this, each TP rank independently runs greedy argmax on its own
+        (graph-captured) logits. Tiny cross-rank logit differences at near-ties
+        can make ranks sample different tokens, disagree on EOS, and diverge in
+        decode step count -> the collective inside a later graph replay hangs.
+        Only handles the non-speculative flat list[int] path; spec paths are
+        left untouched.
+        """
+        if not _XPU_TP_SYNC_TOKENS:
+            return next_token_ids
+        if not batch.spec_algorithm.is_none():
+            return next_token_ids
+        if not isinstance(next_token_ids, list) or len(next_token_ids) == 0:
+            return next_token_ids
+        try:
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            tp = get_tp_group()
+        except Exception:
+            return next_token_ids
+        if tp is None or tp.world_size <= 1:
+            return next_token_ids
+
+        import torch.distributed as dist
+
+        # Keep this collective on the CPU (gloo) group so it never touches the
+        # XPU command queue / graph state.
+        tokens = torch.tensor(next_token_ids, dtype=torch.int64, device="cpu")
+        dist.broadcast(tokens, src=tp.ranks[0], group=tp.cpu_group)
+        return tokens.tolist()
 
     def _normalize_decode_outputs(
         self,
