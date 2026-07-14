@@ -857,7 +857,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # in progress. torch.cuda.CUDAGraph / torch.cuda.graph are
             # aliased onto torch.xpu equivalents in cuda_graph_runner at
             # import time (see _xpu_patch_cuda_graph_apis).
-            if os.environ.get("SGLANG_XPU_ENABLE_GRAPH") == "1":
+            if os.environ.get("SGL_XPU_ENABLE_GRAPH") == "1":
                 self.init_device_graphs()
             else:
                 self.graph_runner = None

@@ -220,11 +220,11 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
+        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
         # path (`fused_experts_none_to_triton`) is the one that actually fires
         # under the default runner config; this branch is here for the future
         # case where a runner_input gets routed straight into the runner_core.
-        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+        if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
             out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
             if out is not None:
                 return TritonRunnerOutput(hidden_states=out)
@@ -463,7 +463,7 @@ def _maybe_esimd_moe_silu_prefill(
         return None
     # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
     # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
+    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
     # off until the shared expert contribution is added. Kept wired + scale-fixed
     # for when that lands.
 
@@ -502,7 +502,7 @@ def fused_experts_none_to_triton(
     # a single linear layer, so a single scalar per expert is too lossy.
     # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
     # (or feed 2D scale through a future kernel variant) before re-enabling.
-    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+    if os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1":
         esimd_out = _maybe_esimd_moe_silu_fused(
             dispatch_output, quant_info, runner_config
         )
@@ -511,7 +511,7 @@ def fused_experts_none_to_triton(
 
     # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
     # be enabled independently of the decode kernel.
-    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
+    if os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1":
         esimd_out = _maybe_esimd_moe_silu_prefill(
             dispatch_output, quant_info, runner_config
         )
