@@ -2542,6 +2542,15 @@ class Scheduler(
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
         res = min(res, self.req_to_token_pool.available_size())
+        # Hybrid GDN/Mamba models keep a SEPARATE mamba state pool that is
+        # typically much smaller than the req-slot pool (especially with
+        # --max-mamba-cache-size or a low mem-fraction). Admission must also be
+        # bounded by mamba availability; otherwise a multi-seq prefill batch is
+        # admitted past the mamba pool size and HybridReqToTokenPool.alloc
+        # over-indexes the size-N mamba pool → GPU index OOB → SIGABRT.
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            res = min(res, mamba_allocator.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

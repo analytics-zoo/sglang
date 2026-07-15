@@ -41,7 +41,7 @@ def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
         return cache[fp8_variant]
     op = None
     try:
-        from custom_esimd_kernels import custom_esimd_kernels_moe_batch as _moe_mod
+        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
         if fp8_variant == "e5m2":
             op = _moe_mod.moe_forward_full_silu_routed_e5m2
         else:
@@ -364,6 +364,127 @@ def _maybe_esimd_moe_silu_fused(
     return out
 
 
+def _load_esimd_moe_prefill_op():
+    """Lazy-load the M-tiled FP8 MoE prefill op (moe_prefill_full_fp8)."""
+    cache = getattr(_load_esimd_moe_prefill_op, "_cached", "unset")
+    if cache != "unset":
+        return cache
+    op = None
+    try:
+        from custom_esimd_kernels_sglang import moe_fp8_prefill_ops  # noqa: F401
+
+        op = torch.ops.moe_fp8_prefill_ops.moe_prefill_full_fp8
+    except Exception:
+        op = None
+    _load_esimd_moe_prefill_op._cached = op
+    return op
+
+
+def _maybe_esimd_moe_silu_prefill(
+    dispatch_output,
+    quant_info,
+    runner_config,
+):
+    """Large-T (prefill) fast path: M-tiled DPAS FP8 MoE GEMM kernel.
+
+    The decode kernel (_maybe_esimd_moe_silu_fused) is DPAS M=1 and gated to
+    T<=8; for prefill (T up to chunked_prefill_size) it would be GEMV-bound.
+    This path routes prefill batches to moe_prefill_full_fp8, which sorts tokens
+    by expert and runs a real M-tiled (MAX_M=32) DPAS GEMM. Online-fp8 weights
+    carry a per-expert per-tensor scale (w13_scale=[E,2], w2_scale=[E]); we
+    collapse w13's two scales to a per-expert mean (minor vs the block-collapse
+    that breaks block-quant checkpoints — verified numerically cos=1.0).
+
+    Returns the MoE output [T, hidden] on success, or None to fall back.
+    """
+    if not quant_info.use_fp8_w8a8:
+        return None
+    h = dispatch_output.hidden_states
+    if h.device.type != "xpu":
+        return None
+    w13 = quant_info.w13_weight
+    w2 = quant_info.w2_weight
+    _fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if w13.dtype not in _fp8_dtypes or w2.dtype not in _fp8_dtypes:
+        return None
+    if w13.dtype != w2.dtype:
+        return None
+    if getattr(runner_config, "activation", "silu") != "silu":
+        return None
+    if getattr(runner_config, "gemm1_alpha", None) is not None:
+        return None
+    if getattr(runner_config, "gemm1_clamp_limit", None) is not None:
+        return None
+    if getattr(runner_config, "swiglu_limit", None) is not None:
+        return None
+    if quant_info.b13 is not None or quant_info.b2 is not None:
+        return None
+    if quant_info.w13_scale is None or quant_info.w2_scale is None:
+        return None
+    # Only block_shape==None (online per-expert per-tensor) is supported by the
+    # per-expert scalar kernel; block-quant checkpoints need a block-scale kernel.
+    if getattr(quant_info, "block_shape", None) is not None:
+        return None
+    op = _load_esimd_moe_prefill_op()
+    if op is None:
+        return None
+
+    # The prefill kernel keeps gate/up scales SEPARATE (g_acc*=s_gate,
+    # u_acc*=s_up): online fp8 w13_scale is [E,2] (gate=w1, up=w3) and
+    # averaging the two to one scalar is too lossy (gsm8k garbage). Pass the
+    # [E,2] tensor straight through; w2_scale is [E].
+    # Online fp8 here uses requantize_with_max_scale, so w1 and w3 are
+    # requantized to a SINGLE common per-expert scale: w13_scale is [E] meaning
+    # the same scale for gate and up. Accept [E] (expand to [E,2], exact) and
+    # [E,2] (separate). w2_scale is [E] scalar.
+    def _f32c(scale, want_2d):
+        key = "_esimd_prefill_w13" if want_2d else "_esimd_prefill_w2"
+        cached = getattr(scale, key, None)
+        if cached is not None:
+            return cached
+        s = scale.to(torch.float32).reshape(scale.shape[0], -1)
+        if want_2d:
+            if s.shape[1] == 1:
+                s = s.expand(s.shape[0], 2)  # [E] -> [E,2], gate==up (max-scale requant)
+            elif s.shape[1] != 2:
+                return None
+        else:
+            s = s.mean(dim=-1)  # [E]
+        s = s.contiguous()
+        try:
+            setattr(scale, key, s)
+        except Exception:
+            pass
+        return s
+
+    s13 = _f32c(quant_info.w13_scale, want_2d=True)
+    s2 = _f32c(quant_info.w2_scale, want_2d=False)
+    if s13 is None or s2 is None:
+        return None
+    # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
+    # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
+    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
+    # off until the shared expert contribution is added. Kept wired + scale-fixed
+    # for when that lands.
+
+    topk_weights, topk_ids, _ = dispatch_output.topk_output
+    if topk_weights.dtype != torch.float16:
+        topk_weights = topk_weights.to(torch.float16)
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+    orig_dtype = h.dtype
+    x_in = h if h.dtype == torch.float16 else h.to(torch.float16)
+    top_k = topk_ids.shape[-1]
+    n_routed = w13.shape[0]
+    try:
+        out = op(x_in, topk_weights, topk_ids, w13, s13, w2, s2, top_k, n_routed)
+    except Exception:
+        return None
+    if out.dtype != orig_dtype:
+        out = out.to(orig_dtype)
+    return out
+
+
 @register_fused_func("none", "triton")
 def fused_experts_none_to_triton(
     dispatch_output: StandardDispatchOutput,
@@ -383,6 +504,15 @@ def fused_experts_none_to_triton(
     # (or feed 2D scale through a future kernel variant) before re-enabling.
     if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
         esimd_out = _maybe_esimd_moe_silu_fused(
+            dispatch_output, quant_info, runner_config
+        )
+        if esimd_out is not None:
+            return StandardCombineInput(hidden_states=esimd_out)
+
+    # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
+    # be enabled independently of the decode kernel.
+    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
+        esimd_out = _maybe_esimd_moe_silu_prefill(
             dispatch_output, quant_info, runner_config
         )
         if esimd_out is not None:

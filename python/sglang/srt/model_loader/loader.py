@@ -115,6 +115,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_npu,
     is_pin_memory_available,
+    is_xpu,
     rank0_log,
     set_weight_attrs,
 )
@@ -125,6 +126,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 # ModelOpt: QUANT_CFG_CHOICES is imported from modelopt_utils.py
 # which contains the complete mapping of quantization config choices
 
@@ -972,6 +974,15 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
                 if processed % 8 == 0:
                     gc.collect()
                     current_platform.empty_cache()
+
+        # Some modules cache views/aliases of a weight's storage at build time
+        # (e.g. a GDN block's conv_weights view of conv1d.weight). Swapping
+        # ``.data`` to a device tensor above leaves those aliases pointing at the
+        # freed CPU storage. Let any module repair them via an opt-in hook.
+        for module in model.modules():
+            rebind = getattr(module, "rebind_device_views", None)
+            if callable(rebind):
+                rebind()
 
         gc.collect()
         current_platform.empty_cache()
@@ -2213,11 +2224,25 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "command-r"
         elif model_type == "qwen3_moe":
             model_type = "qwen3moe"
+        elif model_type in ("qwen3_5", "qwen3_5_text"):
+            model_type = "qwen35"
+        elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
+            model_type = "qwen35moe"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
                 arch = key
                 break
+
+        # XPU/qwen35 GGUF: transformers can't build a meta model for the
+        # qwen3_5 arch (multimodal config rejects the GGUF "qwen35" arch), so
+        # bypass the dummy-model name enumeration with an explicit name map.
+        if _is_xpu and model_type in ("qwen35", "qwen35moe"):
+            archs = getattr(config, "architectures", None) or []
+            if "Qwen3_5ForCausalLMMTP" in archs:
+                return self._get_gguf_weights_map_xpu_qwen35_mtp(config, gguf, arch)
+            return self._get_gguf_weights_map_xpu_qwen35(config, gguf, arch)
+
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
         num_layers = config.num_hidden_layers
@@ -2231,6 +2256,206 @@ class GGUFModelLoader(BaseModelLoader):
             name, suffix = hf_name.rsplit(".", 1)
             gguf_name = name_map.get_name(name)
             gguf_to_hf_name_map[f"{gguf_name}.{suffix}"] = hf_name
+        return gguf_to_hf_name_map
+
+
+    def _get_gguf_weights_map_xpu_qwen35(self, config, gguf, arch):
+        """XPU/qwen35 GGUF name-map bypass.
+
+        The upstream path builds a transformers meta model from ``config`` to
+        enumerate HF param names, then maps them to GGUF names. That fails for
+        qwen35 under transformers 5.5.4: the multimodal config can't be built on
+        meta (token-id / layer_types attrs the sglang config doesn't expose) and
+        the GGUF arch "qwen35" is rejected outright.
+
+        Instead we take the HF param names straight from the model's
+        ``model.safetensors.index.json`` (the ground truth of the namespace
+        ``Qwen3_5ForConditionalGeneration.load_weights`` consumes), restricted to
+        the ``model.language_model.*`` language tower (the text GGUF has no visual
+        / mtp tensors). Each HF name is mapped FORWARD via gguf's
+        ``TensorNameMap(QWEN35).get_name`` — deterministic for a single HF name,
+        unlike the ambiguous reverse direction — with one patch for the GDN
+        tensors gguf's map omits (``linear_attn.dt_bias`` -> ``ssm_dt.bias``;
+        ``A_log`` is already handled by the lib).
+
+        Validated against the real GGUF file: 426/426 tensors covered, zero
+        dropped, zero unfilled; and every mapping matches the real qwen3.5
+        ``linear_attn.*`` / ``self_attn.*`` naming.
+        """
+        import glob
+        import json
+
+        mm_prefix = "model.language_model."
+        text_config = getattr(config, "text_config", config)
+        num_layers = text_config.num_hidden_layers
+        name_map = gguf.get_tensor_name_map(arch, num_layers)
+
+        hf_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if not hf_dir:
+            raise RuntimeError(
+                "XPU qwen35 GGUF requires SGLANG_GGUF_HF_CONFIG_DIR to point at "
+                "the sibling HF checkpoint dir (for config + safetensors index)."
+            )
+
+        # HF param names = keys of the safetensors index (language tower only).
+        index_path = os.path.join(hf_dir, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                hf_names = list(json.load(f)["weight_map"].keys())
+        else:
+            # single-shard checkpoint: read keys directly from the .safetensors
+            from safetensors import safe_open
+
+            st_files = glob.glob(os.path.join(hf_dir, "*.safetensors"))
+            if not st_files:
+                raise RuntimeError(
+                    f"No safetensors index or shard found in {hf_dir} to derive "
+                    "GGUF HF param names from."
+                )
+            hf_names = []
+            for sf in st_files:
+                with safe_open(sf, framework="pt") as fh:
+                    hf_names.extend(fh.keys())
+        # Keep the language tower plus the top-level untied lm_head (the 35B-MoE
+        # has tie_word_embeddings=False, so `lm_head.*` lives outside the
+        # `model.language_model.` prefix and maps to the gguf `output` tensor).
+        hf_names = [
+            n for n in hf_names
+            if n.startswith(mm_prefix) or n.startswith("lm_head.")
+        ]
+
+        def gdn_patch(text_name):
+            # The GDN A_log / dt_bias params have no '.weight' suffix, so the
+            # split-on-last-dot below mis-bases them; gguf's QWEN35 map also
+            # omits ssm_dt entirely. Map both explicitly.
+            #   linear_attn.A_log    -> blk.N.ssm_a
+            #   linear_attn.dt_bias  -> blk.N.ssm_dt.bias
+            # (in_proj_a<->ssm_alpha and in_proj_b<->ssm_beta are correct as the
+            # gguf TensorNameMap provides them — verified perm(ssm_alpha)==in_proj_a.)
+            mobj = re.match(
+                r"model\.layers\.(\d+)\.linear_attn\.(A_log|dt_bias)$", text_name
+            )
+            if not mobj:
+                return None
+            bid, which = mobj.group(1), mobj.group(2)
+            return f"blk.{bid}.ssm_a" if which == "A_log" else f"blk.{bid}.ssm_dt.bias"
+
+        gguf_to_hf_name_map = {}
+        for mm_name in hf_names:
+            # The reference HF checkpoint may be pre-quantized (e.g. the sym_int4
+            # dir used as the 35B config/tokenizer source), so its param names end
+            # in `.qweight` / `.weight_scale` / `.input_scale`. A GGUF file always
+            # stores the weight tensor as `<name>.weight` (the quant type is
+            # separate metadata) and has NO standalone scale tensor. Normalize the
+            # HF name to its `.weight` form so both the GGUF map KEY (real gguf
+            # tensor name) and the VALUE (load target — the gguf weight iterator
+            # does name.replace("weight","qweight") downstream for quant types)
+            # are consistent; drop scale-only entries (gguf has none).
+            if mm_name.endswith((".weight_scale", ".weight_scale_inv", ".input_scale")):
+                continue
+            if mm_name.endswith(".qweight"):
+                mm_name = mm_name[: -len(".qweight")] + ".weight"
+            # Top-level untied lm_head (outside the language_model prefix) ->
+            # gguf `output`. Query the TensorNameMap with the bare name.
+            if mm_name.startswith("lm_head."):
+                text_name = mm_name
+            else:
+                # strip the multimodal 'language_model.' segment to query the
+                # text-level TensorNameMap, but keep mm_name as the load target.
+                text_name = "model." + mm_name[len(mm_prefix) :]
+            # GDN bias/A_log first (no .weight suffix; rpartition would mis-base).
+            gguf_full = gdn_patch(text_name)
+            if gguf_full is None:
+                base, _, suffix = text_name.rpartition(".")
+                gguf_name = name_map.get_name(base)
+                if gguf_name is None:
+                    continue
+                gguf_full = f"{gguf_name}.{suffix}"
+            gguf_to_hf_name_map[gguf_full] = mm_name
+        return gguf_to_hf_name_map
+
+    def _get_gguf_weights_map_xpu_qwen35_mtp(self, config, gguf, arch):
+        """XPU/qwen35 GGUF name-map for the MTP (NextN) DRAFT model.
+
+        The GGUF stores the MTP layer as ``blk.<L>.*`` where ``L`` =
+        ``num_hidden_layers`` (e.g. 40 for the 35B-A3B). The draft model class
+        ``Qwen3_5ForCausalLMMTP`` wraps a single Qwen3_5ForCausalLM layer (index
+        0) and exposes its params under an ``mtp.`` prefix; its ``load_weights``
+        strips that prefix (``mtp.fc``->``fc``, ``mtp.pre_fc``->``pre_fc``,
+        ``mtp.model.layers.0.self_attn``->``model.layers.0`` ...). So we map the
+        GGUF ``blk.<L>.*`` tensors FORWARD into exactly those ``mtp.``-prefixed
+        HF names — the model class is unchanged. Routed-expert tensors
+        (``blk.<L>.ffn_{gate,up,down}_exps``) are handled by the weight iterator
+        (it regexes the gguf name); we pass the MTP rebase there separately, so
+        they are intentionally NOT in this map. See notes/qwen35_gguf_mtp_gap.md.
+
+        Returns the gguf->hf map for the NON-expert MTP tensors only.
+        """
+        text_config = getattr(config, "text_config", config)
+        # At map-build time the draft config still carries the FULL layer count
+        # (qwen3_5_mtp.py forces num_hidden_layers=1 only later, in __init__).
+        mtp_src_layer = text_config.num_hidden_layers  # e.g. 40
+        # name_map range must include the MTP layer index.
+        name_map = gguf.get_tensor_name_map(arch, mtp_src_layer + 1)
+
+        src = f"blk.{mtp_src_layer}."
+        # Target names are what Qwen3_5ForCausalLMMTP.load_weights CONSUMES; that
+        # method does `mtp.`->`model.` (then `model.fc`->`fc`, `model.pre_fc`->
+        # `pre_fc`) and strips `.self_attn`, then runs the stacked/expert
+        # mappings. So we emit `mtp.<...>` names that, AFTER that transform, hit
+        # the real params_dict keys (verified against a real build's 26 keys):
+        #   mtp.fc.weight                  -> fc.weight            (bare nn.Linear)
+        #   mtp.pre_fc_norm_*              -> pre_fc_norm_*
+        #   mtp.norm.weight                -> model.norm.weight    (wrapped final norm)
+        #   mtp.layers.0.self_attn.q_proj  -> model.layers.0.qkv_proj (stacked)
+        #   mtp.layers.0.mlp.shared_expert.gate_proj -> ...gate_up_proj (stacked)
+        # NOTE: `mtp.layers.0` (NOT `mtp.model.layers.0`) — the `mtp.`->`model.`
+        # transform supplies the `model.` prefix; a double `model.` misses.
+        #
+        # 4 MTP-specific tensors gguf's TensorNameMap has no entry for. eh_proj is
+        # Q8_0 in the GGUF but `self.fc` is a BARE nn.Linear (no qweight param), so
+        # it must arrive as a dequantized `mtp.fc.weight` — the iterator dequants
+        # it (see gguf_quant_weights_iterator mtp_dequant_fc). The map records the
+        # target name; dequant happens in the iterator.
+        explicit = {
+            f"{src}nextn.eh_proj.weight": "mtp.fc.weight",
+            f"{src}nextn.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
+            f"{src}nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
+            f"{src}nextn.shared_head_norm.weight": "mtp.norm.weight",
+        }
+        gguf_to_hf_name_map = dict(explicit)
+
+        # Non-expert layer tensors: query gguf's forward map with the MTP layer's
+        # HF names (layer index = mtp_src_layer), then retarget to the rebased
+        # `mtp.layers.0.*` namespace. The MTP layer is an ATTENTION layer
+        # (full_attention_interval=1), so it uses self_attn.* (not linear_attn).
+        hf_layer_names = [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+            "mlp.gate.weight",
+            "mlp.shared_expert.gate_proj.weight",
+            "mlp.shared_expert.up_proj.weight",
+            "mlp.shared_expert.down_proj.weight",
+            "mlp.shared_expert_gate.weight",
+        ]
+        for leaf in hf_layer_names:
+            # query name = the MTP layer's HF name at the real source index
+            query = f"model.layers.{mtp_src_layer}.{leaf}"
+            base, _, suffix = query.rpartition(".")
+            gguf_name = name_map.get_name(base)
+            if gguf_name is None:
+                # not all leaves exist on every arch; skip silently
+                continue
+            gguf_full = f"{gguf_name}.{suffix}"
+            # load target = rebased to layer 0 under the mtp. namespace (the
+            # load_weights `mtp.`->`model.` transform adds the `model.` prefix).
+            gguf_to_hf_name_map[gguf_full] = f"mtp.layers.0.{leaf}"
         return gguf_to_hf_name_map
 
     def _get_weights_iterator(

@@ -533,7 +533,14 @@ class MambaAttnBackendBase(AttentionBackend):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = -1
+        # Padding reqs point at mamba slot 0, which MambaSlotAllocator reserves
+        # as a dummy write target (free_slots start at 1, so 0 is never given to
+        # a real req). The triton GDN kernels treat -1 as a skip sentinel, but
+        # the XPU ESIMD GDN kernels (gdn_conv_fused_seq etc.) index the state
+        # pool by this value with no negative guard, so -1 → conv_state[-1] →
+        # GPU index OOB → SIGABRT on every batch>1 graph replay. Slot 0 is a
+        # valid, harmless address for both paths (padding output is discarded).
+        mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:

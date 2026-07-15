@@ -132,9 +132,7 @@ def _load_esimd_moe_silu_op():
         return _ESIMD_MOE_OP
     _ESIMD_MOE_OP_LOADED = True
     try:
-        from custom_esimd_kernels import (
-            custom_esimd_kernels_moe_batch as _moe_mod,
-        )
+        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
         _ESIMD_MOE_OP = _moe_mod.moe_forward_full_silu_routed
     except Exception:
         _ESIMD_MOE_OP = None
