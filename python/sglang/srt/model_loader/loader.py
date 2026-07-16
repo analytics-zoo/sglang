@@ -960,7 +960,7 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
                     _skip_modules.add(id(mod))
 
         processed = 0
-        for module in model.modules():
+        for module_name, module in model.named_modules():
             if id(module) in _skip_modules:
                 continue
             # Move this module's own params/buffers onto the device (recurse=False
@@ -974,6 +974,12 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
                 if processed % 8 == 0:
                     gc.collect()
                     current_platform.empty_cache()
+                if processed % 32 == 0:
+                    logger.info(
+                        "layered_fp8 processed %d modules; latest=%s",
+                        processed,
+                        module_name,
+                    )
 
         # Some modules cache views/aliases of a weight's storage at build time
         # (e.g. a GDN block's conv_weights view of conv1d.weight). Swapping
@@ -986,6 +992,15 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
 
         gc.collect()
         current_platform.empty_cache()
+
+        validate_online_fp8_weights = getattr(
+            model, "validate_online_fp8_weights", None
+        )
+        if (
+            getattr(model, "quant_config", None) is not None
+            and callable(validate_online_fp8_weights)
+        ):
+            validate_online_fp8_weights()
 
 
 class QuantizedRLModelLoader(DefaultModelLoader):

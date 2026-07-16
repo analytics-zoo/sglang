@@ -243,6 +243,17 @@ class TestToolCallParserDetection(unittest.TestCase):
         tcp = detect_tool_call_parser(template, tok, config, force)
         return rp, tcp
 
+    def test_onyx_tool_template_detects_onyx_parser(self):
+        template = (
+            "<|start|>assistant "
+            "send your assistant message to the function name as recipient"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(
+            template, _DummyTokenizer([]), config, force
+        )
+        self.assertEqual(result, "onyx")
+
     def test_qwen3_detects_qwen_tool_call_parser(self):
         rp, tcp = self._detect_all("Qwen/Qwen3-0.6B")
         self.assertEqual(rp, "qwen3")

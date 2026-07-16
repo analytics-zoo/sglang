@@ -153,15 +153,21 @@ def _set_kv_buffer_impl(
         and row_dim % 32 == 0
         and k.numel() > 0
     ):
-        idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
-        _esimd_kv_scatter(
-            k.reshape(-1, row_dim),
-            v.reshape(-1, row_dim),
-            k_cache.view(-1, row_dim),
-            v_cache.view(-1, row_dim),
-            idx,
-        )
-        return
+        k_2d = k.reshape(-1, row_dim)
+        v_2d = v.reshape(-1, row_dim)
+        # The ESIMD kernel derives source row addresses from row_dim and does
+        # not consume tensor strides. Packed-QKV slices can have a larger
+        # token stride even after reshape, so use the native scatter for them.
+        if k_2d.is_contiguous() and v_2d.is_contiguous():
+            idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+            _esimd_kv_scatter(
+                k_2d,
+                v_2d,
+                k_cache.view(-1, row_dim),
+                v_cache.view(-1, row_dim),
+                idx,
+            )
+            return
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 

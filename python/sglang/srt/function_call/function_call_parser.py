@@ -33,6 +33,7 @@ from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.onyx_detector import OnyxDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -87,6 +88,7 @@ class FunctionCallParser:
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gemma4": Gemma4Detector,
+        "onyx": OnyxDetector,
     }
 
     def __init__(self, tools: List[Tool], tool_call_parser: str):

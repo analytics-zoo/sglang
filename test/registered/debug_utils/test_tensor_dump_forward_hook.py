@@ -67,6 +67,26 @@ class MockCausalLM(nn.Module):
         return self.model(hidden_states)
 
 
+class KeywordBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 4, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, *, scale: torch.Tensor):
+        return self.proj(hidden_states) * scale
+
+
+class AllIOMockCausalLM(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = KeywordBlock()
+        self.lm_head = nn.Linear(4, 8, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, *, scale: torch.Tensor):
+        hidden_states = self.model(hidden_states, scale=scale)
+        return self.lm_head(hidden_states)
+
+
 def init_weights(module):
     if isinstance(module, LinearBase):
         torch.nn.init.uniform_(module.weight)
@@ -102,6 +122,55 @@ def test_model_forward_dump(tmp_path):
     assert torch.allclose(
         data["model.mlp.down_proj"], result.cpu(), rtol=1e-5, atol=1e-5
     )
+
+
+def test_model_all_io_dump(tmp_path):
+    model = AllIOMockCausalLM()
+    dumper = register_forward_hook_for_model(
+        model,
+        tmp_path / "all_io_dump",
+        dump_layers=None,
+        tp_size=1,
+        tp_rank=0,
+        pp_rank=0,
+        mode="all_io",
+    )
+
+    hidden_states = torch.randn(2, 4)
+    scale = torch.tensor(2.0)
+    # ModelRunner calls the root forward method directly rather than nn.Module.__call__.
+    result = model.forward(hidden_states, scale=scale)
+    data = torch.load(f"{dumper.get_dump_dir()}/Pass00000.pt", weights_only=False)
+
+    assert torch.equal(data["__root__.input.args.0"], hidden_states)
+    assert torch.equal(data["model.input.kwargs.scale"], scale)
+    assert torch.equal(data["__root__.output"], result)
+
+    keys = list(data)
+    assert keys.index("model.input.args.0") < keys.index("model.proj.input.args.0")
+    assert keys.index("model.proj.output") < keys.index("model.output")
+    assert keys.index("lm_head.output") < keys.index("__root__.output")
+
+
+def test_model_all_io_dump_last_token_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("TENSOR_DUMP_LAST_TOKEN_ONLY", "1")
+    model = AllIOMockCausalLM()
+    dumper = register_forward_hook_for_model(
+        model,
+        tmp_path / "last_token_dump",
+        dump_layers=None,
+        tp_size=1,
+        tp_rank=0,
+        pp_rank=0,
+        mode="all_io",
+    )
+
+    hidden_states = torch.randn(3, 4)
+    result = model.forward(hidden_states, scale=torch.tensor(2.0))
+    data = torch.load(f"{dumper.get_dump_dir()}/Pass00000.pt", weights_only=False)
+
+    assert torch.equal(data["__root__.input.args.0"], hidden_states[-1:])
+    assert torch.equal(data["__root__.output"], result[-1:])
 
 
 if __name__ == "__main__":

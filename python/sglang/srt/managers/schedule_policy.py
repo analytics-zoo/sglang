@@ -563,7 +563,10 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(
-        self, extend_input_len: int, swa_host_hit_length: int = 0
+        self,
+        extend_input_len: int,
+        swa_prefix_len: int = 0,
+        swa_host_hit_length: int = 0,
     ) -> int:
         """SWA pool budget per request. Only valid when is_hybrid_swa is True.
 
@@ -579,7 +582,10 @@ class PrefillAdder:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
             alloc = extend_input_len
-        budget = max(alloc, self.tree_cache.sliding_window_size) + self.page_size
+        uncovered_window = max(
+            self.tree_cache.sliding_window_size - swa_prefix_len, 0
+        )
+        budget = max(alloc, uncovered_window) + self.page_size
         if swa_host_hit_length > 0:
             budget += self.ceil_paged_tokens(swa_host_hit_length)
         return budget
@@ -623,7 +629,9 @@ class PrefillAdder:
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
-            self.rem_swa_token_offset += self._swa_budget_for_req(extend_input_len)
+            self.rem_swa_token_offset += self._swa_budget_for_req(
+                extend_input_len, swa_prefix_len=prefix_len
+            )
 
         if self.dllm_config is not None:
             self.rem_dllm_tokens -= extend_input_len
@@ -759,7 +767,13 @@ class PrefillAdder:
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
-            if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:
+            if (
+                self._swa_budget_for_req(
+                    req.extend_input_len,
+                    swa_prefix_len=len(req.prefix_indices),
+                )
+                > self.rem_swa_tokens
+            ):
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
@@ -901,7 +915,9 @@ class PrefillAdder:
 
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
-                req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                req.extend_input_len,
+                swa_prefix_len=prefix_len,
+                swa_host_hit_length=req.swa_host_hit_length,
             )
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
@@ -923,7 +939,9 @@ class PrefillAdder:
 
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
-                    req.extend_input_len, swa_host_hit_length=req.swa_host_hit_length
+                    req.extend_input_len,
+                    swa_prefix_len=prefix_len,
+                    swa_host_hit_length=req.swa_host_hit_length,
                 )
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN

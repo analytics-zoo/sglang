@@ -79,35 +79,71 @@ if _is_xpu:
     )
 
 # opt#2 (W8A16): XPU prefill keeps the activation in fp16 (NO activation quant) and runs
-# a mixed f16 x f8 oneDNN matmul (fp8_gemm_w8a16, ported from analytics-zoo/vllm-xpu-kernels
-# and built standalone as mini_fp8_C). This drops the ENTIRE activation quant + dequant chain
+# a mixed f16 x f8 oneDNN matmul from custom_esimd_kernels_sglang. This drops the
+# ENTIRE activation quant + dequant chain
 # (vs opt#1's per-tensor quant + fused _scaled_mm epilogue) AND dispatches to a faster oneDNN
 # GEMM primitive (in-server 1.87x faster GEMM than torch._scaled_mm). Server A/B: gsm8k 0.975
 # (neutral), TTFT -32..37% vs opt#1, HITS the 4k=1500 / 8k=3500 targets. Decode (M<=64) still
 # early-returns via the ESIMD fast path (weight-only fp8, unaffected). This SUPERSEDES opt#1 and
 # is the DEFAULT XPU prefill path; it takes priority over opt#1 when both are on (checked first
-# in apply_fp8_linear). Falls back gracefully to opt#1 if mini_fp8_C.so is missing. Set
+# in apply_fp8_linear). Falls back gracefully to opt#1 if the packaged op is missing. Set
 # SGLANG_XPU_FP8_W8A16_PREFILL=0 to disable and revert to opt#1.
 _XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
     "SGLANG_XPU_FP8_W8A16_PREFILL", "true"
 )
+_XPU_FP8_STRICT_DISPATCH = _is_xpu and get_bool_env_var(
+    "SGLANG_XPU_FP8_STRICT_DISPATCH", "false"
+)
 _fp8_gemm_w8a16 = None
+_xpu_fp8_dispatch_logged = set()
 if _is_xpu and _XPU_FP8_W8A16_PREFILL:
     try:
-        import glob as _glob
-
-        _cands = _glob.glob(
-            "/llm/workspace/sgl_gemma/fp8gemm_bench/mini_fp8_C*.so"
+        from custom_esimd_kernels_sglang import (
+            onednn_fp8_gemm_w8a16 as _fp8_gemm_w8a16,
         )
-        if _cands:
-            torch.ops.load_library(_cands[0])
-            _fp8_gemm_w8a16 = torch.ops.mini_fp8.fp8_gemm_w8a16
-            logger.info("[opt#2] XPU FP8 W8A16 prefill = ON (mini_fp8_C loaded)")
-        else:
-            logger.warning("[opt#2] W8A16 requested but mini_fp8_C.so not found")
+        logger.info(
+            "[opt#2] XPU FP8 W8A16 prefill = ON "
+            "(custom_esimd_kernels_sglang packaged op)"
+        )
     except Exception as _e:
-        logger.warning("[opt#2] W8A16 load failed, falling back to opt#1: %s", _e)
         _fp8_gemm_w8a16 = None
+        message = (
+            "[opt#2] packaged W8A16 load failed, falling back to opt#1: "
+            f"{_e}"
+        )
+        if _XPU_FP8_STRICT_DISPATCH:
+            raise RuntimeError(message) from _e
+        logger.warning(message)
+
+
+def _xpu_fp8_esimd_shape_qualified(m: int, k: int, n: int) -> bool:
+    # Onyx shapes whose ESIMD path loses to the fallback in matched benchmarks.
+    if (k, n) == (9984, 6656):
+        return m == 1
+    if (k, n) == (6656, 19968):
+        return m <= 32
+    return True
+
+
+def _xpu_fp8_w8a16_shape_qualified(m: int, k: int, n: int) -> bool:
+    # Onyx output-gate W8A16 only pulls ahead once the token batch reaches 256.
+    return (k, n) != (6656, 2048) or m >= 256
+
+
+def _log_xpu_fp8_dispatch_once(path: str, m: int, k: int, n: int) -> None:
+    if not _XPU_FP8_STRICT_DISPATCH:
+        return
+    key = (path, m, k, n)
+    if key not in _xpu_fp8_dispatch_logged:
+        _xpu_fp8_dispatch_logged.add(key)
+        logger.info(
+            "Strict XPU FP8 dispatch selected %s for M=%d K=%d N=%d",
+            path,
+            m,
+            k,
+            n,
+        )
+
 
 # Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 # esimd_gemm_fp8_pert kernel wrapper.
@@ -118,8 +154,12 @@ if _is_xpu:
         from custom_esimd_kernels_sglang import (
             esimd_gemm_fp8_pert as _esimd_gemm_fp8_pert,
         )
-    except Exception:
+    except Exception as _e:
         _esimd_gemm_fp8_pert = None
+        message = f"XPU FP8 ESIMD small-M op is unavailable: {_e}"
+        if _XPU_FP8_STRICT_DISPATCH:
+            raise RuntimeError(message) from _e
+        logger.warning(message)
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
@@ -1658,14 +1698,16 @@ def apply_fp8_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[1]]
+    m, k, n = input_2d.shape[0], input_2d.shape[1], weight.shape[1]
+    esimd_shape_qualified = _xpu_fp8_esimd_shape_qualified(m, k, n)
+    w8a16_shape_qualified = _xpu_fp8_w8a16_shape_qualified(m, k, n)
 
     # XPU fast path (early exit): per-tensor weight scale → custom ESIMD kernel.
     # Bypass per_token_group_quant_fp8 entirely (saves ~32us per call) — our
     # kernel takes raw fp16 input, dequantises the fp8 weight inside, and
     # multiplies by the fp32 weight scale in the epilogue.
-    # Restricted to small M (M<=64) since the kernel's M>=64 weight-stationary
-    # path is much slower than torch._scaled_mm (verified: 14000us vs 156us at
-    # M=4096). Triggered for decode (M=1) and small chunked-prefill batches.
+    # Restricted to small M and shape ranges that beat the fallback in matched
+    # benchmarks. Triggered for decode and qualified small chunked-prefill batches.
     if (
         _is_xpu
         and _esimd_gemm_fp8_pert is not None
@@ -1673,7 +1715,8 @@ def apply_fp8_linear(
         and not (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
         and (weight_scale.numel() == 1)
         and bias is None
-        and input_2d.shape[0] <= 64
+        and m <= 64
+        and esimd_shape_qualified
     ):
         weight_nk = getattr(weight, "_esimd_t", None)
         if weight_nk is None:
@@ -1697,25 +1740,67 @@ def apply_fp8_linear(
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
         _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
+        _log_xpu_fp8_dispatch_once("esimd_small_m", m, k, n)
         return output.to(input.dtype).view(*output_shape)
 
+    if (
+        _XPU_FP8_STRICT_DISPATCH
+        and _is_xpu
+        and not compressed_tensor_quant
+        and weight_scale.numel() == 1
+        and bias is None
+        and m <= 64
+        and esimd_shape_qualified
+    ):
+        raise RuntimeError(
+            "Strict XPU FP8 dispatch requires the ESIMD small-M path for "
+            f"M={input_2d.shape[0]}, but it is unavailable"
+        )
+
     # opt#2 XPU W8A16 prefill (alternative to opt#1): skip activation quant entirely
-    # and run a mixed f16 x f8 oneDNN matmul. Decode (M<=64) already returned above via
-    # the ESIMD fast path, so this only fires for prefill-shaped M>64, per-tensor weight,
-    # no compressed-tensor. weight is [K, N] fp8 (kernel adapts layout via is_nt).
+    # and run a mixed f16 x f8 oneDNN matmul. This only fires for qualified
+    # prefill-shaped M>64, per-tensor weight, no compressed-tensor. weight is
+    # [K, N] fp8 (kernel adapts layout via is_nt).
     if (
         _is_xpu
         and _fp8_gemm_w8a16 is not None
         and not compressed_tensor_quant
         and weight_scale.numel() == 1
-        and input_2d.shape[0] > 64
+        and m > 64
+        and w8a16_shape_qualified
     ):
         x_fp16 = (
             input_2d if input_2d.dtype == torch.float16
             else input_2d.to(torch.float16)
         )
         output = _fp8_gemm_w8a16(x_fp16, weight, weight_scale, bias)
+        _log_xpu_fp8_dispatch_once("packaged_onednn_w8a16", m, k, n)
         return output.to(input.dtype).view(*output_shape)
+
+    if (
+        _XPU_FP8_STRICT_DISPATCH
+        and _is_xpu
+        and _XPU_FP8_W8A16_PREFILL
+        and not compressed_tensor_quant
+        and weight_scale.numel() == 1
+        and m > 64
+        and w8a16_shape_qualified
+    ):
+        raise RuntimeError(
+            "Strict XPU FP8 dispatch requires the packaged oneDNN W8A16 path "
+            f"for M={input_2d.shape[0]}, but it is unavailable"
+        )
+
+    if (
+        _is_xpu
+        and not compressed_tensor_quant
+        and weight_scale.numel() == 1
+        and (
+            (m <= 64 and not esimd_shape_qualified)
+            or (m > 64 and not w8a16_shape_qualified)
+        )
+    ):
+        _log_xpu_fp8_dispatch_once("qualified_fallback", m, k, n)
 
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__

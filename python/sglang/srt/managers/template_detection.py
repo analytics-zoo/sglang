@@ -179,6 +179,12 @@ def _is_gpt_oss(ctx):
     return ctx.has_text("<|channel|>")
 
 
+def _is_onyx(ctx):
+    return ctx.has_text("function name as recipient") and ctx.has_text(
+        "<|start|>assistant"
+    )
+
+
 def _is_kimi_k2(ctx):
     return ctx.has_vocab("<|tool_calls_section_begin|>")
 
@@ -283,6 +289,7 @@ REASONING_PARSER_RULES = (
 
 TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="apertus2509", value="apertus2509", predicate=_is_apertus2509),
+    DetectionRule(name="onyx", value="onyx", predicate=_is_onyx),
     DetectionRule(name="gemma4", value="gemma4", predicate=_is_gemma4),
     DetectionRule(name="gpt_oss", value="gpt-oss", predicate=_is_gpt_oss),
     DetectionRule(name="kimi_k2", value="kimi_k2", predicate=_is_kimi_k2),
