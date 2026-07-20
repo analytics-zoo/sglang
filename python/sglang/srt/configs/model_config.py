@@ -301,8 +301,12 @@ class ModelConfig:
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
+        self.is_image_understandable_model = enable_multimodal and (
+            hasattr(self.hf_config, "vision_config")
+            or (
+                "OnyxForCausalLM" in self.hf_config.architectures
+                and getattr(self.hf_config, "has_vision", False)
+            )
         )
 
         # Models expose audio_config at different nesting levels:
@@ -1531,6 +1535,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "OnyxForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,

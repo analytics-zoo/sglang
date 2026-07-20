@@ -25,6 +25,7 @@ from __future__ import annotations
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -98,6 +99,9 @@ if _is_xpu:
         from custom_esimd_kernels_sglang import esimd_kv_scatter as _esimd_kv_scatter
     except ImportError:
         pass
+_disable_esimd_kv_scatter = os.getenv(
+    "SGLANG_XPU_DISABLE_ESIMD_KV_SCATTER", "0"
+) == "1"
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -147,6 +151,7 @@ def _set_kv_buffer_impl(
     # back to the naive path if the kernel is unavailable or the shape is unfit.
     if (
         _is_xpu
+        and not _disable_esimd_kv_scatter
         and same_kv_dim
         and _esimd_kv_scatter is not None
         and store_dtype.itemsize == 2
@@ -155,19 +160,15 @@ def _set_kv_buffer_impl(
     ):
         k_2d = k.reshape(-1, row_dim)
         v_2d = v.reshape(-1, row_dim)
-        # The ESIMD kernel derives source row addresses from row_dim and does
-        # not consume tensor strides. Packed-QKV slices can have a larger
-        # token stride even after reshape, so use the native scatter for them.
-        if k_2d.is_contiguous() and v_2d.is_contiguous():
-            idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
-            _esimd_kv_scatter(
-                k_2d,
-                v_2d,
-                k_cache.view(-1, row_dim),
-                v_cache.view(-1, row_dim),
-                idx,
-            )
-            return
+        idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+        _esimd_kv_scatter(
+            k_2d,
+            v_2d,
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            idx,
+        )
+        return
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 

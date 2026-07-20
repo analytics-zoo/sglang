@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.models.onyx import (
     ONYX_QUERY_SCALE_FACTOR,
     OnyxLogitsProcessor,
+    OnyxNormalizedEmbedding,
     OnyxOffsetRMSNorm,
     OnyxRMSNorm,
     OnyxScalelessRMSNorm,
@@ -32,6 +33,7 @@ from sglang.srt.models.onyx import (
     get_onyx_sliding_window,
     onyx_layer_uses_rope,
 )
+from sglang.srt.models.onyx_vision import OnyxVisionEncoder
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -63,6 +65,24 @@ def make_config(num_hidden_layers=8):
 
 
 class TestOnyxArchitectureSemantics(unittest.TestCase):
+    def test_vision_encoder_output_shape_and_dtype(self):
+        config = SimpleNamespace(
+            vision_latent_dim=32,
+            vision_heads=4,
+            vision_mlp_ratio=2.0,
+            vision_patch_temporal=2,
+            vision_patch_size=14,
+            vision_downsample_factor=2,
+            vision_sparse_attention_factor=2,
+            vision_pos_emb_grid_h=4,
+            vision_pos_emb_grid_w=4,
+            vision_layers=3,
+        )
+        encoder = OnyxVisionEncoder(config)
+        output = encoder([torch.randn(3, 56, 56)])
+        self.assertEqual(output.shape, (4, 128))
+        self.assertEqual(output.dtype, torch.bfloat16)
+
     def test_backward_aligned_hybrid_pattern(self):
         config = make_config(num_hidden_layers=10)
         self.assertEqual(
@@ -151,6 +171,28 @@ class TestOnyxArchitectureSemantics(unittest.TestCase):
             F.rms_norm(x, (4,), eps=1e-5),
         )
 
+    def test_multimodal_text_embedding_is_normalized_before_merge(self):
+        embedding = torch.nn.Embedding(3, 4)
+        embedding.weight.data.copy_(
+            torch.tensor(
+                [
+                    [1.0, 2.0, 3.0, 4.0],
+                    [2.0, 4.0, 6.0, 8.0],
+                    [1.0, -1.0, 1.0, -1.0],
+                ]
+            )
+        )
+        norm = torch.nn.RMSNorm(4, eps=1e-5, elementwise_affine=False)
+        normalized_embedding = OnyxNormalizedEmbedding(embedding, norm)
+        output = normalized_embedding(torch.tensor([0, 2]))
+        torch.testing.assert_close(
+            output,
+            F.rms_norm(embedding(torch.tensor([0, 2])), (4,), eps=1e-5),
+        )
+        self.assertEqual(normalized_embedding.num_embeddings, 3)
+        self.assertEqual(normalized_embedding.embedding_dim, 4)
+        self.assertIs(normalized_embedding.weight, embedding.weight)
+
     def test_logits_processor_promotes_lm_head_output_to_fp32(self):
         processor = object.__new__(OnyxLogitsProcessor)
         hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
@@ -198,6 +240,42 @@ class TestOnyxArchitectureSemantics(unittest.TestCase):
             OnyxForCausalLM(config, quant_config=quant_config)
 
         self.assertIsNone(captured["quant_config"])
+
+    def test_weight_reload_invalidates_optimization_caches(self):
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(torch.ones(4))
+        model.weight._esimd_t = torch.ones(4)
+        model.weight._esimd_1d = torch.ones(1)
+        model.layer = torch.nn.Module()
+        model.layer._post_attn_norm_weight = torch.ones(4)
+        model.layer._pre_ffn_norm_weight = torch.ones(4)
+        model.layer._post_ffn_norm_weight = torch.ones(4)
+
+        OnyxForCausalLM._invalidate_optimization_caches(model)
+
+        self.assertFalse(hasattr(model.weight, "_esimd_t"))
+        self.assertFalse(hasattr(model.weight, "_esimd_1d"))
+        self.assertFalse(hasattr(model.layer, "_post_attn_norm_weight"))
+        self.assertFalse(hasattr(model.layer, "_pre_ffn_norm_weight"))
+        self.assertFalse(hasattr(model.layer, "_post_ffn_norm_weight"))
+
+    def test_fp8_validation_ignores_vision_projection_names(self):
+        class FakeFp8LinearMethod:
+            pass
+
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(num_hidden_layers=0)
+        model.model = torch.nn.Module()
+        model.model.embed_tokens = torch.nn.Embedding(1, 1, dtype=torch.float16)
+        model.model.vision_encoder = torch.nn.Module()
+        model.model.vision_encoder.o_proj = torch.nn.Linear(1, 1)
+        model.lm_head = torch.nn.Linear(1, 1, dtype=torch.float16)
+
+        with patch(
+            "sglang.srt.layers.quantization.fp8.Fp8LinearMethod",
+            FakeFp8LinearMethod,
+        ):
+            OnyxForCausalLM.validate_online_fp8_weights(model)
 
     def test_fp8_fast_path_shape_qualification(self):
         self.assertTrue(_xpu_fp8_esimd_shape_qualified(1, 9984, 6656))
@@ -307,6 +385,46 @@ class TestOnyxArchitectureSemantics(unittest.TestCase):
                 "model.layers.0.self_attn.qkv_proj.weight",
                 "model.layers.0.mlp.gate_up_proj.weight",
             },
+        )
+
+    def test_vision_qkv_weights_are_not_remapped_to_text_qkv(self):
+        class LoaderHarness(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = torch.nn.Module()
+                self.model.has_vision = True
+                self.model.start_layer = 0
+                self.model.end_layer = 1
+                self.model.vision_encoder = torch.nn.Module()
+                self.model.vision_encoder.transformer = torch.nn.ModuleList(
+                    [torch.nn.Module()]
+                )
+                block = self.model.vision_encoder.transformer[0]
+                block.attn = torch.nn.Module()
+                block.attn.q_proj = torch.nn.Linear(2, 2, bias=False)
+                self.pp_group = SimpleNamespace(
+                    is_first_rank=True,
+                    is_last_rank=True,
+                )
+
+        harness = LoaderHarness()
+        weight = torch.arange(4, dtype=torch.float32).view(2, 2)
+        loaded = OnyxForCausalLM.load_weights(
+            harness,
+            [
+                (
+                    "model.vision_encoder.transformer.0.attn.q_proj.weight",
+                    weight,
+                )
+            ],
+        )
+        torch.testing.assert_close(
+            harness.model.vision_encoder.transformer[0].attn.q_proj.weight,
+            weight,
+        )
+        self.assertEqual(
+            loaded,
+            {"model.vision_encoder.transformer.0.attn.q_proj.weight"},
         )
 
 

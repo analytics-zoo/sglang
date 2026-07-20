@@ -2,7 +2,8 @@
 
 import logging
 import math
-from typing import Iterable, Optional, Tuple
+import os
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -30,11 +31,44 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, empty_device_cache, make_layers
+from sglang.srt.models.onyx_vision import OnyxVisionAdapter, OnyxVisionEncoder
+from sglang.srt.utils import (
+    add_prefix,
+    empty_device_cache,
+    flatten_nested_list,
+    make_layers,
+)
 
 logger = logging.getLogger(__name__)
+
+_fused_qk_norm_rope = None
+try:
+    from sgl_kernel import fused_qk_norm_rope as _fused_qk_norm_rope
+except ImportError:
+    pass
+
+_esimd_norm_add_norm = None
+_esimd_rmsnorm_residual_scalar = None
+_esimd_gemv_fp8_pert_fused2 = None
+try:
+    from custom_esimd_kernels_sglang import (
+        esimd_gemv_fp8_pert_fused2 as _esimd_gemv_fp8_pert_fused2,
+        esimd_norm_add_norm as _esimd_norm_add_norm,
+        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
+    )
+except ImportError:
+    pass
 
 ONYX_QUERY_SCALE_FACTOR = 43.7840518911
 ONYX_LOGITS_SCALE = 0.19611613513818404
@@ -152,6 +186,27 @@ class OnyxRMSNorm(Gemma4RMSNorm):
 class OnyxScalelessRMSNorm(Gemma4RMSNorm):
     def __init__(self, hidden_size: int, eps: float):
         super().__init__(hidden_size, eps=eps, with_scale=False)
+
+
+class OnyxNormalizedEmbedding:
+    def __init__(self, embedding: nn.Module, norm: nn.Module):
+        self.embedding = embedding
+        self.norm = norm
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.embedding.num_embeddings
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.embedding.embedding_dim
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self.embedding.weight
+
+    def __call__(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.norm(self.embedding(input_ids))
 
 
 class OnyxLogitsProcessor(LogitsProcessor):
@@ -309,28 +364,148 @@ class OnyxAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+    def _init_fused_qk_norm_rope_weights(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cached = getattr(self, "_fused_qk_norm_rope_weights", None)
+        if cached is None or cached[0].dtype != dtype or cached[0].device != device:
+            cached = (
+                torch.full(
+                    (self.head_dim,),
+                    self.query_scale,
+                    dtype=dtype,
+                    device=device,
+                ).contiguous(),
+                torch.ones(self.head_dim, dtype=dtype, device=device).contiguous(),
+            )
+            self._fused_qk_norm_rope_weights = cached
+        return cached
+
+    @staticmethod
+    def _get_esimd_fp8_weight_and_scale(
+        layer: nn.Module,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        weight_nk = getattr(layer.weight, "_esimd_t", None)
+        if weight_nk is None:
+            weight_nk = layer.weight.t().contiguous()
+            layer.weight._esimd_t = weight_nk
+        scale = getattr(layer.weight_scale, "_esimd_1d", None)
+        if scale is None:
+            scale = (
+                layer.weight_scale.to(torch.float32)
+                .reshape(-1)[:1]
+                .contiguous()
+            )
+            layer.weight_scale._esimd_1d = scale
+        return weight_nk, scale
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        use_fused_qkv_gate = (
+            _esimd_gemv_fp8_pert_fused2 is not None
+            and self.output_gate_proj is not None
+            and hidden_states.device.type == "xpu"
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.float16
+            and hidden_states.is_contiguous()
+            and self.qkv_proj.weight.dtype
+            in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            and self.output_gate_proj.weight.dtype == self.qkv_proj.weight.dtype
+            and self.qkv_proj.weight_scale.numel() == 1
+            and self.output_gate_proj.weight_scale.numel() == 1
+            and self.qkv_proj.input_scale is None
+            and self.output_gate_proj.input_scale is None
+            and os.getenv("SGLANG_ONYX_DISABLE_FUSED_QKV_GATE_GEMV", "0") != "1"
+        )
+        if use_fused_qkv_gate:
+            qkv_weight, qkv_scale = self._get_esimd_fp8_weight_and_scale(
+                self.qkv_proj
+            )
+            gate_weight, gate_scale = self._get_esimd_fp8_weight_and_scale(
+                self.output_gate_proj
+            )
+            if not hasattr(self, "_fused_qkv_output"):
+                self._fused_qkv_output = torch.empty(
+                    1,
+                    qkv_weight.shape[0],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                self._fused_gate_output = torch.empty(
+                    1,
+                    gate_weight.shape[0],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+            _esimd_gemv_fp8_pert_fused2(
+                hidden_states,
+                qkv_weight,
+                qkv_scale,
+                self._fused_qkv_output,
+                gate_weight,
+                gate_scale,
+                self._fused_gate_output,
+            )
+            qkv = self._fused_qkv_output
+            output_gate = self._fused_gate_output
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            output_gate = None
+        use_fused_qk_norm_rope = (
+            _fused_qk_norm_rope is not None
+            and self.use_qk_norm
+            and qkv.is_xpu
+            and qkv.dtype == torch.float16
+            and qkv.is_contiguous()
+            and os.environ.get("SGLANG_ONYX_DISABLE_FUSED_QK_NORM_ROPE", "0") != "1"
+        )
+        if use_fused_qk_norm_rope:
+            q_weight, k_weight = self._init_fused_qk_norm_rope_weights(
+                qkv.dtype, qkv.device
+            )
+            positions_i32 = getattr(forward_batch, "_onyx_positions_i32", None)
+            if (
+                positions_i32 is None
+                or getattr(forward_batch, "_onyx_positions_src", None) is not positions
+            ):
+                positions_i32 = positions.to(torch.int32)
+                forward_batch._onyx_positions_i32 = positions_i32
+                forward_batch._onyx_positions_src = positions
+            _fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.eps,
+                q_weight,
+                k_weight,
+                self.config.rope_theta,
+                False,
+                positions_i32,
+                rotary_dim=self.head_dim if self.rotary_emb is not None else 0,
+            )
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        if self.use_qk_norm:
+        if self.use_qk_norm and not use_fused_qk_norm_rope:
             q_shape = q.shape
             k_shape = k.shape
             q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(q_shape)
             k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k_shape)
             q = q * self.query_scale
 
-        if self.rotary_emb is not None:
+        if self.rotary_emb is not None and not use_fused_qk_norm_rope:
             q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
         if self.output_gate_proj is not None:
-            output_gate, _ = self.output_gate_proj(hidden_states)
+            if output_gate is None:
+                output_gate, _ = self.output_gate_proj(hidden_states)
             attn_output = torch.sigmoid(output_gate) * attn_output
         output, _ = self.o_proj(attn_output)
         return output
@@ -365,6 +540,23 @@ class OnyxDecoderLayer(nn.Module):
         post_norm_eps = getattr(config, "post_norm_eps", config.rms_norm_eps)
         self.post_attn_norm = OnyxOffsetRMSNorm(config.hidden_size, eps=post_norm_eps)
         self.post_ffn_norm = OnyxOffsetRMSNorm(config.hidden_size, eps=post_norm_eps)
+        self.disable_residual_norm_fusion = (
+            os.getenv("SGLANG_ONYX_DISABLE_RESIDUAL_NORM_FUSION", "0") == "1"
+        )
+
+    def _can_use_residual_norm_fusion(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> bool:
+        return (
+            not self.disable_residual_norm_fusion
+            and _esimd_norm_add_norm is not None
+            and _esimd_rmsnorm_residual_scalar is not None
+            and hidden_states.device.type == "xpu"
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == torch.float16
+            and hidden_states.is_contiguous()
+            and residual.is_contiguous()
+        )
 
     def forward(
         self,
@@ -379,11 +571,46 @@ class OnyxDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + self.post_attn_norm(hidden_states)
+        use_residual_norm_fusion = self._can_use_residual_norm_fusion(
+            hidden_states, residual
+        )
+        if use_residual_norm_fusion:
+            if not hasattr(self, "_post_attn_norm_weight"):
+                self._post_attn_norm_weight = (
+                    self.post_attn_norm.weight.data.to(torch.float16) + 1.0
+                ).contiguous()
+                self._pre_ffn_norm_weight = (
+                    self.post_attention_layernorm.weight.data.to(torch.float16) + 1.0
+                ).contiguous()
+            _esimd_norm_add_norm(
+                hidden_states,
+                residual,
+                self._post_attn_norm_weight,
+                self._pre_ffn_norm_weight,
+                hidden_states,
+                self.post_attn_norm.eps,
+                self.post_attention_layernorm.eps,
+            )
+        else:
+            hidden_states = residual + self.post_attn_norm(hidden_states)
+            residual = hidden_states
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if use_residual_norm_fusion:
+            if not hasattr(self, "_post_ffn_norm_weight"):
+                self._post_ffn_norm_weight = self.post_ffn_norm.weight.data.to(
+                    torch.float16
+                ).contiguous()
+                self._post_ffn_output = torch.empty_like(hidden_states)
+            return _esimd_rmsnorm_residual_scalar(
+                hidden_states,
+                self._post_ffn_norm_weight,
+                residual,
+                self._post_ffn_output,
+                self.post_ffn_norm.eps,
+                1.0,
+            )
         return residual + self.post_ffn_norm(hidden_states)
 
 
@@ -396,7 +623,7 @@ class OnyxModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.has_vision = False
+        self.has_vision = bool(getattr(config, "has_vision", False))
 
         self.pp_group = get_pp_group()
         self.normalize_tok_embeddings = getattr(
@@ -414,6 +641,22 @@ class OnyxModel(nn.Module):
                 )
             else:
                 self.embed_norm = None
+            if self.has_vision:
+                self.vision_encoder = OnyxVisionEncoder(config)
+                self.vision_adapter = OnyxVisionAdapter(config)
+                self.vision_projection = nn.Linear(
+                    config.vision_adapter_dim,
+                    config.hidden_size,
+                    bias=False,
+                    dtype=torch.bfloat16,
+                )
+                self.perception_emb_norm = (
+                    OnyxScalelessRMSNorm(
+                        config.hidden_size, eps=config.rms_norm_eps
+                    )
+                    if self.normalize_tok_embeddings
+                    else None
+                )
         else:
             self.embed_tokens = PPMissingLayer()
             self.embed_norm = PPMissingLayer()
@@ -439,7 +682,9 @@ class OnyxModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self) -> nn.Module | OnyxNormalizedEmbedding:
+        if self.has_vision and self.embed_norm is not None:
+            return OnyxNormalizedEmbedding(self.embed_tokens, self.embed_norm)
         return self.embed_tokens
 
     def forward(
@@ -453,10 +698,12 @@ class OnyxModel(nn.Module):
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
+                if self.embed_norm is not None:
+                    hidden_states = self.embed_norm(hidden_states)
             else:
+                # The multimodal embedding routine normalizes text embeddings
+                # before replacing image spans with perception-normalized features.
                 hidden_states = input_embeds
-            if self.embed_norm is not None:
-                hidden_states = self.embed_norm(hidden_states)
         else:
             if pp_proxy_tensors is None or "hidden_states" not in pp_proxy_tensors:
                 raise ValueError("Pipeline rank requires hidden_states proxy tensor")
@@ -527,6 +774,29 @@ class OnyxForCausalLM(nn.Module):
         )
         self.logits_processor.final_logit_softcapping = self.logits_soft_cap
 
+    def pad_input_ids(
+        self,
+        input_ids: List[int],
+        mm_inputs: MultimodalInputs,
+    ) -> List[int]:
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def get_image_feature(
+        self, items: List[MultimodalDataItem]
+    ) -> torch.Tensor:
+        if not self.model.has_vision:
+            raise RuntimeError("Onyx vision modules are disabled by model config")
+        pixel_values = []
+        for item in items:
+            pixel_values.extend(flatten_nested_list([item.feature]))
+        vision_features = self.model.vision_encoder(pixel_values)
+        vision_features = self.model.vision_adapter(vision_features)
+        vision_features = self.model.vision_projection(vision_features)
+        if self.model.perception_emb_norm is not None:
+            vision_features = self.model.perception_emb_norm(vision_features)
+        return vision_features.to(self.model.embed_tokens.weight.dtype)
+
     def validate_online_fp8_weights(self) -> None:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 
@@ -542,6 +812,8 @@ class OnyxForCausalLM(nn.Module):
         errors = []
 
         for name, module in self.named_modules():
+            if not name.startswith("model.layers."):
+                continue
             module_type = name.rsplit(".", 1)[-1]
             if module_type not in expected_shapes:
                 continue
@@ -611,13 +883,23 @@ class OnyxForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> LogitsProcessorOutput | PPProxyTensors:
-        hidden_states = self.model(
-            input_ids,
-            positions,
-            forward_batch,
-            input_embeds,
-            pp_proxy_tensors,
-        )
+        if self.model.has_vision:
+            hidden_states = general_mm_embed_routine(
+                input_ids=input_ids,
+                forward_batch=forward_batch,
+                language_model=self.model,
+                data_embedding_funcs={Modality.IMAGE: self.get_image_feature},
+                positions=positions,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        else:
+            hidden_states = self.model(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds,
+                pp_proxy_tensors,
+            )
 
         if not self.pp_group.is_last_rank:
             return hidden_states
@@ -661,6 +943,20 @@ class OnyxForCausalLM(nn.Module):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
+    def _invalidate_optimization_caches(self) -> None:
+        for parameter in self.parameters():
+            for attr in ("_esimd_t", "_esimd_1d"):
+                if hasattr(parameter, attr):
+                    delattr(parameter, attr)
+        for module in self.modules():
+            for attr in (
+                "_post_attn_norm_weight",
+                "_pre_ffn_norm_weight",
+                "_post_ffn_norm_weight",
+            ):
+                if hasattr(module, attr):
+                    delattr(module, attr)
+
     @torch.no_grad()
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -676,7 +972,9 @@ class OnyxForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if name.endswith(("rotary_emb.freqs", "rotary_emb.inv_freq")):
                 continue
-            if name.startswith(ONYX_VISION_WEIGHT_PREFIXES):
+            if name.startswith(ONYX_VISION_WEIGHT_PREFIXES) and not getattr(
+                self.model, "has_vision", False
+            ):
                 continue
 
             layer_id = get_layer_id(name)
@@ -695,7 +993,7 @@ class OnyxForCausalLM(nn.Module):
 
             matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+                if "model.layers." not in name or weight_name not in name:
                     continue
                 mapped_name = name.replace(weight_name, param_name)
                 if mapped_name.endswith(".bias") and mapped_name not in params_dict:
@@ -723,6 +1021,7 @@ class OnyxForCausalLM(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
+        OnyxForCausalLM._invalidate_optimization_caches(self)
         return loaded_params
 
 

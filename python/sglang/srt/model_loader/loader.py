@@ -952,11 +952,21 @@ class LowMemFp8ModelLoader(DefaultModelLoader):
         # copy of a quantized weight is dropped when process_weights replaces
         # layer.weight, then reclaimed by the periodic empty_cache.
         skip_vision = os.environ.get("SGLANG_SKIP_VISION_GPU", "0") == "1"
-        # Build set of modules to skip (vision_tower subtree)
+        # Build a set of modules to skip for text-only launches.
         _skip_modules = set()
         if skip_vision:
             for name, mod in model.named_modules():
-                if "vision_tower" in name or "embed_vision" in name:
+                if any(
+                    component in name
+                    for component in (
+                        "vision_tower",
+                        "embed_vision",
+                        "vision_encoder",
+                        "vision_adapter",
+                        "vision_projection",
+                        "perception_emb_norm",
+                    )
+                ):
                     _skip_modules.add(id(mod))
 
         processed = 0

@@ -10,7 +10,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestKVBuffer(unittest.TestCase):
-    def test_xpu_fused_scatter_rejects_strided_source_rows(self):
+    def test_xpu_fused_scatter_accepts_strided_source_rows(self):
         tokens, row_dim = 3, 32
         packed = (
             torch.arange(tokens * row_dim * 3)
@@ -23,8 +23,11 @@ class TestKVBuffer(unittest.TestCase):
         k_cache = torch.zeros(16, row_dim, dtype=packed.dtype)
         v_cache = torch.zeros_like(k_cache)
 
-        def fused_scatter(*_args):
-            self.fail("Fused scatter must not receive strided source rows")
+        def fused_scatter(k_src, v_src, k_dst, v_dst, dst_indices):
+            self.assertEqual(k_src.stride(), (row_dim * 3, 1))
+            self.assertEqual(v_src.stride(), (row_dim * 3, 1))
+            k_dst[dst_indices] = k_src
+            v_dst[dst_indices] = v_src
 
         with patch.multiple(
             memory_pool,
@@ -33,6 +36,7 @@ class TestKVBuffer(unittest.TestCase):
             _is_hip=False,
             _is_xpu=True,
             _esimd_kv_scatter=fused_scatter,
+            _disable_esimd_kv_scatter=False,
         ):
             memory_pool._set_kv_buffer_impl(
                 k,

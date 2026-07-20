@@ -3,9 +3,10 @@
 Last updated: 2026-07-17
 
 Status: Level A text FP8 and Phases 0-4 are complete. Phase 5 is unnecessary
-for the functional target, Phase 6 did not meet its trace-driven entry
-condition, and Phase 7 is blocked pending a BF16 multimodal implementation.
-Only results recorded in `ONYX_SGLANG_SUPPORT_STATUS.md` are validated.
+for the functional target, and Phase 6 did not meet its trace-driven entry
+condition. Phase 7 image bring-up is complete with a BF16 vision tower and the
+online-FP8 text decoder; video integration and vision-FP8 qualification remain
+open. Only results recorded in `ONYX_SGLANG_SUPPORT_STATUS.md` are validated.
 
 ## 1. Goal and definition of "complete"
 
@@ -123,9 +124,11 @@ The input embedding intentionally does not receive `quant_config`.
    HD256/HD512. This is a performance gap, not a blocker for FP8 linear
    correctness.
 
-7. **Multimodal execution is not implemented.**
-   The checkpoint contains vision weights, but the current SGLang Onyx model
-   instantiates only text modules and skips vision tensors.
+7. **Image execution is implemented; video remains open.**
+   The current SGLang Onyx model loads the checkpoint-faithful vision tower in
+   BF16 and serves single- and multi-image requests with the online-FP8 text
+   decoder. Video frame grouping, real PTS propagation, VIDEO item construction,
+   and six-channel temporal-patch dispatch are not yet implemented.
 
 ## 4. TP=2 FP8 shape inventory
 
@@ -463,14 +466,69 @@ reduces steady device usage by 41.3%-41.9% and retains the declared 16K
 capacity. FP8 online conversion increases weight-load time from about 18.1 s
 to 32.7 s and total startup from about 45 s to 60 s.
 
-The measured path already satisfies the Level A performance gate, so optional
-Phase 5 QKVG/output-gate fusion is not required. Phase 6 is not started:
-Phase 4 does not identify HD128 attention as a material regression, and the
-plan prohibits starting a new attention kernel without that evidence.
+The measured path already satisfies the Level A performance gate. Further
+kernel work is therefore an optimization investigation, not a release blocker.
+Source comparison with the optimized Gemma4 path established the following
+ordered queue. Every item requires a standalone correctness/performance
+microbenchmark before model integration:
 
-A follow-up current-FP8 throughput matrix used the same harness with 512 output
-tokens, two warmups, three trials, streaming, and `ignore_eos`. It is an FP8
-capacity measurement rather than an FP16 comparison:
+1. **HD128 fused QK norm + RoPE.** Onyx currently launches two scaleless norms,
+   query scaling, and interleaved RoPE separately. The existing
+   `sgl_kernel.fused_qk_norm_rope` supports FP16, HD128, and interleaved RoPE.
+   Fold the constant Onyx query scale into its Q weight; also qualify
+   `rotary_dim=0` for the 13 NoPE layers.
+2. **Decoder residual/norm fusion.** Qualify `esimd_norm_add_norm` for
+   post-attention norm + residual + pre-FFN norm, then
+   `esimd_rmsnorm_residual_scalar` with scalar 1 for post-FFN norm + residual.
+   Preserve Onyx's `(1 + weight)` semantics explicitly.
+3. **Stride-aware KV scatter.** Onyx K/V remain strided views of packed QKV, so
+   the existing contiguous-only `esimd_kv_scatter` is bypassed. Measure the
+   native scatter first, then extend the kernel to consume source row stride
+   only if it wins over both native scatter and explicit contiguous copies.
+4. **QKV + output-gate decode projection.** Qualify
+   `esimd_gemv_fp8_pert_fused2` at bsz=1 while keeping independent weights and
+   scales. Keep sigmoid application after attention and do not introduce a
+   second persistent packed-weight layout.
+5. **HD128 attention.** Only after the lower-risk fusions, trace the full model.
+   Gemma4's DPAS prefill and ESIMD page/split-K decode paths are gated to
+   HD256/HD512, so HD128 requires kernel work. Start it only if the trace shows
+   material TTFT or TPOT cost.
+
+All five investigations are complete. The fused QK microbenchmark is
+1.91-2.51x faster with Q/K cosine at least 0.99999988. Matched model A/B/A
+shows 9.92%-10.79% lower TPOT in A and 12.93%-13.74% lower TPOT in A2; the
+exact fused path scores 96/100 on GSM8K Chat with zero invalid responses.
+
+The residual/norm microbenchmark is 1.55x faster for post-attention add plus
+pre-FFN norm and 1.33x faster for post-FFN norm plus residual, with cosine at
+least 0.99999988. Its matched A/B/A lowers TPOT by 9.26%-9.93% in A and
+9.09%-10.59% in A2 without material TTFT change. The complete smoke,
+2047-8192 boundary, repeatability, multi-turn, and tool-call capture passes.
+The opt-outs are `SGLANG_ONYX_DISABLE_FUSED_QK_NORM_ROPE=1` and
+`SGLANG_ONYX_DISABLE_RESIDUAL_NORM_FUSION=1`.
+
+The stride-aware KV scatter is bit-exact for packed source stride `(2304, 1)`
+and takes 41.75-42.01 us at M=1/64/1024, about 20%-21% below native scatter.
+Matched A/B/A lowers TPOT by 2.44%-3.81% in A and 0.86%-3.99% in A2. The
+native comparison opt-out is `SGLANG_XPU_DISABLE_ESIMD_KV_SCATTER=1`.
+
+The QKV/output-gate fused2 GEMV is bit-exact with independent scales and is
+1.05x faster standalone. It reuses the existing `_esimd_t` weight layouts.
+Matched A/B/A lowers TPOT by 3.25%-4.34% in A and 3.44%-5.23% in A2. The
+opt-out is `SGLANG_ONYX_DISABLE_FUSED_QKV_GATE_GEMV=1`.
+
+The final full-model trace does not justify HD128 attention work:
+`XeFMHAFwdKernel` accounts for 3.76% and 3.73% of GPU self-time on TP0/TP1
+over one warmup plus one measured 1K-input/64-output request. No new attention
+kernel is started.
+
+Existing optimized paths that are not part of this queue are shape-qualified
+FP8 ESIMD decode, W8A16 prefill, XPU SiLU-and-multiply, SYCL standalone RMSNorm,
+and ESIMD decode LM head.
+
+A pre-optional-optimization FP8 throughput matrix used the same harness with
+512 output tokens, two warmups, three trials, streaming, and `ignore_eos`. It
+is an FP8 capacity measurement rather than an FP16 comparison:
 
 | Input tokens | TTFT (ms) | TPOT (ms) | Decode throughput (token/s) | E2E (s) |
 |---:|---:|---:|---:|---:|
@@ -481,6 +539,19 @@ capacity measurement rather than an FP16 comparison:
 
 The machine-readable result is
 `/home/intel/xiangyu/copilot_workspace/onyx_runtime_fp8_output512.json`.
+
+After completing optimization items 1-4, the fully optimized FP8 path was
+remeasured with the same methodology:
+
+| Input tokens | TTFT (ms) | TPOT (ms) | Decode throughput (token/s) | E2E (s) |
+|---:|---:|---:|---:|---:|
+| 1,024 | 286.89 | 34.17 | 29.26 | 17.75 |
+| 2,048 | 584.51 | 34.34 | 29.12 | 18.13 |
+| 4,096 | 1,233.58 | 37.45 | 26.70 | 20.37 |
+| 8,192 | 2,433.75 | 37.14 | 26.93 | 21.41 |
+
+The machine-readable result is
+`/home/intel/xiangyu/copilot_workspace/onyx_runtime_optimized_fp8_output512.json`.
 
 ### Phase 5: optional fused QKVG/output-gate optimization
 
@@ -523,32 +594,134 @@ FP8 goals are already met.
 
 ### Phase 7: multimodal FP8
 
-This phase begins only after BF16 Onyx image/video execution exists in SGLang.
-That prerequisite is currently absent: `OnyxForCausalLM` sets
-`has_vision = False`, instantiates only the text model, and skips all packaged
-vision weights. The live model-info endpoint consequently reports
-`has_image_understanding: false`. Phase 7 is blocked at its declared entry
-gate rather than being approved by text-only results.
+Phase 7 is active. The first image-capable target is implemented and validated:
+the existing TP=2 online-FP8 text decoder runs with a replicated BF16 Onyx
+vision encoder, adapter, final projection, and perception normalization on both
+TP ranks. `OnyxForCausalLM` now uses SGLang's common multimodal embedding
+routine, and the model-info endpoint reports `has_image_understanding: true`.
+
+The initial BF16 check was deliberately limited to the vision subsystem rather
+than a second full 31B service qualification. A reduced Onyx vision
+configuration loaded identical reference/SGLang weights and produced bit-exact
+BF16 features (`max_abs=0`, output shape `[4, 128]`). The final-target TP=2
+FP8-text/BF16-vision service then passed:
+
+- one-image chat: correctly identified the cat, pink hoodie, and sunglasses;
+- two-image chat: correctly identified cat then dog in input order;
+- fixed text raw token remained 328, and English/Chinese chat smoke passed;
+- 17 affected Onyx/KV unit tests passed.
+
+The same final-target service was rerun on the text task suites after image
+integration:
+
+| Suite | Current result | Invalid responses |
+|---|---:|---:|
+| GSM8K Chat API, 100 examples | 0.90 (90/100) | 0 |
+| ARC-Challenge zero-shot Chat API, complete 1,172-example test split | 0.9411 (1103/1172) | 1 |
+
+Both used temperature 0; GSM8K used the Chat harness with `max_tokens=512`.
+Artifacts are
+`/home/intel/xiangyu/copilot_workspace/onyx_current_fp8_gsm8k_100.log` and
+`/home/intel/xiangyu/copilot_workspace/onyx_arc_current_fp8.json`. These are
+current-path FP8 results, not a new matched FP16/FP8 comparison, so the formal
+Phase 3 quantization deltas remain unchanged.
+
+Current supported boundary:
+
+- image preprocessing, variable-resolution patch expansion, sparse/global
+  vision attention, pixel-shuffle downsampling, adapter/projection, multiple
+  images, and image-feature insertion are supported;
+- video is explicitly rejected by the SGLang processor until frame-group and
+  timestamp metadata are represented as video items;
+- audio is not an Onyx modality.
+
+The validated load retained all 260 decoder linears as E4M3 FP8 while vision
+modules remained BF16. Both ranks loaded in about 42 seconds and reported
+17.82 GB model memory per rank. After the one- and two-image smoke requests,
+`xpu-smi` reported 26,802 MiB on XPU0 and 26,053 MiB on XPU1, including
+allocator-retained runtime buffers.
+
+#### Video gap analysis
+
+Video does not require a new text decoder, adapter, projection, or attention
+kernel. The checkpoint reference already defines the token protocol and uses
+the same vision encoder after converting each temporal frame group to a
+`[vision_patch_temporal * 3, H, W]` tensor. The remaining work is primarily
+correctness-sensitive SGLang integration:
+
+1. **Request/processor entry point**
+   - `OnyxSGLangProcessor.process_mm_data_async` currently raises
+     `NotImplementedError` when `request_obj.video_data` is present.
+   - It must pass video data into `load_mm_data` and preserve the distinction
+     between IMAGE and VIDEO items.
+
+2. **Training-faithful decode and timestamps**
+   - The reference samples at 2 FPS, caps at 96 frames, rounds the selected
+     frame count to a multiple of `vision_patch_temporal=2`, and groups every
+     two consecutive frames.
+   - Each group needs the real decoded PTS of its first frame. The prompt is
+     rendered as
+     `<|vid_start|> (Time: X.Xs <|video|>*P [separator])* <|vid_end|>`.
+     Replacing PTS with a uniform synthetic timeline can differ from training.
+   - The reference file-path decoder uses `torchcodec`, which is not installed
+     in the current container. Either install the matching dependency or adapt
+     SGLang's `VideoDecoderWrapper` while retaining real PTS; silently falling
+     back to a decoder/timestamp approximation is not acceptable.
+
+3. **Frame-group feature representation**
+   - `OnyxProcessor` currently emits image tensors and all video group tensors
+     through the same `pixel_values` field.
+   - SGLang maps `pixel_values` to IMAGE by default. The Onyx processor must
+     explicitly construct VIDEO items, or rename/register a video feature
+     field, so each `[6, H, W]` group is associated with its corresponding
+     `<|video|>` span.
+   - One logical video creates multiple disjoint feature spans because timestamp
+     text and frame separators occur between groups. Multi-video requests must
+     retain both group order and video boundaries through cache splitting.
+
+4. **Vision/model dispatch**
+   - The checkpoint vision encoder already handles three-channel images and
+     six-channel two-frame groups. The SGLang port currently rejects any channel
+     count other than three; the reference temporal-patch branch must be
+     restored.
+   - `OnyxForCausalLM` currently registers only
+     `Modality.IMAGE: get_image_feature`. It needs a VIDEO embedding function
+     that reuses the same BF16 encoder/adapter/projection path.
+
+5. **Qualification**
+   - Compare exact prompt token layout, group count, tokens per group, and
+     rendered PTS against the checkpoint processor.
+   - Verify early/late event ordering on a controlled clip, then multiple videos
+     and mixed image/video/text input.
+   - Record encoder memory and latency separately from text prefill/decode.
+
+The hard part is therefore frame/PTS/token-span alignment, not compute-kernel
+availability. A successful import, decode, or non-crashing generation is not a
+video correctness gate.
 
 #### Bring-up order
 
-1. Run the full multimodal model with all vision modules ignored by FP8:
+1. [x] Run the image-capable model with all vision modules ignored by FP8:
    - `model.vision_encoder`
    - `model.vision_adapter`
    - `model.vision_projection`
    - `model.perception_emb_norm`
-2. Generalize `LowMemFp8ModelLoader` vision skipping. Its current
-   `vision_tower`/`embed_vision` name checks are Gemma-specific.
-3. Inventory each vision linear, convolution, adapter, and projection shape.
-4. Quantize one class of vision linear at a time:
+2. [x] Generalize `LowMemFp8ModelLoader` vision skipping from Gemma-only
+   names to the actual Onyx prefixes.
+3. [ ] Inventory and microbenchmark each vision linear, patch embedding,
+   adapter, and projection shape.
+4. [ ] Quantize one class of vision linear at a time, only after an isolated
+   kernel win:
    - vision MLP
    - vision attention projections
    - adapter
    - final vision projection
-5. Keep convolution/patch embedding and normalization BF16 unless a dedicated
+5. [x] Keep patch embedding and normalization BF16 unless a dedicated
    implementation and accuracy study justify quantization.
-6. Maintain an explicit ignore list using actual Onyx module prefixes, not
+6. [x] Maintain an explicit ignore list using actual Onyx module prefixes, not
    Gemma4 names.
+7. [ ] Implement the video integration above in processor → item construction →
+   six-channel vision dispatch order, then qualify temporal ordering.
 
 #### Required gates
 
@@ -677,8 +850,9 @@ tools default to this port; port 30000 must not be used for new Onyx runs.
 
 ### Multimodal FP8
 
-- [ ] BF16 multimodal SGLang baseline exists
-- [ ] Onyx-specific vision ignore/quantization policy exists
-- [ ] Image and video correctness gates pass
-- [ ] Multimodal load/runtime memory is measured
-- [ ] Final supported and ignored module list is documented
+- [x] BF16 vision subsystem matches the checkpoint reference bit-exactly
+- [x] Onyx-specific vision ignore/quantization policy exists
+- [x] Single- and multi-image correctness smoke passes on FP8 text + BF16 vision
+- [ ] Video correctness and timestamp-ordering gates pass
+- [x] Multimodal load/runtime memory is measured
+- [x] Current supported and ignored module list is documented
