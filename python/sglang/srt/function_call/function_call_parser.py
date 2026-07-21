@@ -135,8 +135,9 @@ class FunctionCallParser:
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
-        else:
-            return full_text, []
+        if parsed_result.normal_text or isinstance(self.detector, OnyxDetector):
+            return parsed_result.normal_text, []
+        return full_text, []
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
@@ -165,7 +166,7 @@ class FunctionCallParser:
         return final_normal_text, final_calls
 
     def get_legacy_structural_tag(
-        self, at_least_one: bool = False
+        self, at_least_one: bool = False, tools: Optional[List[Tool]] = None
     ) -> StructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
@@ -180,13 +181,14 @@ class FunctionCallParser:
             ValueError: If tools have conflicting $defs schemas.
         """
         # Validate $defs consistency before building structural tags
-        _get_tool_schema_defs(self.tools)
+        constrained_tools = tools if tools is not None else self.tools
+        _get_tool_schema_defs(constrained_tools)
 
         tool_structures: List[StructuresResponseFormat] = list()
         tool_trigger_set: Set[str] = set()
 
         get_structure_info = self.detector.structure_info()
-        for tool in self.tools:
+        for tool in constrained_tools:
             function = tool.function
             name = function.name
             assert name is not None
@@ -256,7 +258,16 @@ class FunctionCallParser:
                     # model's native tool call format. Schema is only included when
                     # strict=True, per OpenAI protocol semantics.
                     # For "auto": only constrain when strict is enabled.
-                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    constrained_tools = None
+                    if isinstance(tool_choice, ToolChoice):
+                        constrained_tools = [
+                            tool
+                            for tool in self.tools
+                            if tool.function.name == tool_choice.function.name
+                        ]
+                    tag = self.get_legacy_structural_tag(
+                        at_least_one=is_required, tools=constrained_tools
+                    )
                     return ("structural_tag", tag)
 
             if tool_choice == "required" or isinstance(tool_choice, ToolChoice):

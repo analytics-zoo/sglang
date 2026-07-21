@@ -12,7 +12,7 @@
 {%- endmacro -%}
 {%- set tool_prompt = '' -%}
 {%- if tools is defined and tools -%}
-{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. When a function is needed, send your assistant message to the function name as recipient and put only JSON arguments in the message.' -%}
+{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. When a function is needed, send your assistant message to the function name as recipient and put only JSON arguments in the message. After receiving a tool result, use it to answer the user instead of repeating the same call.' -%}
 {%- endif -%}
 {%- set ns = namespace(has_system=false) -%}
 {%- for m in messages -%}
@@ -24,17 +24,40 @@
 {%- for message in messages -%}
 {%- set role = message['role'] -%}
 {%- if role == 'assistant' -%}
-{%- set recipient = message.get('recipient') -%}
+{%- set tool_calls = message.get('tool_calls') -%}
+{%- if tool_calls and tool_calls | length > 1 -%}
+{{- raise_exception('Onyx supports one tool call per assistant turn; set parallel_tool_calls=false') -}}
+{%- endif -%}
+{%- set recipient = tool_calls[0]['function']['name'] if tool_calls else message.get('recipient') -%}
 {%- set end_turn = message.get('end_turn') -%}
 {%- if end_turn is none -%}
 {%- set end_turn = not (recipient and recipient != 'user') -%}
 {%- endif -%}
 {{- '<|start|>assistant' -}}
 {%- if recipient -%}{{- ' to=' + recipient -}}{%- endif -%}
-{{- '<|message|>' -}}{{- render_parts(message['content']) -}}
+{{- '<|message|>' -}}
+{%- if tool_calls -%}
+{%- set arguments = tool_calls[0]['function']['arguments'] -%}
+{{- arguments if arguments is string else arguments | tojson -}}
+{%- else -%}
+{{- render_parts(message.get('content', '')) -}}
+{%- endif -%}
 {{- ('<|eot|>' if end_turn else '<|eom|>') -}}
 {%- elif role == 'tool' -%}
-{%- set name = message.get('name', '') -%}
+{%- set tool_ns = namespace(name=message.get('name', '')) -%}
+{%- if not tool_ns.name and message.get('tool_call_id') -%}
+{%- for prior in messages -%}
+{%- if prior['role'] == 'assistant' and prior.get('tool_calls') -%}
+{%- for tool_call in prior['tool_calls'] -%}
+{%- if tool_call.get('id') == message['tool_call_id'] -%}{%- set tool_ns.name = tool_call['function']['name'] -%}{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- set name = tool_ns.name -%}
+{%- if not name -%}
+{{- raise_exception('Onyx tool messages require a name or a matching tool_call_id') -}}
+{%- endif -%}
 {{- '<|start|>tool ' + name + '<|message|>' -}}{{- render_parts(message['content']) -}}{{- '<|eot|>' -}}
 {%- else -%}
 {%- set header = role -%}

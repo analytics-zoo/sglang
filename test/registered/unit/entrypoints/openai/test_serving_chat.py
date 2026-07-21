@@ -509,6 +509,48 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
+    def test_onyx_rejects_parallel_tool_calls(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            parallel_tool_calls=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "Onyx supports one tool call per assistant turn; "
+            "set parallel_tool_calls=false.",
+        )
+
+    def test_onyx_defaults_to_single_tool_call(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        self.assertIsNone(self.chat._validate_request(req))
+        self.assertFalse(req.parallel_tool_calls)
+
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
         self.template_manager.chat_template_name = None

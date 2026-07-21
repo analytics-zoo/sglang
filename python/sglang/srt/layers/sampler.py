@@ -22,6 +22,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    is_xpu,
 )
 
 if is_cuda():
@@ -67,9 +68,11 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_tp_group().device_group
+        self.tp_sync_coordinator = get_tp_group()
+        self.tp_sync_group = self.tp_sync_coordinator.device_group
         if is_dp_attention_enabled():
-            self.tp_sync_group = get_attention_tp_group().device_group
+            self.tp_sync_coordinator = get_attention_tp_group()
+            self.tp_sync_group = self.tp_sync_coordinator.device_group
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -385,11 +388,20 @@ class Sampler(nn.Module):
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
             # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
+            if is_xpu():
+                cpu_token_ids = batch_next_token_ids.cpu()
+                dist.broadcast(
+                    cpu_token_ids,
+                    src=self.tp_sync_coordinator.ranks[0],
+                    group=self.tp_sync_coordinator.cpu_group,
+                )
+                batch_next_token_ids.copy_(cpu_token_ids)
+            else:
+                torch.distributed.all_reduce(
+                    batch_next_token_ids,
+                    op=dist.ReduceOp.MIN,
+                    group=self.tp_sync_group,
+                )
 
     def compute_logprobs_only(
         self,

@@ -553,7 +553,22 @@ Validation results:
 - Distributed initialization can still intermittently block before weight
   loading. Diagnostic runs use a 30-second phase watchdog and restart the whole
   container on this condition.
-- OpenAI-compatible tool calling requires
-  `benchmark/onyx/onyx_tool_chat_template.jinja` and
-  `--tool-call-parser onyx`. `tool_choice=auto` is qualified;
-  `tool_choice=required` structural constraints are not advertised.
+- OpenAI-compatible tool calling uses the model's default
+  `chat_template.jinja` plus `--tool-call-parser onyx`; the launch script no
+  longer needs a benchmark template override. The template renders standard
+  `assistant.tool_calls` history, resolves a subsequent `tool_call_id` to its
+  function name, and retains the legacy `recipient` input for compatibility.
+- `tool_choice=auto`, native `required`, and named-function constraints are
+  qualified on the TP=2 online-FP8 service. Streaming emits the function name
+  followed by incremental argument fragments. A complete standard OpenAI
+  round trip returns `get_weather({"city":"Paris"})`, accepts a tool result
+  carrying only `tool_call_id`, and produces the final answer
+  `The current temperature in Paris is 18°C.` with `finish_reason=stop`.
+- Onyx remains single-call-per-turn. Omitting `parallel_tool_calls` defaults to
+  false for this parser; explicitly requesting true returns HTTP 400.
+- The current tool-description system prompt is an integration prompt, not a
+  recovered Onyx training prompt. Protocol conformance is qualified, but
+  tool-selection accuracy is not. In the current smoke, `strict=true` auto may
+  choose to repeat a call after a tool result; the validated autonomous
+  round-trip path uses non-strict auto, while strict required/named calls are
+  qualified independently.

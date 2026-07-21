@@ -415,6 +415,18 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
+        if (
+            self.tool_call_parser == "onyx"
+            and request.tools
+            and request.parallel_tool_calls
+        ):
+            if "parallel_tool_calls" in request.model_fields_set:
+                return (
+                    "Onyx supports one tool call per assistant turn; "
+                    "set parallel_tool_calls=false."
+                )
+            request.parallel_tool_calls = False
+
         # Validate tool definitions
         for i, tool in enumerate(request.tools or []):
             if tool.function.parameters is None:
@@ -1414,12 +1426,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 not is_required or parser.detector.supports_structural_tag()
             )
             if should_try_parser and parser.has_tool_call(text):
-                original_finish_type = finish_reason["type"]
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
+                original_finish_reason = finish_reason.copy()
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    if not call_info_list:
+                        return ToolCallProcessingResult(None, text, finish_reason)
+                    if finish_reason["type"] == "stop":
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
                     tool_calls = []
                     for call_info in call_info_list:
                         tool_id = self._process_tool_call_id(
@@ -1438,7 +1452,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    finish_reason["type"] = original_finish_type
+                    finish_reason.update(original_finish_reason)
                     return ToolCallProcessingResult(None, text, finish_reason)
 
         # json_schema constraint → JSON array output for required/named
