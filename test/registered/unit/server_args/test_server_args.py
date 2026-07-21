@@ -38,6 +38,20 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_enable_fp8_lm_head(self):
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--enable-fp8-lm-head"]
+        )
+        self.assertTrue(server_args.enable_fp8_lm_head)
+
+    def test_lm_head_precision_flags_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            ServerArgs(
+                model_path="dummy",
+                enable_fp32_lm_head=True,
+                enable_fp8_lm_head=True,
+            )
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

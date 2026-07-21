@@ -21,7 +21,14 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+_esimd_gemv_fp8_pern = None
 _esimd_gemv_fp16 = None
+try:
+    from custom_esimd_kernels_sglang import (
+        esimd_gemv_fp8_pern as _esimd_gemv_fp8_pern,
+    )
+except ImportError:
+    pass
 try:
     from custom_esimd_kernels_sglang import esimd_gemv_fp16 as _esimd_gemv_fp16
 except ImportError:
@@ -280,6 +287,8 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        self.use_fp8_lm_head = get_global_server_args().enable_fp8_lm_head
+        self._fp8_lm_head_fallback_logged = False
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -895,6 +904,32 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
+            elif self.use_fp8_lm_head and hidden_states.shape[0] == 1:
+                if not hidden_states.is_xpu:
+                    raise RuntimeError("--enable-fp8-lm-head requires an XPU device")
+                if _esimd_gemv_fp8_pern is None:
+                    raise RuntimeError(
+                        "--enable-fp8-lm-head requires the XPU ESIMD FP8 GEMV op"
+                    )
+                weight, scale = self._get_or_create_fp8_lm_head(lm_head)
+                inp = hidden_states.to(torch.float16).contiguous()
+                logits = torch.empty(
+                    1, weight.shape[0], dtype=torch.float16, device=hidden_states.device
+                )
+                _esimd_gemv_fp8_pern(
+                    inp, weight, scale, logits, weight.shape[0], weight.shape[1]
+                )
+            elif self.use_fp8_lm_head:
+                if not self._fp8_lm_head_fallback_logged:
+                    logger.warning(
+                        "--enable-fp8-lm-head currently accelerates single-token "
+                        "decode only; falling back to the original LM head for M=%d",
+                        hidden_states.shape[0],
+                    )
+                    self._fp8_lm_head_fallback_logged = True
+                logits = torch.matmul(
+                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
@@ -924,6 +959,10 @@ class LogitsProcessor(nn.Module):
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
                 )
         else:
+            if self.use_fp8_lm_head:
+                raise RuntimeError(
+                    "--enable-fp8-lm-head requires an unquantized LM-head weight"
+                )
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
             if self.use_fp32_lm_head:
@@ -936,6 +975,56 @@ class LogitsProcessor(nn.Module):
                     lm_head, hidden_states, embedding_bias
                 )
         return logits
+
+    @staticmethod
+    def _get_or_create_fp8_lm_head(
+        lm_head: VocabParallelEmbedding,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cached_weight = getattr(lm_head, "_esimd_fp8_weight", None)
+        cached_scale = getattr(lm_head, "_esimd_fp8_scale", None)
+        if cached_weight is not None and cached_scale is not None:
+            return cached_weight, cached_scale
+
+        weight = lm_head.weight
+        if weight.ndim != 2 or weight.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "--enable-fp8-lm-head requires a 2D FP16 or BF16 LM-head weight"
+            )
+        if weight.shape[0] % 8 != 0 or weight.shape[1] % 256 != 0:
+            raise RuntimeError(
+                "--enable-fp8-lm-head requires the LM-head output dimension to "
+                "be divisible by 8 and hidden dimension to be divisible by 256"
+            )
+
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            fp8_dtype,
+            fp8_max,
+        )
+
+        fp8_weight = torch.empty(weight.shape, dtype=fp8_dtype, device=weight.device)
+        scale = torch.empty(weight.shape[0], dtype=torch.float16, device=weight.device)
+
+        # Quantize in chunks so the temporary FP16 division result stays bounded.
+        chunk_rows = 4096
+        for start in range(0, weight.shape[0], chunk_rows):
+            end = min(start + chunk_rows, weight.shape[0])
+            chunk = weight[start:end].to(torch.float16)
+            chunk_scale = chunk.abs().amax(dim=1).div(fp8_max).clamp(min=1e-12)
+            fp8_weight[start:end].copy_(
+                chunk.div(chunk_scale[:, None])
+                .clamp(min=-fp8_max, max=fp8_max)
+                .to(fp8_dtype)
+            )
+            scale[start:end].copy_(chunk_scale)
+
+        lm_head._esimd_fp8_weight = fp8_weight
+        lm_head._esimd_fp8_scale = scale
+        logger.info(
+            "Initialized XPU FP8 LM head: shape=%s dtype=%s",
+            tuple(fp8_weight.shape),
+            fp8_weight.dtype,
+        )
+        return fp8_weight, scale
 
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata

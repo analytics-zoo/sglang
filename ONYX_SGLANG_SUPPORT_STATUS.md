@@ -49,6 +49,7 @@ from the same converted checkpoint.
 | Decoder online FP8 | Phase 1 complete | Two clean TP=2 starts validate exactly 260 E4M3 decoder linears and pass raw, English/Chinese chat, and SWA-boundary gates |
 | Onyx FP8 fast kernels | Phase 2 complete | All 75 required cases pass numerical/repeatability gates; shape-aware runtime dispatch selects only measured wins |
 | Model-level FP8 correctness | Phase 3 complete | GSM8K delta is -1.00 point; ARC-Challenge delta is -0.17 point; radix on/off and 2047-8192-token stability gates pass |
+| Optional FP8 LM head | Qualified | `--enable-fp8-lm-head` preserves current accuracy and lowers decode TPOT by 2.5%-3.5% in matched A-B-A measurements |
 | Multimodal image support | Phase 7 image bring-up complete | Checkpoint-faithful BF16 vision tower feeds the TP=2 online-FP8 decoder; single- and two-image chat smoke plus current text-task reruns passed |
 | Multimodal video support | Not implemented | Processor rejects video explicitly until frame grouping and timestamps are carried as video items |
 
@@ -484,6 +485,74 @@ the same 512-output methodology:
 
 The machine-readable report is
 `/home/intel/xiangyu/copilot_workspace/onyx_runtime_optimized_fp8_output512.json`.
+
+### Optional FP8 LM head
+
+`--enable-fp8-lm-head` is default-off and applies only to single-token XPU
+decode. Each TP rank lazily quantizes its `[101024, 6656]` independent LM-head
+shard to E4M3 with one FP16 scale per output channel, then dispatches
+`esimd_gemv_fp8_pern`. Multi-token logits retain the original FP16 path, and the
+original FP16 weight remains resident.
+
+An isolated BMG microbenchmark at the exact per-rank Onyx shape measured
+1.1367 ms for FP8 versus 2.2614 ms for FP16 (1.989x). Across five random inputs,
+the minimum cosine similarity was 0.99964762, maximum relative L2 error was
+0.02654906, and all five argmax results matched.
+
+The Onyx correctness qualification passed:
+
+- fixed raw output token 328 and coherent Paris/Beijing chat;
+- exact 2047/2048/2049 boundary tokens 328/15718/290;
+- task smoke 0.9, valid 4096/8192 outputs, deterministic prefix reuse,
+  multi-turn chat, and tool calling;
+- GSM8K Chat API 0.90 (90/100), equal to the current-path result;
+- ARC-Challenge 0.9420 (1104/1172), one correct answer above the current-path
+  result, with the same one invalid response.
+
+Matched A-B-A runtime measurements used the qualified launch script,
+`benchmark/onyx/bench_runtime.py`, 512 output tokens, two warmups, three trials,
+and medians. `ON midpoint` is the midpoint of the two FP8-LM-head runs:
+
+| Input tokens | FP16 LM-head TPOT (ms) | FP8 LM-head ON midpoint (ms) | Improvement |
+|---:|---:|---:|---:|
+| 1,024 | 34.693 | 33.540 | 3.32% |
+| 2,048 | 34.942 | 33.728 | 3.47% |
+| 4,096 | 37.517 | 36.490 | 2.74% |
+| 8,192 | 37.545 | 36.598 | 2.52% |
+
+The complete current-path matrix, including a 16,000-token input and 512-token
+output, was measured in one server run with
+`ONYX_CONTEXT_LENGTH=16896`, `ONYX_MAX_TOTAL_TOKENS=17152`, and
+`ONYX_ALLOW_LONG_CONTEXT=1`:
+
+| Input tokens | TTFT (ms) | TPOT (ms) | Decode throughput (token/s) | E2E (s) |
+|---:|---:|---:|---:|---:|
+| 1,024 | 285.49 | 34.55 | 28.94 | 17.94 |
+| 2,048 | 582.46 | 34.51 | 28.97 | 18.22 |
+| 4,096 | 1,187.29 | 37.28 | 26.83 | 20.24 |
+| 8,192 | 2,421.31 | 37.44 | 26.71 | 21.56 |
+| 16,000 | 4,859.20 | 37.30 | 26.81 | 23.92 |
+
+This is an absolute FP8-LM-head-ON matrix, not an A-B-A comparison; the OFF
+path was not rerun with the long-context allocation.
+
+TTFT changed by -0.37% to -0.58%, with no regression. After the same clean
+startup and smoke, device memory increased by 753-754 MiB per rank; the FP8
+weight and scale account for about 641.5 MiB, with the remainder attributable to
+allocator retention and quantization temporaries. The declared 16,384-token
+capacity remains unchanged.
+
+Raw artifacts are:
+
+- `onyx_fp8_lm_head_qualification.json`
+- `onyx_fp8_lm_head_gsm8k_100.log`
+- `onyx_fp8_lm_head_arc_challenge.json`
+- `onyx_runtime_fp8_lm_head_on_output512.json`
+- `onyx_runtime_fp8_lm_head_off_output512.json`
+- `onyx_runtime_fp8_lm_head_on_a2_output512.json`
+- `onyx_runtime_fp8_lm_head_on_1k_16k_output512.json`
+
+All are under `/home/intel/xiangyu/copilot_workspace/`.
 
 The former multimodal prerequisite is now satisfied for images:
 `OnyxForCausalLM` loads the BF16 vision modules and reports

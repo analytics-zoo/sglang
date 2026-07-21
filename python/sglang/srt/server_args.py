@@ -415,6 +415,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enable_fp32_lm_head: bool = False
+    enable_fp8_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
@@ -904,6 +905,10 @@ class ServerArgs:
 
         # Validate mm_process_config before dummy-model early return.
         self._handle_multimodal()
+        if self.enable_fp32_lm_head and self.enable_fp8_lm_head:
+            raise ValueError(
+                "--enable-fp32-lm-head and --enable-fp8-lm-head are mutually exclusive"
+            )
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
         # Validate transcription/ASR-specific server args (model-independent).
@@ -4756,6 +4761,14 @@ class ServerArgs:
             "--enable-fp32-lm-head",
             action="store_true",
             help="If set, the LM head outputs (logits) are in FP32.",
+        )
+        parser.add_argument(
+            "--enable-fp8-lm-head",
+            action="store_true",
+            help=(
+                "Enable the XPU ESIMD per-output-channel FP8 weight-only LM head for "
+                "single-token decode. The original LM-head weight is preserved."
+            ),
         )
         parser.add_argument(
             "--modelopt-quant",
