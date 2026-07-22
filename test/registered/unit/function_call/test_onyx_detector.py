@@ -73,6 +73,22 @@ class TestOnyxDetector(unittest.TestCase):
         self.assertEqual(text, "")
         self.assertEqual(calls, [])
 
+    def test_multiple_recipient_calls_use_response_ordinals(self):
+        text = (
+            ' to=get_weather<|message|>{"city":"Paris"}<|eot|>'
+            'assistant to=get_weather<|message|>{"city":"Tokyo"}<|eot|>'
+            "<|start|>assistant to=user<|message|>"
+        )
+
+        result = OnyxDetector().detect_and_parse(text, self.tools)
+
+        self.assertEqual([call.tool_index for call in result.calls], [0, 1])
+        self.assertEqual(
+            [json.loads(call.parameters) for call in result.calls],
+            [{"city": "Paris"}, {"city": "Tokyo"}],
+        )
+        self.assertEqual(result.normal_text, "")
+
     def test_streaming_recipient_call(self):
         detector = OnyxDetector()
         first = detector.parse_streaming_increment(" to=get_", self.tools)
@@ -97,6 +113,46 @@ class TestOnyxDetector(unittest.TestCase):
         self.assertEqual(first.normal_text, "It is ")
         self.assertEqual(second.normal_text, "18 degrees.")
         self.assertEqual(first.calls + second.calls, [])
+
+    def test_streaming_multiple_recipient_calls(self):
+        detector = OnyxDetector()
+        chunks = [
+            ' to=get_weather<|message|>{"city":"Paris"}<|eot|><|start|>assi',
+            'stant to=get_weather<|message|>{"city":"Tokyo"}<|eot|>',
+            "<|start|>assistant to=user<|message|>",
+        ]
+        calls = []
+        normal_text = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            calls.extend(result.calls)
+            normal_text += result.normal_text
+
+        names = [call for call in calls if call.name]
+        self.assertEqual(
+            [(call.tool_index, call.name) for call in names],
+            [(0, "get_weather"), (1, "get_weather")],
+        )
+        parameters = {0: "", 1: ""}
+        for call in calls:
+            parameters[call.tool_index] += call.parameters
+        self.assertEqual(json.loads(parameters[0]), {"city": "Paris"})
+        self.assertEqual(json.loads(parameters[1]), {"city": "Tokyo"})
+        self.assertEqual(normal_text, "")
+
+    def test_streaming_suppresses_generated_tool_result_header(self):
+        detector = OnyxDetector()
+
+        first = detector.parse_streaming_increment(
+            ' to=get_weather<|message|>{"city":"Paris"}<|eot|><|start|>to',
+            self.tools,
+        )
+        second = detector.parse_streaming_increment("ol get_weather", self.tools)
+
+        self.assertEqual([call.name for call in first.calls if call.name], ["get_weather"])
+        self.assertEqual(first.normal_text + second.normal_text, "")
+        self.assertEqual(second.calls, [])
 
     def test_structure_info_uses_native_recipient_protocol(self):
         info = OnyxDetector().structure_info()("get_weather")
@@ -197,6 +253,29 @@ class TestOnyxDetector(unittest.TestCase):
                 "<|start|>assistant<|message|>It is 18 degrees.<|eot|>"
             )
         )
+
+    def test_template_renders_auto_parallel_native_generation_prompt(self):
+        template_path = (
+            Path(__file__).resolve().parents[4]
+            / "benchmark"
+            / "onyx"
+            / "onyx_tool_chat_template.jinja"
+        )
+        environment = Environment(undefined=StrictUndefined)
+        template = environment.from_string(template_path.read_text())
+
+        rendered = template.render(
+            bos_token="<s>",
+            tools=[tool.model_dump() for tool in self.tools],
+            messages=[{"role": "user", "content": "Weather in Paris and Tokyo?"}],
+            add_generation_prompt=True,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+        )
+
+        self.assertIn("Decide whether functions are actually needed.", rendered)
+        self.assertIn("one recipient message per call", rendered)
+        self.assertTrue(rendered.endswith("<|start|>assistant"))
 
 
 if __name__ == "__main__":

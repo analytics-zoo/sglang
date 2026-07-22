@@ -103,7 +103,10 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import (
+    STOP_ON_EOS_OUTPUT_PREFIX_KEY,
+    SamplingParams,
+)
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
@@ -1238,15 +1241,12 @@ class Req(ReqDllmMixin):
         return False
 
     def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
-        if self.sampling_params.ignore_eos:
-            return False
-
         # Check stop token ids
-        matched_eos = False
-
         for i, token_id in enumerate(new_accepted_tokens):
-            if self.sampling_params.stop_token_ids:
-                matched_eos |= token_id in self.sampling_params.stop_token_ids
+            matched_eos = bool(
+                self.sampling_params.stop_token_ids
+                and token_id in self.sampling_params.stop_token_ids
+            )
             if self.eos_token_ids:
                 matched_eos |= token_id in self.eos_token_ids
             if self.tokenizer is not None:
@@ -1254,6 +1254,18 @@ class Req(ReqDllmMixin):
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
+                if self.sampling_params.ignore_eos:
+                    custom_params = self.sampling_params.custom_params
+                    stop_prefix = (
+                        custom_params.get(STOP_ON_EOS_OUTPUT_PREFIX_KEY)
+                        if isinstance(custom_params, dict)
+                        else None
+                    )
+                    if not stop_prefix or self.tokenizer is None:
+                        continue
+                    output_prefix = self.tokenizer.decode(self.output_ids[:16])
+                    if not output_prefix.lstrip().startswith(stop_prefix):
+                        continue
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
                 self.finished_len = matched_pos + 1

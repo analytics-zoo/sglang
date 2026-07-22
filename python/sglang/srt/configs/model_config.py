@@ -1377,6 +1377,8 @@ class ModelConfig:
         default_sampling_params = {
             p: config.get(p) for p in available_params if config.get(p) is not None
         }
+        if config.get("do_sample") is False:
+            default_sampling_params["temperature"] = 0.0
 
         return default_sampling_params
 

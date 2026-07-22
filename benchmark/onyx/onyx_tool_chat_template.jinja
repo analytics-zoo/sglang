@@ -10,9 +10,12 @@
 {%- endfor -%}
 {%- endif -%}
 {%- endmacro -%}
+{%- set use_parallel_native = tools is defined and tools and (parallel_tool_calls | default(false)) and (tool_choice | default('auto')) == 'auto' -%}
 {%- set tool_prompt = '' -%}
 {%- if tools is defined and tools -%}
-{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. When a function is needed, send your assistant message to the function name as recipient and put only JSON arguments in the message. After receiving a tool result, use it to answer the user instead of repeating the same call.' -%}
+{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. Decide whether functions are actually needed. Call a listed function only for external information or actions that the user explicitly requests and that require that function. Never call functions for arithmetic, translation, explanations, or stable general knowledge. Do not call unrelated functions. When a function is needed, send your assistant message to the function name as recipient and put only JSON arguments in the message.' -%}
+{%- if use_parallel_native -%}{%- set tool_prompt = tool_prompt + ' If multiple independent calls are needed, issue only the necessary calls, one recipient message per call, before replying to the user.' -%}{%- endif -%}
+{%- set tool_prompt = tool_prompt + ' After receiving a tool result, use it to answer the user instead of repeating the same call.' -%}
 {%- endif -%}
 {%- set ns = namespace(has_system=false) -%}
 {%- for m in messages -%}

@@ -16,8 +16,13 @@ class OnyxDetector(BaseFormatDetector):
     """Parse Onyx recipient tool calls: ``to=name{"arg": "value"}``."""
 
     _recipient = re.compile(r"^\s*to=(user|[A-Za-z_][A-Za-z0-9_.-]*)\s*")
+    _sequence_header = re.compile(
+        r"\s*(?:(?:<\|start\|>)?assistant\s+)?"
+        r"to=(user|[A-Za-z_][A-Za-z0-9_.-]*)\s*(<\|message\|>|\{)"
+    )
     _stream_header = re.compile(
-        r"^\s*to=([A-Za-z_][A-Za-z0-9_.-]*)\s*(<\|message\|>|\{)"
+        r"^\s*(?:(?:<\|start\|>)?assistant\s+)?"
+        r"to=([A-Za-z_][A-Za-z0-9_.-]*)\s*(<\|message\|>|\{)"
     )
     _end_tokens = ("<|eom|>", "<|eot|>")
 
@@ -26,6 +31,7 @@ class OnyxDetector(BaseFormatDetector):
         self._stream_name: str | None = None
         self._stream_tool_index: int | None = None
         self._stream_is_user = False
+        self._stream_user_visible = False
 
     def _strip_protocol_payload(self, payload: str) -> str:
         payload = payload.strip()
@@ -36,34 +42,73 @@ class OnyxDetector(BaseFormatDetector):
                 payload = payload[: -len(end_token)].rstrip()
         return payload
 
-    def _parse(self, text: str, tools: List[Tool]) -> ToolCallItem | None:
-        match = self._recipient.match(text)
-        if match is None:
-            return None
-        name = match.group(1)
-        tool_indices = self._get_tool_indices(tools)
-        if name not in tool_indices:
-            return None
-        payload = self._strip_protocol_payload(text[match.end() :])
+    def _parse_arguments(self, payload: str) -> str | None:
         try:
             arguments, end = json.JSONDecoder().raw_decode(payload)
         except json.JSONDecodeError:
             return None
         if payload[end:].strip() or not isinstance(arguments, dict):
             return None
-        return ToolCallItem(
-            tool_index=tool_indices[name],
-            name=name,
-            parameters=json.dumps(arguments, ensure_ascii=False),
-        )
+        return json.dumps(arguments, ensure_ascii=False)
+
+    def _find_end_token(self, text: str, start: int) -> tuple[int, str]:
+        end_pos = -1
+        end_token = ""
+        for candidate in self._end_tokens:
+            candidate_pos = text.find(candidate, start)
+            if candidate_pos != -1 and (
+                end_pos == -1 or candidate_pos < end_pos
+            ):
+                end_pos = candidate_pos
+                end_token = candidate
+        return end_pos, end_token
 
     def has_tool_call(self, text: str) -> bool:
         return self._recipient.match(text) is not None
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
-        call = self._parse(text, tools)
-        if call is not None:
-            return StreamingParseResult(calls=[call])
+        tool_indices = self._get_tool_indices(tools)
+        calls = []
+        pos = 0
+
+        while pos < len(text):
+            match = self._sequence_header.match(text, pos)
+            if match is None:
+                break
+
+            name = match.group(1)
+            payload_start = match.end()
+            if match.group(2) == "{":
+                payload_start -= 1
+            end_pos, end_token = self._find_end_token(text, payload_start)
+            payload_end = len(text) if end_pos == -1 else end_pos
+            payload = text[payload_start:payload_end].strip()
+
+            if name == "user":
+                if calls:
+                    return StreamingParseResult(calls=calls)
+                return StreamingParseResult(normal_text=payload)
+
+            if name not in tool_indices:
+                break
+            parameters = self._parse_arguments(payload)
+            if parameters is None:
+                break
+            calls.append(
+                ToolCallItem(
+                    tool_index=len(calls),
+                    name=name,
+                    parameters=parameters,
+                )
+            )
+
+            if end_pos == -1:
+                return StreamingParseResult(calls=calls)
+            pos = end_pos + len(end_token)
+
+        if calls:
+            return StreamingParseResult(calls=calls)
+
         match = self._recipient.match(text)
         if match is not None and match.group(1) == "user":
             return StreamingParseResult(
@@ -78,11 +123,27 @@ class OnyxDetector(BaseFormatDetector):
         calls = []
 
         if self._stream_name is None and not self._stream_is_user:
+            stripped = self._buffer.lstrip()
+            tool_result_prefix = "<|start|>tool"
+            if self.current_tool_id >= 0:
+                if tool_result_prefix.startswith(stripped):
+                    return StreamingParseResult()
+                if stripped.startswith(tool_result_prefix):
+                    self._buffer = ""
+                    return StreamingParseResult()
+
             match = self._stream_header.match(self._buffer)
             if match is None:
-                stripped = self._buffer.lstrip()
-                could_be_header = "to=".startswith(stripped) or stripped.startswith("to=")
-                if new_text and could_be_header:
+                header_prefixes = (
+                    "to=",
+                    "assistant to=",
+                    "<|start|>assistant to=",
+                )
+                could_be_header = any(
+                    prefix.startswith(stripped) or stripped.startswith(prefix)
+                    for prefix in header_prefixes
+                )
+                if could_be_header:
                     return StreamingParseResult()
                 if self._buffer:
                     normal_text = self._buffer
@@ -94,6 +155,7 @@ class OnyxDetector(BaseFormatDetector):
             tool_indices = self._get_tool_indices(tools)
             if name == "user":
                 self._stream_is_user = True
+                self._stream_user_visible = self.current_tool_id < 0
                 self._buffer = self._buffer[match.end() :]
                 if match.group(2) == "{":
                     self._buffer = "{" + self._buffer
@@ -104,8 +166,8 @@ class OnyxDetector(BaseFormatDetector):
             else:
                 separator = match.group(2)
                 self._stream_name = name
-                self._stream_tool_index = tool_indices[name]
-                self.current_tool_id = 0
+                self.current_tool_id += 1
+                self._stream_tool_index = self.current_tool_id
                 self.current_tool_name_sent = True
                 self.streamed_args_for_tool.append("")
                 self._buffer = self._buffer[match.end() :]
@@ -145,7 +207,10 @@ class OnyxDetector(BaseFormatDetector):
         if self._stream_is_user:
             if complete:
                 self._stream_is_user = False
-            return StreamingParseResult(normal_text=argument_delta)
+            normal_text = argument_delta if self._stream_user_visible else ""
+            if complete:
+                self._stream_user_visible = False
+            return StreamingParseResult(normal_text=normal_text)
 
         if argument_delta:
             assert self._stream_tool_index is not None
@@ -155,19 +220,28 @@ class OnyxDetector(BaseFormatDetector):
                     parameters=argument_delta,
                 )
             )
-            self.streamed_args_for_tool[0] += argument_delta
+            self.streamed_args_for_tool[self._stream_tool_index] += argument_delta
 
         if complete:
-            full_arguments = self.streamed_args_for_tool[0]
+            assert self._stream_tool_index is not None
+            completed_tool_index = self._stream_tool_index
+            full_arguments = self.streamed_args_for_tool[completed_tool_index]
             try:
                 parsed_arguments = json.loads(full_arguments)
             except json.JSONDecodeError:
                 parsed_arguments = {}
-            self.prev_tool_call_arr = [
+            self.prev_tool_call_arr.append(
                 {"name": self._stream_name, "arguments": parsed_arguments}
-            ]
+            )
             self._stream_name = None
             self._stream_tool_index = None
+
+            if self._buffer:
+                remainder = self.parse_streaming_increment("", tools)
+                calls.extend(remainder.calls)
+                return StreamingParseResult(
+                    calls=calls, normal_text=remainder.normal_text
+                )
 
         return StreamingParseResult(calls=calls)
 

@@ -20,9 +20,9 @@
 #   ONYX_ALLOW_LONG_CONTEXT=1 \
 #     bash benchmark/onyx/launch_onyx_fp8_tp2.sh
 #
-# Tool calling uses the checkpoint's default chat_template.jinja. The Onyx
-# parser supports one tool call per assistant turn, so clients must omit
-# parallel_tool_calls or set it to false.
+# Tool calling uses the tracked Onyx integration template. Auto mode supports
+# OpenAI parallel tool calls by default; required or named choice must set
+# parallel_tool_calls=false.
 #
 # Additional command-line arguments are appended to launch_server:
 #   bash benchmark/onyx/launch_onyx_fp8_tp2.sh --log-level info
@@ -36,6 +36,7 @@ ONYX_SGLANG_ROOT=${ONYX_SGLANG_ROOT:-${ONYX_DEFAULT_SGLANG_ROOT}}
 ONYX_WORKSPACE_ROOT=${ONYX_WORKSPACE_ROOT:-$(cd -- "${ONYX_SGLANG_ROOT}/.." && pwd)}
 ONYX_KERNEL_PYTHON=${ONYX_KERNEL_PYTHON:-${ONYX_WORKSPACE_ROOT}/llm-scaler/sglang/custom-esimd-kernels/python}
 ONYX_MODEL_PATH=${ONYX_MODEL_PATH:-/llm/workspace/model/onyx-hf}
+ONYX_TOOL_CHAT_TEMPLATE=${ONYX_TOOL_CHAT_TEMPLATE:-${ONYX_SCRIPT_DIR}/onyx_tool_chat_template.jinja}
 ONYX_PYTHON=${ONYX_PYTHON:-python3}
 ONYX_HOST=${ONYX_HOST:-0.0.0.0}
 ONYX_PORT=${ONYX_PORT:-31888}
@@ -82,8 +83,8 @@ if [[ ! -d "${ONYX_MODEL_PATH}" ]]; then
   echo "Onyx model directory does not exist: ${ONYX_MODEL_PATH}" >&2
   exit 1
 fi
-if [[ ! -f "${ONYX_MODEL_PATH}/chat_template.jinja" ]]; then
-  echo "Onyx tool-calling template does not exist: ${ONYX_MODEL_PATH}/chat_template.jinja" >&2
+if [[ ! -f "${ONYX_TOOL_CHAT_TEMPLATE}" ]]; then
+  echo "Onyx tool-calling template does not exist: ${ONYX_TOOL_CHAT_TEMPLATE}" >&2
   exit 1
 fi
 if [[ ! -d "${ONYX_KERNEL_PYTHON}" ]]; then
@@ -113,6 +114,7 @@ esac
 ONYX_SERVER_ARGS=(
   -m sglang.launch_server
   --model-path "${ONYX_MODEL_PATH}"
+  --chat-template "${ONYX_TOOL_CHAT_TEMPLATE}"
   --trust-remote-code
   --model-impl sglang
   --tool-call-parser onyx
@@ -151,6 +153,7 @@ if [[ "${ONYX_DRY_RUN}" == "1" ]]; then
   printf 'ONYX_MAX_TOTAL_TOKENS=%q\n' "${ONYX_MAX_TOTAL_TOKENS}"
   printf 'ONYX_CHUNKED_PREFILL_SIZE=%q\n' "${ONYX_CHUNKED_PREFILL_SIZE}"
   printf 'ONYX_ALLOW_LONG_CONTEXT=%q\n' "${ONYX_ALLOW_LONG_CONTEXT}"
+  printf 'ONYX_TOOL_CHAT_TEMPLATE=%q\n' "${ONYX_TOOL_CHAT_TEMPLATE}"
   if [[ -n "${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN:-}" ]]; then
     printf 'SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=%q\n' "${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN}"
   fi

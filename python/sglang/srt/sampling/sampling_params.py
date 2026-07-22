@@ -27,6 +27,8 @@ TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
 
+STOP_ON_EOS_OUTPUT_PREFIX_KEY = "__stop_on_eos_output_prefix"
+
 
 class SamplingParams:
     """

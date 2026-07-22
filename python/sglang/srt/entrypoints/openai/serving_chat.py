@@ -68,12 +68,19 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.sampling.sampling_params import STOP_ON_EOS_OUTPUT_PREFIX_KEY
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+ONYX_PARALLEL_STOP_REGEXES = [
+    r"<\|eo[mt]\|><\|start\|>tool ",
+    r"<\|eo[mt]\|>(?:<\|start\|>)?assistant to=user<\|message\|>",
+]
+ONYX_DIRECT_USER_PREFIX = "to=user<|message|>"
 
 
 def normalize_tool_content(role: str, content):
@@ -96,6 +103,65 @@ def normalize_tool_content(role: str, content):
         text_parts = [p.get("text", "") if isinstance(p, dict) else p for p in parts]
         return " ".join(text_parts)
     return content
+
+
+def normalize_onyx_tool_history(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Expand OpenAI parallel tool history into Onyx recipient/tool pairs."""
+    normalized = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        tool_calls = message.get("tool_calls") or []
+        if message.get("role") != "assistant" or len(tool_calls) <= 1:
+            normalized.append(message)
+            index += 1
+            continue
+
+        results = []
+        next_index = index + 1
+        while (
+            next_index < len(messages)
+            and messages[next_index].get("role") == "tool"
+        ):
+            results.append(messages[next_index])
+            next_index += 1
+
+        results_by_id = {}
+        for result in results:
+            call_id = result.get("tool_call_id")
+            if not call_id or call_id in results_by_id:
+                raise ValueError(
+                    f"parallel tool turn at message {index} has ambiguous results"
+                )
+            results_by_id[call_id] = result
+
+        used_ids = set()
+        for call_index, tool_call in enumerate(tool_calls):
+            call_id = tool_call.get("id")
+            if call_id in used_ids:
+                raise ValueError(
+                    f"parallel tool call at message {index} has duplicate id {call_id}"
+                )
+            if not call_id or call_id not in results_by_id:
+                raise ValueError(
+                    f"parallel tool call at message {index} has no matching result"
+                )
+            assistant_turn = dict(message)
+            assistant_turn["tool_calls"] = [tool_call]
+            if call_index > 0:
+                assistant_turn["content"] = ""
+                if "reasoning_content" in assistant_turn:
+                    assistant_turn["reasoning_content"] = ""
+            normalized.extend((assistant_turn, results_by_id[call_id]))
+            used_ids.add(call_id)
+
+        if used_ids != set(results_by_id):
+            raise ValueError(f"parallel tool turn at message {index} has extra results")
+        index = next_index
+
+    return normalized
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
@@ -419,11 +485,12 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tool_call_parser == "onyx"
             and request.tools
             and request.parallel_tool_calls
+            and request.tool_choice not in ("auto", "none")
         ):
             if "parallel_tool_calls" in request.model_fields_set:
                 return (
-                    "Onyx supports one tool call per assistant turn; "
-                    "set parallel_tool_calls=false."
+                    "Onyx parallel tool calls currently require tool_choice='auto'; "
+                    "set parallel_tool_calls=false for required or named tool choice."
                 )
             request.parallel_tool_calls = False
 
@@ -505,6 +572,25 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
+        if (
+            self.tool_call_parser == "onyx"
+            and request.tools
+            and request.tool_choice == "auto"
+            and request.parallel_tool_calls
+        ):
+            configured_stop_regex = sampling_params.get("stop_regex")
+            if configured_stop_regex is None:
+                configured_stop_regex = []
+            elif isinstance(configured_stop_regex, str):
+                configured_stop_regex = [configured_stop_regex]
+            sampling_params["stop_regex"] = [
+                *configured_stop_regex,
+                *ONYX_PARALLEL_STOP_REGEXES,
+            ]
+            custom_params = dict(sampling_params.get("custom_params") or {})
+            custom_params[STOP_ON_EOS_OUTPUT_PREFIX_KEY] = ONYX_DIRECT_USER_PREFIX
+            sampling_params["custom_params"] = custom_params
+            sampling_params["ignore_eos"] = True
 
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
@@ -586,6 +672,11 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.server_args.reasoning_parser is None
         )
         tool_call_constraint = None
+        use_onyx_auto_parallel = (
+            self.tool_call_parser == "onyx"
+            and request.tool_choice == "auto"
+            and request.parallel_tool_calls
+        )
 
         # Apply chat template and its stop strings
         tools = None
@@ -599,7 +690,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser:
+            if self.tool_call_parser and not use_onyx_auto_parallel:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
@@ -781,6 +872,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 openai_compatible_messages.append(processed_msg)
 
+            if self.tool_call_parser == "onyx":
+                openai_compatible_messages = normalize_onyx_tool_history(
+                    openai_compatible_messages
+                )
+
             # Handle continue_final_message: separate final assistant message
             openai_compatible_messages, assistant_prefix = (
                 self._handle_last_assistant_message(openai_compatible_messages, request)
@@ -791,6 +887,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            if self.tool_call_parser == "onyx":
+                extra_template_kwargs["tool_choice"] = (
+                    request.tool_choice
+                    if isinstance(request.tool_choice, str)
+                    else "named"
+                )
+                extra_template_kwargs["parallel_tool_calls"] = (
+                    request.parallel_tool_calls
+                )
 
             # Split apply_chat_template(tokenize=True) into render + encode so we
             # can skip add_special_tokens=False on tokenizers that don't auto-add
@@ -1653,7 +1758,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self,
         index: int,
         delta: str,
-        parser_dict: Dict[int, FunctionCallParser],
+        parser_dict: Dict[int, Union[FunctionCallParser, JsonArrayParser]],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],

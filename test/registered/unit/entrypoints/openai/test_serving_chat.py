@@ -25,10 +25,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
+    normalize_onyx_tool_history,
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
+from sglang.srt.sampling.sampling_params import STOP_ON_EOS_OUTPUT_PREFIX_KEY
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -509,7 +511,7 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
-    def test_onyx_rejects_parallel_tool_calls(self):
+    def test_onyx_allows_auto_parallel_tool_calls(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -526,13 +528,54 @@ class ServingChatTestCase(unittest.TestCase):
             parallel_tool_calls=True,
         )
 
-        self.assertEqual(
-            self.chat._validate_request(req),
-            "Onyx supports one tool call per assistant turn; "
-            "set parallel_tool_calls=false.",
+        self.assertIsNone(self.chat._validate_request(req))
+        self.assertTrue(req.parallel_tool_calls)
+
+    def test_onyx_rejects_required_parallel_tool_calls(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="required",
+            parallel_tool_calls=True,
         )
 
-    def test_onyx_defaults_to_single_tool_call(self):
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "Onyx parallel tool calls currently require tool_choice='auto'; "
+            "set parallel_tool_calls=false for required or named tool choice.",
+        )
+
+    def test_onyx_defaults_required_tool_choice_to_single_call(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            tool_choice="required",
+        )
+
+        self.assertIsNone(self.chat._validate_request(req))
+        self.assertFalse(req.parallel_tool_calls)
+
+    def test_onyx_defaults_to_auto_parallel_tool_calls(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -549,7 +592,350 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(self.chat._validate_request(req))
+        self.assertTrue(req.parallel_tool_calls)
+
+    def test_onyx_preserves_explicit_single_tool_call_mode(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            parallel_tool_calls=False,
+        )
+
+        self.assertIsNone(self.chat._validate_request(req))
         self.assertFalse(req.parallel_tool_calls)
+
+    def test_onyx_auto_parallel_passes_native_template_mode(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "onyx"
+        self.tm.tokenizer.apply_chat_template.return_value = "prompt"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Compare Paris and Tokyo."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "strict": True,
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+
+        kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertEqual(kwargs["tool_choice"], "auto")
+        self.assertTrue(kwargs["parallel_tool_calls"])
+        self.assertIsNone(result.tool_call_constraint)
+
+    def test_onyx_auto_parallel_sets_native_stop_policy(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "onyx"
+        self.tm.tokenizer.apply_chat_template.return_value = "prompt"
+        self.tm.tokenizer.get_vocab.return_value = {
+            "a": 0,
+            "." * 113: 1,
+        }
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Compare Paris and Tokyo."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            max_tokens=128,
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertTrue(adapted.sampling_params["ignore_eos"])
+        self.assertFalse(adapted.sampling_params["no_stop_trim"])
+        self.assertEqual(len(adapted.sampling_params["stop_regex"]), 2)
+        self.assertIn("start", adapted.sampling_params["stop_regex"][0])
+        self.assertIn("tool ", adapted.sampling_params["stop_regex"][0])
+        self.assertIn("assistant to=user", adapted.sampling_params["stop_regex"][1])
+        self.assertIn("eo[mt]", adapted.sampling_params["stop_regex"][1])
+        self.assertEqual(
+            adapted.sampling_params["custom_params"][
+                STOP_ON_EOS_OUTPUT_PREFIX_KEY
+            ],
+            "to=user<|message|>",
+        )
+
+    def test_onyx_auto_parallel_preserves_client_stop_trimming(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "onyx"
+        self.tm.tokenizer.apply_chat_template.return_value = "prompt"
+        self.tm.tokenizer.get_vocab.return_value = {"a": 0}
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            stop=["4"],
+            max_tokens=128,
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req)
+
+        self.assertEqual(adapted.sampling_params["stop"], ["4"])
+        self.assertFalse(adapted.sampling_params["no_stop_trim"])
+
+    def test_onyx_auto_parallel_non_streaming_native_calls(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Compare Paris and Tokyo."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        finish_reason = {"type": "stop", "matched": 200008}
+
+        tool_calls, text, finish_reason = self.chat._process_tool_calls(
+            text=(
+                ' to=get_weather<|message|>{"city":"Paris"}<|eot|>'
+                '<|start|>assistant to=get_weather<|message|>'
+                '{"city":"Tokyo"}<|eot|>'
+                "<|start|>assistant to=user<|message|>"
+            ),
+            tools=req.tools,
+            finish_reason=finish_reason,
+            tool_choice=req.tool_choice,
+        )
+
+        self.assertEqual(text, "")
+        self.assertEqual(finish_reason, {"type": "tool_calls", "matched": None})
+        self.assertEqual([call.index for call in tool_calls], [0, 1])
+        self.assertEqual(
+            [json.loads(call.function.arguments) for call in tool_calls],
+            [{"city": "Paris"}, {"city": "Tokyo"}],
+        )
+        self.assertNotEqual(tool_calls[0].id, tool_calls[1].id)
+
+    def test_onyx_auto_parallel_non_streaming_user_response(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        finish_reason = {"type": "stop", "matched": 200008}
+
+        tool_calls, text, finish_reason = self.chat._process_tool_calls(
+            text=" to=user<|message|>2+2 equals 4.<|eot|>",
+            tools=req.tools,
+            finish_reason=finish_reason,
+            tool_choice=req.tool_choice,
+        )
+
+        self.assertIsNone(tool_calls)
+        self.assertEqual(text, "2+2 equals 4.")
+        self.assertEqual(finish_reason["type"], "stop")
+
+    def test_onyx_normalizes_parallel_tool_history(self):
+        messages = [
+            {"role": "user", "content": "Inspect both files."},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Use both tools.",
+                "tool_calls": [
+                    {
+                        "id": "call_list",
+                        "type": "function",
+                        "function": {"name": "list_directory", "arguments": {}},
+                    },
+                    {
+                        "id": "call_glob",
+                        "type": "function",
+                        "function": {"name": "glob", "arguments": {"pattern": "*"}},
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_list",
+                "content": "a.txt",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_glob",
+                "content": "b.txt",
+            },
+            {"role": "user", "content": "Continue."},
+        ]
+
+        normalized = normalize_onyx_tool_history(messages)
+
+        self.assertEqual(
+            [message["role"] for message in normalized],
+            ["user", "assistant", "tool", "assistant", "tool", "user"],
+        )
+        self.assertEqual(normalized[1]["tool_calls"][0]["id"], "call_list")
+        self.assertEqual(normalized[2]["tool_call_id"], "call_list")
+        self.assertEqual(normalized[3]["tool_calls"][0]["id"], "call_glob")
+        self.assertEqual(normalized[3]["reasoning_content"], "")
+        self.assertEqual(normalized[4]["tool_call_id"], "call_glob")
+
+    def test_onyx_parallel_tool_history_requires_matching_results(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": {}},
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": {}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "done"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "has no matching result"):
+            normalize_onyx_tool_history(messages)
+
+    def test_onyx_parallel_tool_history_rejects_duplicate_call_ids(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": {}},
+                    },
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": {}},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_a", "content": "done"},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "has duplicate id call_a"):
+            normalize_onyx_tool_history(messages)
+
+    def test_onyx_jinja_receives_normalized_parallel_tool_history(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Inspect both files."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_list",
+                            "type": "function",
+                            "function": {
+                                "name": "list_directory",
+                                "arguments": "{}",
+                            },
+                        },
+                        {
+                            "id": "call_glob",
+                            "type": "function",
+                            "function": {
+                                "name": "glob",
+                                "arguments": '{"pattern": "*"}',
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_list",
+                    "content": "a.txt",
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_glob",
+                    "content": "b.txt",
+                },
+                {"role": "user", "content": "Continue."},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_directory",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "glob",
+                        "parameters": {"type": "object"},
+                    },
+                },
+            ],
+        )
+
+        self.chat._process_messages(req, is_multimodal=False)
+
+        template_messages = self.tm.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(
+            [message["role"] for message in template_messages],
+            ["user", "assistant", "tool", "assistant", "tool", "user"],
+        )
+        self.assertEqual(template_messages[1]["tool_calls"][0]["id"], "call_list")
+        self.assertEqual(template_messages[3]["tool_calls"][0]["id"], "call_glob")
 
     def test_xgrammar_tag_omits_reasoning_when_parser_owns_it(self):
         """ReasonerGrammarBackend owns the thinking prefix when a parser is set."""
