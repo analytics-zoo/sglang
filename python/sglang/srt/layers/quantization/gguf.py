@@ -1147,20 +1147,19 @@ def _xpu_repack_q5_k_down_combined(qweight: torch.Tensor,
         u5, scale, minv = _xpu_q5_k_elem(qweight)
         K = u5.shape[1]
         ql = _pack_nibble_interleaved(u5)
-        qh = _preshuffle_qh1((u5 >> 4) & 1, K)
         hbit = ((u5 >> 4) & 1).to(torch.uint8).view(N, K // 8, 8)
         weights = (1 << torch.arange(8, dtype=torch.int32, device=u5.device))
         qh_plain = (hbit.to(torch.int32) * weights).sum(dim=2).to(torch.uint8)
-        return ql, qh, scale.contiguous(), minv.contiguous(), qh_plain.contiguous()
-    ql_out, qh_out, qhp_out, sc_out, mn_out = [], [], [], [], []
+        return ql, scale.contiguous(), minv.contiguous(), qh_plain.contiguous()
+    ql_out, qhp_out, sc_out, mn_out = [], [], [], []
     for lo in range(0, N, chunk_rows):
         hi = min(lo + chunk_rows, N)
         r = _xpu_repack_q5_k_down_combined(qweight[lo:hi], chunk_rows)
-        ql_out.append(r[0]); qh_out.append(r[1]); sc_out.append(r[2])
-        mn_out.append(r[3]); qhp_out.append(r[4])
+        ql_out.append(r[0]); sc_out.append(r[1])
+        mn_out.append(r[2]); qhp_out.append(r[3])
         if qweight.device.type == "xpu":
             torch.xpu.empty_cache()
-    return (torch.cat(ql_out, 0), torch.cat(qh_out, 0), torch.cat(sc_out, 0),
+    return (torch.cat(ql_out, 0), torch.cat(sc_out, 0),
             torch.cat(mn_out, 0), torch.cat(qhp_out, 0))
 
 
@@ -1172,19 +1171,18 @@ def _xpu_repack_q6_k_down_combined(qweight: torch.Tensor,
         u6, scale = _xpu_q6_k_elem(qweight)
         K = u6.shape[1]
         ql = _pack_nibble_interleaved(u6)
-        qh = _preshuffle_qh2((u6 >> 4) & 3, K)
         h2 = ((u6 >> 4) & 3).to(torch.int32).view(N, K // 4, 4)
         shifts = (2 * torch.arange(4, dtype=torch.int32, device=u6.device))
         qh_plain = (h2 << shifts).sum(dim=2).to(torch.uint8)
-        return ql, qh, scale.contiguous(), qh_plain.contiguous()
-    ql_out, qh_out, qhp_out, sc_out = [], [], [], []
+        return ql, scale.contiguous(), qh_plain.contiguous()
+    ql_out, qhp_out, sc_out = [], [], []
     for lo in range(0, N, chunk_rows):
         hi = min(lo + chunk_rows, N)
         r = _xpu_repack_q6_k_down_combined(qweight[lo:hi], chunk_rows)
-        ql_out.append(r[0]); qh_out.append(r[1]); sc_out.append(r[2]); qhp_out.append(r[3])
+        ql_out.append(r[0]); sc_out.append(r[1]); qhp_out.append(r[2])
         if qweight.device.type == "xpu":
             torch.xpu.empty_cache()
-    return torch.cat(ql_out, 0), torch.cat(qh_out, 0), torch.cat(sc_out, 0), torch.cat(qhp_out, 0)
+    return torch.cat(ql_out, 0), torch.cat(sc_out, 0), torch.cat(qhp_out, 0)
 
 
 def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
@@ -2122,33 +2120,24 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         down_b = w2.reshape(E * Nd, Kbd).contiguous()
         del w2
         self._grouped_ok = _moe_grouped is not None
-        # MEMORY (TP=1 OOM fix, cont'd): the decode-packed rep (ql/qh/scale/[minv])
-        # and the grouped-prefill PLAIN-qh rep used to be built by two separate
-        # calls (_xpu_repack_q5_k/_q6_k then _xpu_repack_q5_k_plain/_q6_k_plain),
-        # each re-deriving the element-order u5/u6 int32 [N,K] tensor from
-        # scratch (N=E*Nd rows -> several GB for a full down-proj layer). The
-        # *_down_combined helpers derive u5/u6 ONCE and chunk over rows (see
-        # SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS) so peak memory no longer scales
-        # with E*Nd at all.
+        # Down proj: decode + grouped-prefill kernels both read PLAIN qh, so
+        # down_qh_plain is the only high-bit rep we keep (no 512-tile pre-shuffle).
+        # The *_down_combined helpers derive u5/u6 ONCE and chunk over rows (see
+        # SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS) so peak memory does not scale
+        # with E*Nd.
         if self._down_is_q6:
-            if self._grouped_ok:
-                ql, qh, sc, qh_plain = _xpu_repack_q6_k_down_combined(down_b)
-                self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
-                del qh_plain
-            else:
-                ql, qh, sc = _xpu_repack_q6_k(down_b)
-            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
+            ql, sc, qh_plain = _xpu_repack_q6_k_down_combined(down_b)
+            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
+            del qh_plain
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
             self.down_mn = torch.zeros(1, dtype=torch.float16, device=dev)
-            del ql, qh, sc
+            del ql, sc
         else:
-            if self._grouped_ok:
-                ql, qh, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
-                self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
-                del qh_plain
-            else:
-                ql, qh, sc, mn = _xpu_repack_q5_k(down_b)
-            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
-            del ql, qh, sc, mn
+            ql, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
+            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
+            del qh_plain
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
+            del ql, sc, mn
         del down_b
         # dims: w13 gate rows = intermediate; hidden from gate K (=ql cols*2).
         self.intermediate = half
@@ -2203,10 +2192,10 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
                          M, hidden, inter, top_k)
         out_partial = torch.empty(n_routed, hidden, dtype=torch.float16, device=x2.device)
         if self._down_is_q6:
-            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
                                sel, tw, out_partial, M, hidden, inter, top_k)
         else:
-            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
                                self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
         # sum the top_k per-route partials back to per-token output (one op).
         out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
