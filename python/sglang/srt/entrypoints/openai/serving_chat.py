@@ -57,7 +57,7 @@ from sglang.srt.entrypoints.openai.utils import (
     to_openai_style_logprobs,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.core_types import ToolCallItem, ToolCallParseError
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import (
@@ -68,19 +68,13 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.sampling.sampling_params import STOP_ON_EOS_OUTPUT_PREFIX_KEY
+from sglang.srt.sampling.sampling_params import ONYX_PROTOCOL_TOKEN_IDS_KEY
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
-
-ONYX_PARALLEL_STOP_REGEXES = [
-    r"<\|eo[mt]\|><\|start\|>tool ",
-    r"<\|eo[mt]\|>(?:<\|start\|>)?assistant to=user<\|message\|>",
-]
-ONYX_DIRECT_USER_PREFIX = "to=user<|message|>"
 
 
 def normalize_tool_content(role: str, content):
@@ -418,7 +412,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
 
         # Handle tool calls
-        if request.tool_choice != "none" and request.tools and self.tool_call_parser:
+        if self.tool_call_parser == "onyx" or (
+            request.tool_choice != "none" and request.tools and self.tool_call_parser
+        ):
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -434,6 +430,16 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
+                if isinstance(parser, FunctionCallParser):
+                    final_normal_text = parser.finalize_stream()
+                    if final_normal_text:
+                        yield build_sse_content(
+                            chunk_id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            content=final_normal_text,
+                        )
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
                 )
@@ -463,6 +469,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
+        self._apply_onyx_tool_policy(request)
+
         if not request.messages:
             return "Messages cannot be empty."
 
@@ -480,19 +488,6 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_exists = any(tool.function.name == tool_name for tool in request.tools)
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
-
-        if (
-            self.tool_call_parser == "onyx"
-            and request.tools
-            and request.parallel_tool_calls
-            and request.tool_choice not in ("auto", "none")
-        ):
-            if "parallel_tool_calls" in request.model_fields_set:
-                return (
-                    "Onyx parallel tool calls currently require tool_choice='auto'; "
-                    "set parallel_tool_calls=false for required or named tool choice."
-                )
-            request.parallel_tool_calls = False
 
         # Validate tool definitions
         for i, tool in enumerate(request.tools or []):
@@ -531,6 +526,65 @@ class OpenAIServingChat(OpenAIServingBase):
                 return "schema_ is required for json_schema response format request."
 
         return None
+
+    def _apply_onyx_tool_policy(self, request: ChatCompletionRequest) -> None:
+        if self.tool_call_parser != "onyx" or not request.tools:
+            return
+
+        # Onyx serving is intentionally single-call and schema-strict. Client
+        # capability hints must not weaken this server-side policy.
+        request.parallel_tool_calls = False
+        for tool in request.tools:
+            tool.function.strict = True
+
+    def _apply_onyx_protocol_token_policy(
+        self, sampling_params: Dict[str, Any]
+    ) -> None:
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is None:
+            raise ValueError("Onyx protocol handling requires a tokenizer.")
+
+        vocab = tokenizer.get_vocab()
+
+        def get_special_token_id(token: str) -> int:
+            token_id = vocab.get(token)
+            if not isinstance(token_id, int):
+                token_id = tokenizer.convert_tokens_to_ids(token)
+            if not isinstance(token_id, int) or token_id < 0:
+                raise ValueError(f"Onyx tokenizer is missing special token {token}.")
+            return token_id
+
+        eom_token_id = get_special_token_id("<|eom|>")
+        eot_token_id = get_special_token_id("<|eot|>")
+        start_token_id = get_special_token_id("<|start|>")
+        message_token_id = get_special_token_id("<|message|>")
+        if len({eom_token_id, eot_token_id, start_token_id, message_token_id}) != 4:
+            raise ValueError("Onyx protocol special tokens must have distinct token IDs.")
+
+        self_recipient_prefixes = []
+        for prefix in ("to=self", " to=self"):
+            token_ids = tokenizer.encode(prefix, add_special_tokens=False)
+            if (
+                not token_ids
+                or not isinstance(token_ids, list)
+                or not all(isinstance(token_id, int) for token_id in token_ids)
+            ):
+                raise ValueError(
+                    f"Onyx tokenizer cannot encode recipient prefix {prefix!r}."
+                )
+            if token_ids not in self_recipient_prefixes:
+                self_recipient_prefixes.append(token_ids)
+
+        custom_params = dict(sampling_params.get("custom_params") or {})
+        custom_params[ONYX_PROTOCOL_TOKEN_IDS_KEY] = {
+            "eom": eom_token_id,
+            "eot": eot_token_id,
+            "start": start_token_id,
+            "message": message_token_id,
+            "self_recipient_prefixes": self_recipient_prefixes,
+        }
+        sampling_params["custom_params"] = custom_params
+        sampling_params["ignore_eos"] = False
 
     def _convert_to_internal_request(
         self,
@@ -572,25 +626,8 @@ class OpenAIServingChat(OpenAIServingBase):
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
-        if (
-            self.tool_call_parser == "onyx"
-            and request.tools
-            and request.tool_choice == "auto"
-            and request.parallel_tool_calls
-        ):
-            configured_stop_regex = sampling_params.get("stop_regex")
-            if configured_stop_regex is None:
-                configured_stop_regex = []
-            elif isinstance(configured_stop_regex, str):
-                configured_stop_regex = [configured_stop_regex]
-            sampling_params["stop_regex"] = [
-                *configured_stop_regex,
-                *ONYX_PARALLEL_STOP_REGEXES,
-            ]
-            custom_params = dict(sampling_params.get("custom_params") or {})
-            custom_params[STOP_ON_EOS_OUTPUT_PREFIX_KEY] = ONYX_DIRECT_USER_PREFIX
-            sampling_params["custom_params"] = custom_params
-            sampling_params["ignore_eos"] = True
+        if self.tool_call_parser == "onyx":
+            self._apply_onyx_protocol_token_policy(sampling_params)
 
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
@@ -658,8 +695,10 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        self._apply_onyx_tool_policy(request)
+
         # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss or self.is_gemma4:
+        if self.is_gpt_oss or self.is_gemma4 or self.tool_call_parser == "onyx":
             request.skip_special_tokens = False
 
         self._patch_reasoning_skip_special_tokens(request)
@@ -672,11 +711,6 @@ class OpenAIServingChat(OpenAIServingBase):
             self.tokenizer_manager.server_args.reasoning_parser is None
         )
         tool_call_constraint = None
-        use_onyx_auto_parallel = (
-            self.tool_call_parser == "onyx"
-            and request.tool_choice == "auto"
-            and request.parallel_tool_calls
-        )
 
         # Apply chat template and its stop strings
         tools = None
@@ -690,7 +724,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser and not use_onyx_auto_parallel:
+            if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
@@ -1301,11 +1335,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if not isinstance(ret, list):
             ret = [ret]
 
-        response = self._build_chat_response(
-            request,
-            ret,
-            int(time.time()),
-        )
+        try:
+            response = self._build_chat_response(request, ret, int(time.time()))
+        except ToolCallParseError as e:
+            logger.error("Onyx tool call validation error: %s", e)
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=500,
+            )
 
         return response
 
@@ -1371,15 +1409,20 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle tool calls
             tool_calls = None
-            if (
+            if self.tool_call_parser == "onyx" or (
                 request.tool_choice != "none"
                 and request.tools
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+                tools_for_parsing = (
+                    request.tools
+                    if request.tool_choice != "none" and request.tools
+                    else []
+                )
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
-                    request.tools,
+                    tools_for_parsing,
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
@@ -1530,12 +1573,23 @@ class OpenAIServingChat(OpenAIServingBase):
             should_try_parser = (
                 not is_required or parser.detector.supports_structural_tag()
             )
-            if should_try_parser and parser.has_tool_call(text):
+            if should_try_parser and (
+                parser.has_tool_call(text) or self.tool_call_parser == "onyx"
+            ):
                 original_finish_reason = finish_reason.copy()
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
                         return ToolCallProcessingResult(None, text, finish_reason)
+                    if self.tool_call_parser == "onyx":
+                        if len(call_info_list) != 1:
+                            raise ToolCallParseError(
+                                "Onyx supports at most one tool call per "
+                                "assistant response"
+                            )
+                        self._validate_onyx_tool_arguments(
+                            call_info_list[0], tools
+                        )
                     if finish_reason["type"] == "stop":
                         finish_reason["type"] = "tool_calls"
                         finish_reason["matched"] = None
@@ -1555,6 +1609,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
                         )
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
+                except ToolCallParseError:
+                    finish_reason.update(original_finish_reason)
+                    raise
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
                     finish_reason.update(original_finish_reason)
@@ -1597,6 +1654,45 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         return ToolCallProcessingResult(None, text, finish_reason)
+
+    def _validate_onyx_tool_arguments(
+        self, call_info: ToolCallItem, tools: List[Any]
+    ) -> None:
+        tool = next(
+            (
+                candidate
+                for candidate in tools
+                if candidate.function.name == call_info.name
+            ),
+            None,
+        )
+        if tool is None:
+            raise ToolCallParseError(
+                f"Onyx generated an unknown tool recipient: {call_info.name}"
+            )
+
+        try:
+            arguments = orjson.loads(call_info.parameters)
+        except orjson.JSONDecodeError as e:
+            raise ToolCallParseError(
+                f"Onyx tool '{call_info.name}' arguments are invalid JSON"
+            ) from e
+        if not isinstance(arguments, dict):
+            raise ToolCallParseError(
+                f"Onyx tool '{call_info.name}' arguments are not a JSON object"
+            )
+
+        schema = tool.function.parameters
+        if schema is None:
+            return
+        error = next(Draft202012Validator(schema).iter_errors(arguments), None)
+        if error is not None:
+            path = ".".join(str(part) for part in error.absolute_path)
+            location = f" at '{path}'" if path else ""
+            raise ToolCallParseError(
+                f"Onyx tool '{call_info.name}' arguments violate its schema"
+                f"{location}: {error.message}"
+            )
 
     def _process_streaming_logprobs(
         self,
@@ -1765,6 +1861,11 @@ class OpenAIServingChat(OpenAIServingBase):
         continuous_usage_stats: bool = False,
     ):
         """Process tool calls in streaming response"""
+        active_tools = (
+            request.tools
+            if request.tool_choice != "none" and request.tools
+            else []
+        )
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
@@ -1778,7 +1879,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 use_native_parser = False
                 if self.tool_call_parser:
                     probe = FunctionCallParser(
-                        tools=request.tools,
+                        tools=active_tools,
                         tool_call_parser=self.tool_call_parser,
                     )
                     use_native_parser = probe.detector.supports_structural_tag()
@@ -1788,7 +1889,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(
-                    tools=request.tools,
+                    tools=active_tools,
                     tool_call_parser=self.tool_call_parser,
                 )
 
@@ -1796,7 +1897,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, request.tools)
+            result = parser.parse_streaming_increment(delta, active_tools)
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)

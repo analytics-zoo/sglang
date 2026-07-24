@@ -279,7 +279,8 @@ class TestOnyxArchitectureSemantics(unittest.TestCase):
 
     def test_fp8_fast_path_shape_qualification(self):
         self.assertTrue(_xpu_fp8_esimd_shape_qualified(1, 9984, 6656))
-        self.assertFalse(_xpu_fp8_esimd_shape_qualified(2, 9984, 6656))
+        self.assertTrue(_xpu_fp8_esimd_shape_qualified(2, 9984, 6656))
+        self.assertTrue(_xpu_fp8_esimd_shape_qualified(64, 9984, 6656))
         self.assertTrue(_xpu_fp8_esimd_shape_qualified(32, 6656, 19968))
         self.assertFalse(_xpu_fp8_esimd_shape_qualified(64, 6656, 19968))
         self.assertFalse(_xpu_fp8_w8a16_shape_qualified(128, 6656, 2048))

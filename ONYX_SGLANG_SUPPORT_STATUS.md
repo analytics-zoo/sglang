@@ -622,6 +622,8 @@ Validation results:
 - Distributed initialization can still intermittently block before weight
   loading. Diagnostic runs use a 30-second phase watchdog and restart the whole
   container on this condition.
+- The complete tool-calling contract, qualification matrix, and Agent-runtime
+  boundary are maintained in `ONYX_TOOL_CALLING_STATUS.md`.
 - OpenAI-compatible tool calling uses the tracked
   `benchmark/onyx/onyx_tool_chat_template.jinja` plus
   `--tool-call-parser onyx`; the launch script passes that template explicitly
@@ -630,45 +632,57 @@ Validation results:
   `assistant.tool_calls` history, resolves a subsequent `tool_call_id` to its
   function name, and retains the legacy `recipient` input for compatibility.
 - `tool_choice=auto`, native `required`, and named-function constraints are
-  qualified on the TP=2 online-FP8 service. Streaming emits the function name
-  followed by incremental argument fragments. A complete standard OpenAI
-  round trip returns `get_weather({"city":"Paris"})`, accepts a tool result
-  carrying only `tool_call_id`, and produces the final answer
-  `The current temperature in Paris is 18°C.` with `finish_reason=stop`.
-- `tool_choice=auto` supports one or more native recipient calls in one OpenAI
-  response and honors the protocol default `parallel_tool_calls=true`.
-  `required` and named choice retain the native single-call structural
-  constraint and therefore require `parallel_tool_calls=false`; when that field
-  is omitted, the server preserves compatibility by selecting single-call mode.
-- Native calls are separated by tokens that the checkpoint also declares as
-  EOS. Auto-parallel requests ignore EOS for tool-recipient output, but honor
-  the first EOS when the generated output starts with the direct-user prefix.
-  After one or more calls, bounded transition regexes stop when the model moves
-  to either a user response or a tool-result block. This avoids an
-  answer-length regex and full-output re-decode on every decode step. The parser
-  accepts repeated assistant recipient blocks, assigns response-local indexes
-  `0..N-1`, and suppresses the generated transition header. A zero-call
-  response preserves the complete native `to=user` body.
-- The final deterministic OpenAI matrix passes 8/8 cases: four zero-call
-  arithmetic/translation/explanation/stable-knowledge prompts, two single-call
-  weather/time prompts, one repeated-function two-call prompt, and one
-  two-function parallel prompt. The streaming subset passes zero, one, and two
-  calls with unique IDs, incremental arguments, and the expected
-  `stop`/`tool_calls` finish reasons. A 3,359-character zero-call response
-  stops on token 200008 without protocol leakage, and a client-provided stop
-  string remains trimmed normally.
+  qualified on the TP=2 online-FP8 service. Onyx serving is intentionally
+  single-call: the server overrides `parallel_tool_calls=true` (including the
+  OpenAI protocol default) to `false`, and every assistant response may contain
+  at most one tool call. This is a server capability boundary and does not rely
+  on client configuration.
+- `required` and named choice use the native structural constraint with each
+  declared parameter schema forced to strict mode. `auto` retains unconstrained
+  native 0/1 tool selection, then validates the complete generated JSON object
+  against the selected tool's Draft 2020-12 schema before returning it. A
+  structural constraint cannot be used safely for Onyx auto selection because
+  direct responses (`to=user`) and tool recipients share the `to=` trigger;
+  constraining that trigger to tool names turns ordinary answers into calls.
+- Onyx termination is recipient-aware and uses tokenizer special-token IDs
+  rather than decoded string matching. `<|eom|>` ends one recipient message:
+  after `to=self` it is retained as an internal frame separator and decoding
+  continues, while after a tool recipient it ends generation. `<|eot|>` ends
+  the assistant turn. The server keeps ordinary `ignore_eos` disabled and
+  resolves `<|eom|>`, `<|eot|>`, and `<|message|>` IDs from the active tokenizer,
+  so this behavior is isolated to Onyx requests.
+- Both non-streaming and streaming parsers reject a second call, unknown tool
+  recipients, malformed JSON objects, and schema-invalid arguments. One or
+  more `to=self ... <|eom|>` frames are suppressed while parsing continues to
+  the first `to=user` or tool frame. `to=user` is unwrapped, and embedded or
+  chunk-split protocol markers are not exposed as response content. Protocol
+  cleanup also runs when the request has no tools or uses `tool_choice=none`.
+- The single-call runtime matrix passes direct arithmetic and translation,
+  a three-city request carrying client `parallel_tool_calls=true` (one returned
+  call), required enum-constrained generation, and incremental streaming. Every
+  returned argument object validates against its declared schema, and all
+  content is free of Onyx protocol markers.
 - Incoming OpenAI history may also contain parallel calls: the server expands
   each multi-call assistant message and its matched tool results into sequential
   native recipient/tool pairs before rendering the Onyx prompt.
 - The unmodified `/llm/workspace/20k.json` is the long-history delivery gate. A
-  direct streaming `/v1/chat/completions` request passes in 8.87 seconds at
-  19,258 prompt plus 74 completion tokens, returning one response-local index-0
+  direct streaming `/v1/chat/completions` request passes with 19,293 prompt plus
+  71 completion tokens, returning one response-local index-0
   `run_shell_command` with the expected foreground TypeScript/Phaser dependency
-  install. With the default `sampling_defaults=model`, the model's explicit
-  `do_sample=false` generation default is honored as greedy decoding when the
-  request omits `temperature`.
+  install and no protocol leakage. With the default
+  `sampling_defaults=model`, the model's explicit `do_sample=false` generation
+  default is honored as greedy decoding when the request omits `temperature`.
+- The unmodified `/llm/workspace/13k.json` validates internal planning
+  continuation. It produces a hidden `to=self` planning frame followed by one
+  visible `todo_write` call: 14,359 prompt plus 183 completion tokens,
+  `finish_reason=tool_calls`, valid schema-conforming arguments, and no protocol
+  leakage. This confirms that self `<|eom|>` is treated as a message separator
+  rather than an empty successful response.
 - The tool-selection rules remain an integration prompt, not a recovered Onyx
   training prompt. They explicitly reserve tools for requested external
   information/actions, reject unrelated calls for arithmetic, translation,
-  explanations, and stable knowledge, and tell the model to emit each necessary
-  independent recipient call before replying.
+  explanations, and stable knowledge, and tell the model to call only the next
+  function before waiting for its result. The prompt also tells the model not to
+  repeat an identical failed call. Hard repeated-error counting, tool-turn
+  budgets, and replanning remain responsibilities of the external Agent runtime:
+  `/v1/chat/completions` generates calls but does not execute an Agent loop.

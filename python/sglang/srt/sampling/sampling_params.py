@@ -27,7 +27,7 @@ TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
 
-STOP_ON_EOS_OUTPUT_PREFIX_KEY = "__stop_on_eos_output_prefix"
+ONYX_PROTOCOL_TOKEN_IDS_KEY = "__onyx_protocol_token_ids"
 
 
 class SamplingParams:

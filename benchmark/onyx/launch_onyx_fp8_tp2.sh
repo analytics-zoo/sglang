@@ -20,9 +20,9 @@
 #   ONYX_ALLOW_LONG_CONTEXT=1 \
 #     bash benchmark/onyx/launch_onyx_fp8_tp2.sh
 #
-# Tool calling uses the tracked Onyx integration template. Auto mode supports
-# OpenAI parallel tool calls by default; required or named choice must set
-# parallel_tool_calls=false.
+# Tool calling uses the tracked Onyx integration template. The server enforces
+# one schema-constrained tool call per assistant response regardless of client
+# parallel_tool_calls settings.
 #
 # Additional command-line arguments are appended to launch_server:
 #   bash benchmark/onyx/launch_onyx_fp8_tp2.sh --log-level info
@@ -44,18 +44,25 @@ ONYX_MAX_RUNNING_REQUESTS=${ONYX_MAX_RUNNING_REQUESTS:-1}
 ONYX_CONTEXT_LENGTH=${ONYX_CONTEXT_LENGTH:-16384}
 ONYX_MAX_TOTAL_TOKENS=${ONYX_MAX_TOTAL_TOKENS:-16384}
 ONYX_CHUNKED_PREFILL_SIZE=${ONYX_CHUNKED_PREFILL_SIZE:-1024}
+ONYX_SWA_FULL_TOKENS_RATIO=${ONYX_SWA_FULL_TOKENS_RATIO:-0.25}
 ONYX_ALLOW_LONG_CONTEXT=${ONYX_ALLOW_LONG_CONTEXT:-0}
 ONYX_ENABLE_VISION=${ONYX_ENABLE_VISION:-0}
 ONYX_DRY_RUN=${ONYX_DRY_RUN:-0}
 ONYX_STRICT_KERNEL_CHECK=${ONYX_STRICT_KERNEL_CHECK:-1}
 
-for value_name in ONYX_CONTEXT_LENGTH ONYX_MAX_TOTAL_TOKENS ONYX_CHUNKED_PREFILL_SIZE; do
+for value_name in ONYX_CONTEXT_LENGTH ONYX_MAX_TOTAL_TOKENS ONYX_CHUNKED_PREFILL_SIZE ONYX_MAX_RUNNING_REQUESTS; do
   value=${!value_name}
   if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer, got: ${value}" >&2
     exit 2
   fi
 done
+
+if [[ ! "${ONYX_SWA_FULL_TOKENS_RATIO}" =~ ^(0(\.[0-9]+)?|1(\.0*)?)$ ]] \
+  || [[ "${ONYX_SWA_FULL_TOKENS_RATIO}" =~ ^0(\.0*)?$ ]]; then
+  echo "ONYX_SWA_FULL_TOKENS_RATIO must be in (0, 1], got: ${ONYX_SWA_FULL_TOKENS_RATIO}" >&2
+  exit 2
+fi
 
 case "${ONYX_ALLOW_LONG_CONTEXT}" in
   0|1) ;;
@@ -131,16 +138,16 @@ ONYX_SERVER_ARGS=(
   --mem-fraction-static 0.95
   --max-total-tokens "${ONYX_MAX_TOTAL_TOKENS}"
   --context-length "${ONYX_CONTEXT_LENGTH}"
-  --swa-full-tokens-ratio 0.25
+  --swa-full-tokens-ratio "${ONYX_SWA_FULL_TOKENS_RATIO}"
   --chunked-prefill-size "${ONYX_CHUNKED_PREFILL_SIZE}"
   --max-running-requests "${ONYX_MAX_RUNNING_REQUESTS}"
-  --disable-radix-cache
   --disable-cuda-graph
   --disable-custom-all-reduce
   --disable-overlap-schedule
   --skip-server-warmup
   --watchdog-timeout 300
   --random-seed 0
+  --enable-cache-report
 
   --host "${ONYX_HOST}"
   --port "${ONYX_PORT}"
@@ -152,6 +159,7 @@ if [[ "${ONYX_DRY_RUN}" == "1" ]]; then
   printf 'ONYX_CONTEXT_LENGTH=%q\n' "${ONYX_CONTEXT_LENGTH}"
   printf 'ONYX_MAX_TOTAL_TOKENS=%q\n' "${ONYX_MAX_TOTAL_TOKENS}"
   printf 'ONYX_CHUNKED_PREFILL_SIZE=%q\n' "${ONYX_CHUNKED_PREFILL_SIZE}"
+  printf 'ONYX_SWA_FULL_TOKENS_RATIO=%q\n' "${ONYX_SWA_FULL_TOKENS_RATIO}"
   printf 'ONYX_ALLOW_LONG_CONTEXT=%q\n' "${ONYX_ALLOW_LONG_CONTEXT}"
   printf 'ONYX_TOOL_CHAT_TEMPLATE=%q\n' "${ONYX_TOOL_CHAT_TEMPLATE}"
   if [[ -n "${SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN:-}" ]]; then

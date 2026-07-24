@@ -104,7 +104,7 @@ from sglang.srt.observability.req_time_stats import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import (
-    STOP_ON_EOS_OUTPUT_PREFIX_KEY,
+    ONYX_PROTOCOL_TOKEN_IDS_KEY,
     SamplingParams,
 )
 from sglang.srt.server_args import ServerArgs, get_global_server_args
@@ -1254,23 +1254,71 @@ class Req(ReqDllmMixin):
                 if self.tokenizer.additional_stop_token_ids:
                     matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
             if matched_eos:
-                if self.sampling_params.ignore_eos:
-                    custom_params = self.sampling_params.custom_params
-                    stop_prefix = (
-                        custom_params.get(STOP_ON_EOS_OUTPUT_PREFIX_KEY)
-                        if isinstance(custom_params, dict)
-                        else None
-                    )
-                    if not stop_prefix or self.tokenizer is None:
-                        continue
-                    output_prefix = self.tokenizer.decode(self.output_ids[:16])
-                    if not output_prefix.lstrip().startswith(stop_prefix):
-                        continue
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                onyx_eos_decision = self._should_continue_onyx_eom(
+                    token_id, matched_pos
+                )
+                if onyx_eos_decision is True:
+                    continue
+                if onyx_eos_decision is None and self.sampling_params.ignore_eos:
+                    continue
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 self.finished_len = matched_pos + 1
                 return True
 
+        return False
+
+    def _should_continue_onyx_eom(
+        self, token_id: int, matched_pos: int
+    ) -> Optional[bool]:
+        custom_params = self.sampling_params.custom_params
+        protocol = (
+            custom_params.get(ONYX_PROTOCOL_TOKEN_IDS_KEY)
+            if isinstance(custom_params, dict)
+            else None
+        )
+        if not isinstance(protocol, dict):
+            return None
+
+        eom_token_id = protocol.get("eom")
+        start_token_id = protocol.get("start")
+        message_token_id = protocol.get("message")
+        self_recipient_prefixes = protocol.get("self_recipient_prefixes")
+        if (
+            not isinstance(eom_token_id, int)
+            or not isinstance(start_token_id, int)
+            or not isinstance(message_token_id, int)
+            or not isinstance(self_recipient_prefixes, list)
+        ):
+            return False
+
+        # ``<|eom|><|start|>`` is a continuation boundary only when the
+        # completed recipient is exactly self. Every other Onyx stop token is
+        # terminal, including a standalone or malformed <|start|>.
+        if token_id == start_token_id:
+            eom_pos = matched_pos - 1
+            if eom_pos < 0 or self.output_ids[eom_pos] != eom_token_id:
+                return False
+            matched_pos = eom_pos
+        elif token_id != eom_token_id:
+            return False
+
+        message_pos = -1
+        for pos in range(matched_pos - 1, -1, -1):
+            if self.output_ids[pos] == message_token_id:
+                message_pos = pos
+                break
+        if message_pos == -1:
+            return False
+
+        for prefix in self_recipient_prefixes:
+            if not prefix or not all(isinstance(item, int) for item in prefix):
+                continue
+            prefix_start = message_pos - len(prefix)
+            if prefix_start < 0:
+                continue
+            if list(self.output_ids[prefix_start:message_pos]) == prefix:
+                return True
         return False
 
     def _check_str_based_finish(self):

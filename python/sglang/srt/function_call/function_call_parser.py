@@ -113,7 +113,7 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
+        if not self.tools and not isinstance(self.detector, OnyxDetector):
             return False
         return self.detector.has_tool_call(text)
 
@@ -129,7 +129,7 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
+        if not self.tools and not isinstance(self.detector, OnyxDetector):
             return full_text, []
         parsed_result = self.detector.detect_and_parse(full_text, self.tools)
         tool_call_list = parsed_result.calls
@@ -151,7 +151,7 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
+        if not self.tools and not isinstance(self.detector, OnyxDetector):
             return chunk_text, []
         final_normal_text = ""
         final_calls = []
@@ -164,6 +164,11 @@ class FunctionCallParser:
             final_normal_text = sp_result.normal_text
 
         return final_normal_text, final_calls
+
+    def finalize_stream(self) -> str:
+        if isinstance(self.detector, OnyxDetector):
+            return self.detector.finalize_stream(self.tools)
+        return ""
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False, tools: Optional[List[Tool]] = None

@@ -220,6 +220,28 @@ def register_grammar_backend(name, init_func):
     GRAMMAR_BACKEND_REGISTRY[name] = init_func
 
 
+def _filter_onyx_grammar_stop_tokens(server_args, tokenizer, eos_list):
+    """Keep Onyx protocol boundaries available to XGrammar itself.
+
+    The scheduler applies recipient-aware termination for these tokens. If
+    XGrammar treats them as global stops first, a ``to=self`` message cannot
+    continue into the next assistant recipient and a ``to=user`` tag cannot
+    consume its explicit EOT boundary.
+    """
+    if server_args.tool_call_parser != "onyx" or not eos_list:
+        return eos_list
+
+    vocab = tokenizer.get_vocab()
+    separators = set()
+    for token in ("<|eom|>", "<|eot|>", "<|start|>"):
+        token_id = vocab.get(token)
+        if not isinstance(token_id, int):
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        if isinstance(token_id, int) and token_id >= 0:
+            separators.add(token_id)
+    return [token_id for token_id in eos_list if token_id not in separators]
+
+
 def create_grammar_backend(
     server_args: ServerArgs,
     tokenizer,
@@ -251,6 +273,9 @@ def create_grammar_backend(
 
         # Convert Set[int] to List[int] if needed
         eos_list = list(eos_token_ids) if eos_token_ids else None
+        eos_list = _filter_onyx_grammar_stop_tokens(
+            server_args, tokenizer, eos_list
+        )
 
         try:
             grammar_backend = XGrammarGrammarBackend(

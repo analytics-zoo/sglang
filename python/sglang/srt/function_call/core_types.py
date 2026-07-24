@@ -19,6 +19,10 @@ class StreamingParseResult(BaseModel):
     calls: List[ToolCallItem] = []
 
 
+class ToolCallParseError(ValueError):
+    """Raised when model output violates the configured tool-call protocol."""
+
+
 @dataclass
 class StructureInfo:
     begin: str

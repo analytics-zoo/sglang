@@ -10,12 +10,9 @@
 {%- endfor -%}
 {%- endif -%}
 {%- endmacro -%}
-{%- set use_parallel_native = tools is defined and tools and (parallel_tool_calls | default(false)) and (tool_choice | default('auto')) == 'auto' -%}
 {%- set tool_prompt = '' -%}
 {%- if tools is defined and tools -%}
-{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. Decide whether functions are actually needed. Call a listed function only for external information or actions that the user explicitly requests and that require that function. Never call functions for arithmetic, translation, explanations, or stable general knowledge. Do not call unrelated functions. When a function is needed, send your assistant message to the function name as recipient and put only JSON arguments in the message.' -%}
-{%- if use_parallel_native -%}{%- set tool_prompt = tool_prompt + ' If multiple independent calls are needed, issue only the necessary calls, one recipient message per call, before replying to the user.' -%}{%- endif -%}
-{%- set tool_prompt = tool_prompt + ' After receiving a tool result, use it to answer the user instead of repeating the same call.' -%}
+{%- set tool_prompt = ' You have access to functions. Available functions: ' + (tools | tojson) + '. Decide whether a function is actually needed and call only the minimum functions required for the user\'s explicit request. You may make at most one short private self-recipient decision before responding. Never narrate, promise, or announce an intended function call to the user; either call the function or give the user a normal answer. When a function is needed, send the assistant message to that function name as recipient and put exactly one JSON object in the message. Call at most one function in each assistant response, then wait for its result before deciding the next step. A successful tool result completes that action. If it satisfies the request, answer the user and stop calling functions; continue only when another explicit part of the current request remains. Do not call functions merely to verify, reformat, navigate after, undo, or repeat an action that already succeeded, unless the user explicitly requested that additional action. Within one user turn, do not repeat the same function with identical arguments unless its previous result explicitly reports a temporary or retryable failure. If a tool reports a non-retryable error, change the arguments or plan, or explain why the task is blocked. Do not ask the user to repeat values already stated in the request. Treat a supplied access token, access code, or authorization code as available authorization for a compatible function. If a requested target state requires an unknown current value and a listed status function directly provides it, use that status function. Use a listed calculation or conversion function when the user requests that operation. Otherwise, do not call unrelated functions for arithmetic, translation, explanations, or stable general knowledge. Function arguments must start with { and end with }; never use XML for function arguments. This argument rule does not apply to normal user replies.' -%}
 {%- endif -%}
 {%- set ns = namespace(has_system=false) -%}
 {%- for m in messages -%}
@@ -29,7 +26,7 @@
 {%- if role == 'assistant' -%}
 {%- set tool_calls = message.get('tool_calls') -%}
 {%- if tool_calls and tool_calls | length > 1 -%}
-{{- raise_exception('Onyx supports one tool call per assistant turn; set parallel_tool_calls=false') -}}
+{{- raise_exception('Onyx supports one tool call per assistant turn') -}}
 {%- endif -%}
 {%- set recipient = tool_calls[0]['function']['name'] if tool_calls else message.get('recipient') -%}
 {%- set end_turn = message.get('end_turn') -%}

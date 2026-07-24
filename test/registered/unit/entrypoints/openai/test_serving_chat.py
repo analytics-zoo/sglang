@@ -28,9 +28,10 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_onyx_tool_history,
     normalize_tool_content,
 )
+from sglang.srt.function_call.core_types import ToolCallParseError
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.template_detection import ReasoningToggleConfig
-from sglang.srt.sampling.sampling_params import STOP_ON_EOS_OUTPUT_PREFIX_KEY
+from sglang.srt.sampling.sampling_params import ONYX_PROTOCOL_TOKEN_IDS_KEY
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,6 +62,13 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        special_token_ids = {
+            "<|eom|>": 200007,
+            "<|eot|>": 200008,
+            "<|start|>": 200022,
+            "<|message|>": 200023,
+        }
+        self.tokenizer.convert_tokens_to_ids.side_effect = special_token_ids.get
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -511,7 +519,7 @@ class ServingChatTestCase(unittest.TestCase):
             second_tools, [tool.function.model_dump() for tool in req.tools]
         )
 
-    def test_onyx_allows_auto_parallel_tool_calls(self):
+    def test_onyx_forces_explicit_parallel_request_to_single_strict_call(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -529,9 +537,10 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(self.chat._validate_request(req))
-        self.assertTrue(req.parallel_tool_calls)
+        self.assertFalse(req.parallel_tool_calls)
+        self.assertTrue(req.tools[0].function.strict)
 
-    def test_onyx_rejects_required_parallel_tool_calls(self):
+    def test_onyx_forces_required_parallel_request_to_single_strict_call(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -549,11 +558,9 @@ class ServingChatTestCase(unittest.TestCase):
             parallel_tool_calls=True,
         )
 
-        self.assertEqual(
-            self.chat._validate_request(req),
-            "Onyx parallel tool calls currently require tool_choice='auto'; "
-            "set parallel_tool_calls=false for required or named tool choice.",
-        )
+        self.assertIsNone(self.chat._validate_request(req))
+        self.assertFalse(req.parallel_tool_calls)
+        self.assertTrue(req.tools[0].function.strict)
 
     def test_onyx_defaults_required_tool_choice_to_single_call(self):
         self.chat.tool_call_parser = "onyx"
@@ -574,8 +581,9 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNone(self.chat._validate_request(req))
         self.assertFalse(req.parallel_tool_calls)
+        self.assertTrue(req.tools[0].function.strict)
 
-    def test_onyx_defaults_to_auto_parallel_tool_calls(self):
+    def test_onyx_defaults_auto_to_single_strict_call(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -592,7 +600,8 @@ class ServingChatTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(self.chat._validate_request(req))
-        self.assertTrue(req.parallel_tool_calls)
+        self.assertFalse(req.parallel_tool_calls)
+        self.assertTrue(req.tools[0].function.strict)
 
     def test_onyx_preserves_explicit_single_tool_call_mode(self):
         self.chat.tool_call_parser = "onyx"
@@ -613,8 +622,9 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertIsNone(self.chat._validate_request(req))
         self.assertFalse(req.parallel_tool_calls)
+        self.assertTrue(req.tools[0].function.strict)
 
-    def test_onyx_auto_parallel_passes_native_template_mode(self):
+    def test_onyx_auto_uses_native_union_constraint(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "onyx"
@@ -638,10 +648,21 @@ class ServingChatTestCase(unittest.TestCase):
 
         kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
         self.assertEqual(kwargs["tool_choice"], "auto")
-        self.assertTrue(kwargs["parallel_tool_calls"])
-        self.assertIsNone(result.tool_call_constraint)
+        self.assertFalse(kwargs["parallel_tool_calls"])
+        self.assertTrue(req.tools[0].function.strict)
+        self.assertIsNotNone(result.tool_call_constraint)
+        constraint_type, constraint = result.tool_call_constraint
+        self.assertEqual(constraint_type, "structural_tag")
+        format_ = constraint.model_dump()["format"]
+        self.assertEqual(format_["type"], "grammar")
+        grammar = format_["grammar"]
+        self.assertIn("onyx_self_sequence{0, 8}", grammar)
+        self.assertIn('" to=self<|message|>"', grammar)
+        self.assertIn('" to=user<|message|>"', grammar)
+        self.assertIn('"<|message|>"', grammar)
+        self.assertIn('" to=get_weather<|message|>"', grammar)
 
-    def test_onyx_auto_parallel_sets_native_stop_policy(self):
+    def test_onyx_auto_uses_recipient_aware_special_token_policy(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "onyx"
@@ -667,21 +688,19 @@ class ServingChatTestCase(unittest.TestCase):
 
         adapted, _ = self.chat._convert_to_internal_request(req)
 
-        self.assertTrue(adapted.sampling_params["ignore_eos"])
+        self.assertFalse(adapted.sampling_params["ignore_eos"])
         self.assertFalse(adapted.sampling_params["no_stop_trim"])
-        self.assertEqual(len(adapted.sampling_params["stop_regex"]), 2)
-        self.assertIn("start", adapted.sampling_params["stop_regex"][0])
-        self.assertIn("tool ", adapted.sampling_params["stop_regex"][0])
-        self.assertIn("assistant to=user", adapted.sampling_params["stop_regex"][1])
-        self.assertIn("eo[mt]", adapted.sampling_params["stop_regex"][1])
-        self.assertEqual(
-            adapted.sampling_params["custom_params"][
-                STOP_ON_EOS_OUTPUT_PREFIX_KEY
-            ],
-            "to=user<|message|>",
-        )
+        self.assertFalse(adapted.sampling_params.get("stop_regex"))
+        protocol = adapted.sampling_params["custom_params"][
+            ONYX_PROTOCOL_TOKEN_IDS_KEY
+        ]
+        self.assertEqual(protocol["eom"], 200007)
+        self.assertEqual(protocol["eot"], 200008)
+        self.assertEqual(protocol["start"], 200022)
+        self.assertEqual(protocol["message"], 200023)
+        self.assertTrue(protocol["self_recipient_prefixes"])
 
-    def test_onyx_auto_parallel_preserves_client_stop_trimming(self):
+    def test_onyx_single_call_preserves_client_stop_trimming(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"
         self.chat.tool_call_parser = "onyx"
@@ -708,7 +727,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.sampling_params["stop"], ["4"])
         self.assertFalse(adapted.sampling_params["no_stop_trim"])
 
-    def test_onyx_auto_parallel_non_streaming_native_calls(self):
+    def test_onyx_rejects_multiple_non_streaming_native_calls(self):
         self.chat.tool_call_parser = "onyx"
         req = ChatCompletionRequest(
             model="x",
@@ -725,26 +744,55 @@ class ServingChatTestCase(unittest.TestCase):
         )
         finish_reason = {"type": "stop", "matched": 200008}
 
-        tool_calls, text, finish_reason = self.chat._process_tool_calls(
-            text=(
-                ' to=get_weather<|message|>{"city":"Paris"}<|eot|>'
-                '<|start|>assistant to=get_weather<|message|>'
-                '{"city":"Tokyo"}<|eot|>'
-                "<|start|>assistant to=user<|message|>"
-            ),
-            tools=req.tools,
-            finish_reason=finish_reason,
-            tool_choice=req.tool_choice,
-        )
+        with self.assertRaisesRegex(ToolCallParseError, "at most one tool call"):
+            self.chat._process_tool_calls(
+                text=(
+                    ' to=get_weather<|message|>{"city":"Paris"}<|eot|>'
+                    '<|start|>assistant to=get_weather<|message|>'
+                    '{"city":"Tokyo"}<|eot|>'
+                    "<|start|>assistant to=user<|message|>"
+                ),
+                tools=req.tools,
+                finish_reason=finish_reason,
+                tool_choice=req.tool_choice,
+            )
 
-        self.assertEqual(text, "")
-        self.assertEqual(finish_reason, {"type": "tool_calls", "matched": None})
-        self.assertEqual([call.index for call in tool_calls], [0, 1])
-        self.assertEqual(
-            [json.loads(call.function.arguments) for call in tool_calls],
-            [{"city": "Paris"}, {"city": "Tokyo"}],
+    def test_onyx_rejects_non_streaming_arguments_outside_schema(self):
+        self.chat.tool_call_parser = "onyx"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Pick green."}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "select_color",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "color": {
+                                    "type": "string",
+                                    "enum": ["red", "blue"],
+                                }
+                            },
+                            "required": ["color"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
         )
-        self.assertNotEqual(tool_calls[0].id, tool_calls[1].id)
+        self.assertIsNone(self.chat._validate_request(req))
+        with self.assertRaisesRegex(ToolCallParseError, "violate its schema"):
+            self.chat._process_tool_calls(
+                text=(
+                    " to=select_color<|message|>"
+                    '{"color":"green","note":"requested"}<|eot|>'
+                ),
+                tools=req.tools,
+                finish_reason={"type": "stop", "matched": 200008},
+                tool_choice=req.tool_choice,
+            )
 
     def test_onyx_auto_parallel_non_streaming_user_response(self):
         self.chat.tool_call_parser = "onyx"
