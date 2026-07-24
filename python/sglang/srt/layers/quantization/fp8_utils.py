@@ -117,9 +117,13 @@ if _is_xpu and _XPU_FP8_W8A16_PREFILL:
 
 
 def _xpu_fp8_esimd_shape_qualified(m: int, k: int, n: int) -> bool:
-    # Onyx shapes whose ESIMD path loses to the fallback in matched benchmarks.
+    # Keep Onyx decode on the weight-only FP8 path for every supported small-M
+    # batch.  The activation-quantized fallback is faster for down_proj at
+    # M=2..64, but changing paths between M=1 and M>1 makes greedy generation
+    # batch-dependent.  The ESIMD path is bitwise repeatable and passed the
+    # existing FP16-reference numerical gates for all of these M values.
     if (k, n) == (9984, 6656):
-        return m == 1
+        return m <= 64
     if (k, n) == (6656, 19968):
         return m <= 32
     return True
