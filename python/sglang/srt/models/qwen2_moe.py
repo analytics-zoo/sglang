@@ -19,6 +19,7 @@
 """Inference-only Qwen2MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -34,6 +35,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
     get_tensor_model_parallel_world_size,
+    attention_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -121,6 +123,464 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+# ---------------------------------------------------------------------------
+# ESIMD MoE router (fp8) fast path.
+#
+# vLLM's BMG path runs the MoE router logits through an ESIMD fp8 GEMV
+# (`custom_esimd_kernels_sglang.moe_ops.moe_router_forward`) instead of the
+# default fp16 `aten::mm`, saving ~1 host-dispatch/layer during decode. The
+# kernel ONLY accepts fp8 e4m3/e5m2 weights (no fp16 variant), so the fp16 gate
+# weight is quantized once (per-tensor amax/448) and cached on the module.
+#
+# Gated by SGL_XPU_MOE_ROUTER_FP8=1 (default OFF: keeps the accurate fp16 gate).
+# Quantizing the router to per-tensor fp8 perturbs ~top-8 routing on a fraction
+# of tokens, so this must be gsm8k A/B validated before enabling in production.
+# ---------------------------------------------------------------------------
+_ESIMD_MOE_ROUTER_OP = "unset"
+# Set once at launch; constant for the process. Cached to avoid an os.environ
+# read on every MoE layer's router call during decode.
+_MOE_ROUTER_FP8 = os.environ.get("SGL_XPU_MOE_ROUTER_FP8", "0") == "1"
+logger.warning(
+    "[router_fp8] module loaded: file=%s SGL_XPU_MOE_ROUTER_FP8=%s (_MOE_ROUTER_FP8=%s)",
+    __file__, os.environ.get("SGL_XPU_MOE_ROUTER_FP8"), _MOE_ROUTER_FP8,
+)
+
+
+def _load_esimd_moe_router_op():
+    global _ESIMD_MOE_ROUTER_OP
+    if _ESIMD_MOE_ROUTER_OP != "unset":
+        return _ESIMD_MOE_ROUTER_OP
+    op = None
+    try:
+        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
+
+        op = getattr(_moe_mod, "moe_router_forward", None)
+    except Exception:
+        op = None
+    _ESIMD_MOE_ROUTER_OP = op
+    return op
+
+
+_ROUTER_DEBUG = os.environ.get("SGL_XPU_ROUTER_DEBUG", "0") == "1"
+_ROUTER_DEBUG_N = 0
+
+
+def _router_dbg(reason, **kw):
+    global _ROUTER_DEBUG_N
+    if not _ROUTER_DEBUG or _ROUTER_DEBUG_N >= 12:
+        return
+    _ROUTER_DEBUG_N += 1
+    logger.warning("[router_fp8] fallback=%s %s", reason, kw)
+
+
+def _esimd_router_wq_scale(gate, hidden_states: torch.Tensor):
+    """Return (wq_e4m3 [E,H], scale [1] fp32) for the router gate weight, lazily
+    quantized + cached on the weight, or None on any shape/dtype/layout mismatch.
+    Shared by _esimd_router_logits (split path) and the rtfused MoE path.
+    """
+    if not _MOE_ROUTER_FP8:
+        _router_dbg("env_off")
+        return None
+    x = hidden_states
+    if x.device.type != "xpu" or x.dim() != 2:
+        _router_dbg("device_or_dim", dev=str(x.device), dim=x.dim(), shape=tuple(x.shape))
+        return None
+    # Kernel is tuned for decode + tiny prefill chunks (M=1 GEMV).
+    if x.shape[0] > 8:
+        return None
+    weight = getattr(gate, "weight", None)
+    if weight is None or weight.dim() != 2:
+        _router_dbg("weight_missing", gate_type=type(gate).__name__,
+                    has_w=weight is not None)
+        return None
+    N, K = weight.shape  # [num_experts, hidden]
+    if x.shape[1] != K:
+        _router_dbg("K_mismatch", xK=x.shape[1], wK=K, N=N)
+        return None
+    # A bias'd gate would need to be added post-GEMV; keep it simple & safe.
+    if getattr(gate, "bias", None) is not None:
+        _router_dbg("has_bias", bias_type=type(getattr(gate, "bias")).__name__)
+        return None
+    # Lazy per-tensor fp8 quant of the gate weight, cached on the parameter.
+    wq = getattr(weight, "_esimd_router_wq", None)
+    sc = getattr(weight, "_esimd_router_scale", None)
+    if wq is None or sc is None:
+        try:
+            wf = weight.detach().float()
+            amax = wf.abs().max()
+            if not torch.isfinite(amax) or amax <= 0:
+                return None
+            scale = (amax / 448.0)
+            wq = torch.clamp(wf / scale, -448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+            sc = scale.reshape(1).to(torch.float32).contiguous()
+            weight._esimd_router_wq = wq
+            weight._esimd_router_scale = sc
+        except Exception as e:
+            _router_dbg("quant_exc", err=repr(e))
+            return None
+    return wq, sc
+
+
+def _esimd_router_logits(gate, hidden_states: torch.Tensor):
+    """Compute router logits via the ESIMD fp8 GEMV, or return None to fall back.
+
+    Returns a [T, num_experts] fp16 logits tensor on success. Falls back (None)
+    on any shape/dtype/layout mismatch so the standard fp16 gate runs instead.
+    """
+    op = _load_esimd_moe_router_op()
+    if op is None:
+        _router_dbg("op_none")
+        return None
+    wqsc = _esimd_router_wq_scale(gate, hidden_states)
+    if wqsc is None:
+        return None
+    wq, sc = wqsc
+    x = hidden_states
+    x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+    try:
+        logits = op(x_in, wq, sc)
+    except Exception as e:
+        _router_dbg("kernel_exc", err=repr(e))
+        return None
+    if _ROUTER_DEBUG:
+        _router_dbg("SUCCESS", out_shape=tuple(logits.shape))
+    return logits
+
+
+# ---------------------------------------------------------------------------
+# ESIMD full MoE fusion (e5m2) fast path.
+#
+# `moe_forward_full_v2` fuses the whole decode MoE block into ONE dispatch:
+#   router topk (softmax, renorm) + routed experts (silu) + shared expert (silu)
+#   + shared_expert_gate (sigmoid) + weighted accumulate.
+# This collapses the unfused decode path (routed silu kernel + shared-expert
+# gate_up/act/down linears + gate linear/sigmoid/mul + adds ≈ 300 dispatch/step)
+# down to a single op. e5m2-only (the kernel dequantises fp8_e5m2 weights);
+# activations stay fp16. Gated by SGL_XPU_ESIMD_MOE_FULL=1.
+#
+# Weight layouts the kernel expects (all validated numerically, cos≈1.0):
+#   routed gate_up : [E, hidden, 2*inter]  -> w13_weight._esimd_e5m2_t  (load-time)
+#   routed down    : [E, inter, hidden]    -> w2_weight._esimd_e5m2_t   (load-time)
+#   shared gate_up : [NS, 2*inter, hidden] (natural)  -> transpose of stored [hidden,2*inter]
+#   shared down    : [NS, hidden, inter]   (natural)  -> transpose of stored [inter,hidden]
+#   shared_gate    : [NS, hidden] fp16 (not quantised)
+#   all scales     : per-expert per-tensor fp32 (dequant scale = amax/fp8_max)
+# ---------------------------------------------------------------------------
+_ESIMD_MOE_FULL = os.environ.get("SGL_XPU_ESIMD_MOE_FULL", "0") == "1"
+_ESIMD_MOE_FULL_OP = "unset"
+_MOE_FULL_DEBUG = os.environ.get("SGL_XPU_MOE_FULL_DEBUG", "0") == "1"
+_MOE_FULL_DEBUG_N = 0
+
+
+def _moe_full_dbg(reason, **kw):
+    global _MOE_FULL_DEBUG_N
+    if not _MOE_FULL_DEBUG or _MOE_FULL_DEBUG_N >= 16:
+        return
+    _MOE_FULL_DEBUG_N += 1
+    logger.warning("[moe_full] fallback=%s %s", reason, kw)
+
+
+def _load_esimd_moe_full_op():
+    global _ESIMD_MOE_FULL_OP
+    if _ESIMD_MOE_FULL_OP != "unset":
+        return _ESIMD_MOE_FULL_OP
+    ops = None
+    try:
+        from custom_esimd_kernels_sglang import moe_ops as _moe_mod
+
+        v2 = getattr(_moe_mod, "moe_forward_full_v2", None)
+        # BSZ=1 decode: moe_forward_full uses the fused down_finalize kernel
+        # (shared-expert down + gate sigmoid + accumulate in ONE dispatch),
+        # so it launches 5 internal kernels vs v2's 7 (gate_precompute +
+        # down_shared + accumulate collapse into down_finalize). Prefer it when
+        # n_tokens==1; fall back to v2 for multi-token.
+        full = getattr(_moe_mod, "moe_forward_full", None)
+        # rtfused: BSZ=1 path that also fuses router GEMV + topk into one
+        # dispatch (takes the e4m3 gate weight + scale instead of logits).
+        rtfused = getattr(_moe_mod, "moe_forward_full_rtfused", None)
+        # rtfused_norm: BSZ=1 path that ALSO folds the pre-MoE GemmaRMSNorm
+        # (resadd + rmsnorm) into the fused router kernel head and returns the
+        # new residual, removing the standalone gemma_fused_add_rmsnorm dispatch.
+        rtfused_norm = getattr(_moe_mod, "moe_forward_full_rtfused_norm", None)
+        if v2 is not None:
+            ops = {"v2": v2, "full": full, "rtfused": rtfused,
+                   "rtfused_norm": rtfused_norm}
+    except Exception:
+        ops = None
+    _ESIMD_MOE_FULL_OP = ops
+    return ops
+
+
+def _pt_scale_1d(scale):
+    """Collapse a per-expert weight scale to a contiguous 1-D fp32 [E] tensor."""
+    if scale is None:
+        return None
+    s = scale.to(torch.float32)
+    if s.dim() == 0:
+        s = s.reshape(1)
+    elif s.dim() > 1:
+        # [E, *block] -> per-expert scalar (these are already per-tensor scales,
+        # so any trailing dims are size-1; mean is a safe collapse).
+        s = s.reshape(s.shape[0], -1).mean(dim=-1)
+    return s.contiguous()
+
+
+def _gather_moe_full_weights(block, x: torch.Tensor):
+    """Collect + validate all tensors needed by the fused decode MoE ops
+    (moe_forward_full / rtfused / rtfused_norm). Returns a dict of the routed +
+    shared expert weights/scales, the gate module, and routing dims, or None to
+    fall back. Layout/dtype checks here guarantee a bad tensor never reaches the
+    kernel."""
+    experts = getattr(block, "experts", None)
+    shared = getattr(block, "shared_expert", None)
+    sgate = getattr(block, "shared_expert_gate", None)
+    gate = getattr(block, "gate", None)
+    topk = getattr(block, "topk", None)
+    if experts is None or shared is None or sgate is None or gate is None or topk is None:
+        _moe_full_dbg("missing_submodule", experts=experts is not None,
+                      shared=shared is not None, sgate=sgate is not None)
+        return None
+
+    # Fused topk uses softmax + renorm + plain (ungrouped, no-bias) selection.
+    tc = getattr(topk, "topk_config", None)
+    if tc is None:
+        return None
+    if getattr(tc, "scoring_func", "softmax") != "softmax":
+        return None
+    if not getattr(tc, "renormalize", True):
+        return None
+    if getattr(tc, "use_grouped_topk", False):
+        return None
+    if getattr(tc, "correction_bias", None) is not None:
+        return None
+    if getattr(tc, "custom_routing_function", None) is not None:
+        return None
+    top_k = getattr(tc, "top_k", None)
+    if top_k is None:
+        return None
+
+    # --- routed weights (e5m2) + load-time transposed caches ---
+    w13 = getattr(experts, "w13_weight", None)
+    w2 = getattr(experts, "w2_weight", None)
+    if w13 is None or w2 is None:
+        return None
+    if w13.dtype != torch.float8_e5m2 or w2.dtype != torch.float8_e5m2:
+        _moe_full_dbg("routed_not_e5m2", w13=str(w13.dtype), w2=str(w2.dtype))
+        return None
+    gate_up_routed = getattr(w13, "_esimd_e5m2_t", None)   # [E, hidden, 2*inter]
+    down_routed = w2                                        # natural [E, hidden, inter]
+    if gate_up_routed is None:
+        _moe_full_dbg("routed_cache_missing", gu=False)
+        return None
+    s13 = _pt_scale_1d(getattr(experts, "w13_weight_scale", None))
+    s2 = _pt_scale_1d(getattr(experts, "w2_weight_scale", None))
+    if s13 is None or s2 is None:
+        return None
+
+    # --- shared expert (dense Fp8, weights stored transposed [hidden, out]) ---
+    gu_s = getattr(shared, "gate_up_proj", None)
+    dn_s = getattr(shared, "down_proj", None)
+    if gu_s is None or dn_s is None:
+        return None
+    gw = getattr(gu_s, "weight", None)   # stored [hidden, 2*inter] e5m2
+    dw = getattr(dn_s, "weight", None)   # stored [inter, hidden]   e5m2
+    if gw is None or dw is None:
+        return None
+    if gw.dtype != torch.float8_e5m2 or dw.dtype != torch.float8_e5m2:
+        _moe_full_dbg("shared_not_e5m2", gw=str(gw.dtype), dw=str(dw.dtype))
+        return None
+    shared_gate_up = getattr(gw, "_esimd_moe_full_nat", None)
+    if shared_gate_up is None:
+        try:
+            shared_gate_up = gw.t().contiguous().unsqueeze(0)  # [1, 2*inter, hidden]
+            gw._esimd_moe_full_nat = shared_gate_up
+        except Exception:
+            return None
+    # DPAS/transposed layout [1, hidden, 2*inter] for the merged up kernel (4b).
+    # gw is already stored [hidden, 2*inter], so this is just an unsqueeze.
+    shared_gate_up_dpas = getattr(gw, "_esimd_moe_full_dpas", None)
+    if shared_gate_up_dpas is None:
+        try:
+            shared_gate_up_dpas = gw.unsqueeze(0).contiguous()  # [1, hidden, 2*inter]
+            gw._esimd_moe_full_dpas = shared_gate_up_dpas
+        except Exception:
+            return None
+    shared_down = getattr(dw, "_esimd_moe_full_nat", None)
+    if shared_down is None:
+        try:
+            shared_down = dw.t().contiguous().unsqueeze(0)      # [1, hidden, inter]
+            dw._esimd_moe_full_nat = shared_down
+        except Exception:
+            return None
+    ss13 = _pt_scale_1d(getattr(gu_s, "weight_scale", None))
+    ss2 = _pt_scale_1d(getattr(dn_s, "weight_scale", None))
+    if ss13 is None or ss2 is None:
+        return None
+
+    # --- shared_expert_gate weight (fp16 [NS, hidden], not quantised) ---
+    sgw = getattr(sgate, "weight", None)
+    if sgw is None or sgw.dim() != 2:
+        return None
+    sgw16 = (sgw if sgw.dtype == torch.float16 else sgw.to(torch.float16)).contiguous()
+
+    return {
+        "gate": gate,
+        "top_k": int(top_k),
+        "n_routed": int(w13.shape[0]),
+        "num_shared": int(shared_gate_up.shape[0]),
+        "gate_up_routed": gate_up_routed, "s13": s13,
+        "shared_gate_up": shared_gate_up, "ss13": ss13,
+        "shared_gate_up_dpas": shared_gate_up_dpas,
+        "down_routed": down_routed, "s2": s2,
+        "shared_down": shared_down, "ss2": ss2,
+        "sgw16": sgw16,
+    }
+
+
+def _maybe_esimd_moe_full(block, hidden_states: torch.Tensor):
+    """One-dispatch decode MoE via moe_forward_full_v2. Returns the final
+    [T, hidden] fp16 tensor (routed + gate*shared, already summed), or None to
+    fall back to the unfused router/shared path.
+    """
+    if not _ESIMD_MOE_FULL:
+        return None
+    ops = _load_esimd_moe_full_op()
+    if ops is None:
+        _moe_full_dbg("op_none")
+        return None
+    x = hidden_states
+    if x.device.type != "xpu" or x.dim() != 2 or x.shape[0] > 8:
+        return None
+
+    W = _gather_moe_full_weights(block, x)
+    if W is None:
+        return None
+    gate = W["gate"]
+    top_k = W["top_k"]; num_shared = W["num_shared"]; n_routed = W["n_routed"]
+    gate_up_routed = W["gate_up_routed"]; s13 = W["s13"]
+    shared_gate_up = W["shared_gate_up"]; ss13 = W["ss13"]
+    down_routed = W["down_routed"]; s2 = W["s2"]
+    shared_down = W["shared_down"]; ss2 = W["ss2"]
+    sgw16 = W["sgw16"]
+    x_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+
+    # BSZ=1 decode: prefer moe_forward_full_rtfused, which folds the router GEMV
+    # + softmax-topk into ONE dispatch (needs the e4m3-quantized gate weight).
+    # Fall back to moe_forward_full (fused down_finalize, separate router+topk)
+    # when the quant isn't available, and to moe_forward_full_v2 for multi-token.
+    rt = ops.get("rtfused")
+    if x.shape[0] == 1 and rt is not None:
+        wqsc = _esimd_router_wq_scale(gate, x)
+        if wqsc is not None:
+            wq, sc = wqsc
+            try:
+                out = rt(
+                    x_in, wq, sc,
+                    gate_up_routed, s13,
+                    shared_gate_up, ss13,
+                    down_routed, s2,
+                    shared_down, ss2,
+                    sgw16,
+                    int(top_k), int(num_shared), int(n_routed),
+                )
+            except Exception as e:
+                _moe_full_dbg("rtfused_exc", err=repr(e))
+                return None
+            if _MOE_FULL_DEBUG:
+                _moe_full_dbg("SUCCESS", T=int(x.shape[0]), E=int(n_routed),
+                              top_k=int(top_k), out=tuple(out.shape), path="rtfused")
+            return out
+
+    # --- router logits [T, E] fp16 (full/v2 do topk internally) ---
+    logits = _esimd_router_logits(gate, x)
+    if logits is None:
+        logits, _ = gate(x)
+    if logits.dtype != torch.float16:
+        logits = logits.to(torch.float16)
+
+    # BSZ=1 decode -> moe_forward_full (fused down_finalize, 5 internal kernels).
+    # Multi-token or missing op -> moe_forward_full_v2 (7 internal kernels).
+    op = ops.get("full") if (x.shape[0] == 1 and ops.get("full") is not None) else ops["v2"]
+    try:
+        out = op(
+            x_in, logits,
+            gate_up_routed, s13,
+            shared_gate_up, ss13,
+            down_routed, s2,
+            shared_down, ss2,
+            sgw16,
+            int(top_k), int(num_shared), int(n_routed),
+        )
+    except Exception as e:
+        _moe_full_dbg("kernel_exc", err=repr(e))
+        return None
+    if _MOE_FULL_DEBUG:
+        _moe_full_dbg("SUCCESS", T=int(x.shape[0]), E=int(n_routed),
+                      top_k=int(top_k), out=tuple(out.shape),
+                      path=("full" if op is ops.get("full") else "v2"))
+    return out
+
+
+def _maybe_esimd_moe_full_norm(block, hidden_states, residual, norm_weight_folded, eps):
+    """BSZ=1 decode MoE that ALSO folds the pre-MoE GemmaRMSNorm (residual add +
+    rmsnorm) into the fused router kernel head. ``hidden_states`` is the pre-norm
+    attention output (already all-reduced across the attn-TP group by the
+    caller), ``residual`` the residual stream, ``norm_weight_folded`` the Gemma
+    (1 + weight) in fp16, and ``eps`` the norm epsilon.
+
+    Returns ``(moe_out, new_residual)`` where new_residual = hidden + residual,
+    or None to fall back to the standard prepare_mlp + mlp path.
+    """
+    if not _ESIMD_MOE_FULL:
+        return None
+    ops = _load_esimd_moe_full_op()
+    if ops is None:
+        _moe_full_dbg("op_none")
+        return None
+    rtn = ops.get("rtfused_norm")
+    if rtn is None:
+        return None
+    x = hidden_states
+    if x.device.type != "xpu" or x.dim() != 2 or x.shape[0] != 1:
+        return None
+    if residual is None or residual.dim() != 2 or residual.shape != x.shape:
+        return None
+
+    W = _gather_moe_full_weights(block, x)
+    if W is None:
+        return None
+
+    wqsc = _esimd_router_wq_scale(W["gate"], x)
+    if wqsc is None:
+        return None
+    wq, sc = wqsc
+
+    h_in = x if x.dtype == torch.float16 else x.to(torch.float16)
+    h_in = h_in.contiguous()
+    res = residual if residual.dtype == torch.float16 else residual.to(torch.float16)
+    res = res if res.is_contiguous() else res.contiguous()
+    try:
+        out = rtn(
+            h_in, res, norm_weight_folded, float(eps),
+            wq, sc,
+            W["gate_up_routed"], W["s13"],
+            W["shared_gate_up_dpas"], W["ss13"],
+            W["down_routed"], W["s2"],
+            W["shared_down"], W["ss2"],
+            W["sgw16"],
+            W["top_k"], W["num_shared"], W["n_routed"],
+        )
+    except Exception as e:
+        _moe_full_dbg("rtfused_norm_exc", err=repr(e))
+        return None
+    if not isinstance(out, (list, tuple)) or len(out) != 2:
+        return None
+    if _MOE_FULL_DEBUG:
+        _moe_full_dbg("SUCCESS", T=1, E=W["n_routed"], top_k=W["top_k"],
+                      out=tuple(out[0].shape), path="rtfused_norm")
+    return out[0], out[1]
 
 
 def can_fuse_shared_expert(
@@ -454,7 +914,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = _esimd_router_logits(self.gate, hidden_states)
+        if router_logits is None:
+            router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
@@ -522,8 +984,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states
             )
         else:
-            shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            fused_full = _maybe_esimd_moe_full(self, hidden_states)
+            if fused_full is not None:
+                # v2 returns routed + gate*shared already summed → skip the
+                # separate shared path and its add below.
+                final_hidden_states = fused_full
+                shared_output = None
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
+                final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
             final_hidden_states += shared_output
@@ -541,6 +1010,96 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Debug removed - was causing issues during CUDA graph capture
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def esimd_prepare_mlp_moe(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_module,
+        forward_batch,
+        use_reduce_scatter: bool,
+        should_allreduce_fusion: bool,
+    ):
+        """Phase 3: fused replacement for ``prepare_mlp`` + ``mlp.forward`` on the
+        plain-TP single-token decode path.
+
+        Baseline does, in two dispatched pieces:
+          1. prepare_mlp: all-reduce(attn output) then GemmaRMSNorm(resadd+norm)
+          2. mlp.forward: MoE (router+experts+shared) then all-reduce(MoE output)
+
+        Here the GemmaRMSNorm resadd+norm is folded into the fused MoE router
+        kernel head (``moe_forward_full_rtfused_norm``), removing the standalone
+        ``gemma_fused_add_rmsnorm`` dispatch and returning the new residual so no
+        separate python add is needed. The two all-reduces are reproduced
+        explicitly (identical to the baseline collectives).
+
+        Returns ``(hidden_out, residual_out)`` on success, or ``None`` to signal
+        the caller to run the standard ``prepare_mlp`` + ``mlp`` path. All guards
+        that could invalidate the manual collectives are checked BEFORE any
+        communication, so a ``None`` return never leaves a stray all-reduce.
+        """
+        if not _ESIMD_MOE_FULL:
+            return None
+        ops = _load_esimd_moe_full_op()
+        if ops is None or ops.get("rtfused_norm") is None:
+            return None
+        if not (
+            hidden_states.device.type == "xpu"
+            and forward_batch is not None
+            and forward_batch.forward_mode.is_decode()
+        ):
+            return None
+        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
+            return None
+        if residual is None or residual.shape != hidden_states.shape:
+            return None
+        # Only the plain-TP path (no input-scatter, no DP-attention, no
+        # all-reduce fusion, no reduce-scatter) matches the manual collectives.
+        if use_reduce_scatter or should_allreduce_fusion:
+            return None
+        if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+            return None
+        try:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+            from sglang.srt.layers.dp_attention import get_attention_dp_size
+
+            if get_attn_tp_context().input_scattered:
+                return None
+            if get_attention_dp_size() != 1:
+                return None
+        except Exception:
+            return None
+        # Fold GemmaRMSNorm (1 + weight) once per layer.
+        nw = getattr(norm_module, "_esimd_moe_nw", None)
+        if nw is None:
+            w = getattr(norm_module, "weight", None)
+            eps = getattr(norm_module, "variance_epsilon", None)
+            if w is None or eps is None:
+                return None
+            nw = (w.data.to(torch.float32) + 1.0).to(torch.float16).contiguous()
+            norm_module._esimd_moe_nw = nw
+        eps = float(norm_module.variance_epsilon)
+
+        # ── Commit: reproduce prepare_mlp's attention-output all-reduce ──
+        h_ar = attention_tensor_model_parallel_all_reduce(hidden_states)
+
+        fused = _maybe_esimd_moe_full_norm(self, h_ar, residual, nw, eps)
+        if fused is not None:
+            moe_out, new_residual = fused
+            # Reproduce mlp.forward's post-experts all-reduce (kernel is per-rank).
+            if self.tp_size > 1 and not get_moe_a2a_backend().is_flashinfer():
+                moe_out = tensor_model_parallel_all_reduce(moe_out)
+            return moe_out, new_residual
+
+        # Fallback (kernel unavailable / guard miss inside the MoE helper): run
+        # the baseline norm on the already-reduced hidden, then the standard MoE
+        # forward (which performs its own post-experts all-reduce). This keeps
+        # correctness without duplicating the attention all-reduce above.
+        normed, new_residual = norm_module(h_ar, residual)
+        moe_out = self.forward(
+            normed, forward_batch, use_reduce_scatter, should_allreduce_fusion
+        )
+        return moe_out, new_residual
 
 
 class Qwen2MoeAttention(nn.Module):
