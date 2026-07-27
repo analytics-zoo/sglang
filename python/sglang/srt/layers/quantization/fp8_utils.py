@@ -135,6 +135,9 @@ if _is_cuda:
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+# Cached once at import: read on every apply_fp8_linear call (100+/decode step)
+# otherwise, and the value is constant for the process lifetime.
+_enable_torch_compile = get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -907,7 +910,8 @@ def triton_w8a8_block_fp8_linear(
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
         _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_pt, output)
-        return output.to(input.dtype).view(*output_shape)
+        out = output if output.dtype == input.dtype else output.to(input.dtype)
+        return out.view(*output_shape)
 
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
@@ -1603,9 +1607,7 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
-            "SGLANG_ENABLE_TORCH_COMPILE"
-        )
+        pad_output = not cutlass_fp8_supported and not _enable_torch_compile
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
@@ -1650,7 +1652,8 @@ def apply_fp8_linear(
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
         _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
-        return output.to(input.dtype).view(*output_shape)
+        out = output if output.dtype == input.dtype else output.to(input.dtype)
+        return out.view(*output_shape)
 
     if compressed_tensor_quant:
         # Maybe apply padding to output, see comment in __init__

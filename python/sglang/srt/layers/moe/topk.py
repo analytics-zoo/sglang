@@ -114,6 +114,11 @@ from sglang.srt.utils import (
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
+# Benchmark-only simulation flags, constant for the process lifetime. Cached at
+# import so select_experts (called once per MoE layer per decode step) does not
+# re-read os.getenv twice on every call.
+_SIMULATE_UNIFORM_EXPERTS = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+_SIMULATE_ROUND_ROBIN_EXPERTS = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -1739,8 +1744,8 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    simulate_uniform_experts = envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
-    simulate_round_robin_experts = envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    simulate_uniform_experts = _SIMULATE_UNIFORM_EXPERTS
+    simulate_round_robin_experts = _SIMULATE_ROUND_ROBIN_EXPERTS
     if simulate_uniform_experts and simulate_round_robin_experts:
         raise ValueError(
             "SGLANG_SIMULATE_UNIFORM_EXPERTS and "
