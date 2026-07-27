@@ -191,19 +191,71 @@ class XPUAttentionBackend(AttentionBackend):
         (the proven-correct kernel for GQA ratio=8 / single-KV-head configs)
         unreachable in eager decode -- so decode silently fell back to the
         numerically-wrong eagle_page_attn_decode / flash kernel instead.
-        Buffers are cached per batch-size (no graph-replay stability
-        requirement in eager mode, so plain re-use is enough)."""
+
+        Optimization (P0+P1) for the disable-XPU-graph path: the scratch
+        buffers (kv_indptr / kv_indices / temp_p) are kept as a single
+        *persistent, grow-only* cache reused across decode steps instead of
+        being re-allocated every step, and the per-step
+        ``int(kv_indptr[-1].item())`` device->host sync (which stalled the
+        CPU-GPU pipeline on every full-attention layer) is removed:
+        kv_indices is sized to the upper bound ``bs * max_seq_len_k`` (a CPU
+        int already available on ``metadata``, no device readback needed).
+        create_flashinfer_kv_indices_triton only writes into the ranges
+        indexed by kv_indptr, so an over-sized buffer is safe, and
+        sglang_decode_attn only reads the kv_indptr-delimited ranges."""
         bs = forward_batch.batch_size
+        # kv_indptr/kv_indices/temp_p depend only on this step's cache_seqlens
+        # (batch-level), not on the attention layer, so they are identical for
+        # every full-attention layer in a decode step. ``metadata`` is a fresh
+        # object built once per step in init_forward_metadata, so memoizing the
+        # built inputs on it lets the first full-attn layer build them and the
+        # remaining layers reuse them -- removing ~9x (cumsum + kv_indptr fill +
+        # create_flashinfer_kv_indices) dispatched ops per step on the
+        # disable-XPU-graph path.
+        cached = getattr(metadata, "_eager_kv_inputs", None)
+        if cached is not None and cached[0].numel() == bs + 1:
+            return cached
         device = metadata.cache_seqlens_int32.device
+        _SPLIT_TILE = 64
+        _MAX_N_SPLITS = 256
+        graph_max_seq = _SPLIT_TILE * _MAX_N_SPLITS  # 16384
+
+        # Upper bound on total kv entries this step: sum(seq_lens) <= bs * max_seq_len_k.
+        # max_seq_len_k is a plain python int already computed on the CPU-side
+        # seq_lens_cpu in init_forward_metadata, so reading it here costs no
+        # device synchronization (unlike kv_indptr[-1].item()).
+        max_seq_len_k = getattr(metadata, "max_seq_len_k", None)
+        if not isinstance(max_seq_len_k, int) or max_seq_len_k <= 0:
+            max_seq_len_k = self.max_context_len
+        need_kv = max(bs * max_seq_len_k, 1)
+        need_temp = max(bs * tp_q_head_num * _MAX_N_SPLITS * (1 + 1 + 256), 1)
+
+        # Persistent grow-only scratch: allocate once, reuse (and only grow)
+        # across decode steps. No per-step torch.empty, no per-bs rebuild.
         cache = getattr(self, "_sglang_decode_eager_scratch", None)
-        cache_key = bs
-        if cache is None or cache.get("bs") != cache_key:
+        if (
+            cache is None
+            or cache["kv_indptr"].numel() < bs + 1
+            or cache["kv_indices"].numel() < need_kv
+            or cache["temp_p"].numel() < need_temp
+        ):
             cache = {
-                "bs": cache_key,
-                "kv_indptr": torch.zeros(bs + 1, dtype=torch.int32, device=device),
+                "kv_indptr": torch.zeros(
+                    max(bs + 1, 1), dtype=torch.int32, device=device
+                ),
+                "kv_indices": torch.empty(
+                    need_kv, dtype=torch.int32, device=device
+                ),
+                "temp_p": torch.empty(
+                    need_temp, dtype=torch.float32, device=device
+                ),
             }
             self._sglang_decode_eager_scratch = cache
-        kv_indptr = cache["kv_indptr"]
+
+        kv_indptr = cache["kv_indptr"][: bs + 1]
+        kv_indices = cache["kv_indices"]
+        temp_p = cache["temp_p"]
+
         kv_indptr[0] = 0
         torch.cumsum(
             metadata.cache_seqlens_int32,
@@ -211,8 +263,6 @@ class XPUAttentionBackend(AttentionBackend):
             dtype=torch.int32,
             out=kv_indptr[1:],
         )
-        total_kv = int(kv_indptr[-1].item())
-        kv_indices = torch.empty(max(total_kv, 1), dtype=torch.int32, device=device)
         from sglang.srt.layers.attention.triton_ops.kv_indices import (
             create_flashinfer_kv_indices_triton,
         )
@@ -226,18 +276,12 @@ class XPUAttentionBackend(AttentionBackend):
             kv_indices,
             self.req_to_token.stride(0),
         )
-        # Same fixed sizing formula used by init_cuda_graph_state's
-        # sglang_temp_p / _sglang_decode_graph_max_seq, just allocated fresh
-        # here instead of pre-allocated graph-stable buffers.
-        _SPLIT_TILE = 64
-        _MAX_N_SPLITS = 256
-        graph_max_seq = _SPLIT_TILE * _MAX_N_SPLITS  # 16384
-        temp_p = torch.empty(
-            bs * tp_q_head_num * _MAX_N_SPLITS * (1 + 1 + 256),
-            dtype=torch.float32,
-            device=device,
-        )
-        return kv_indptr, kv_indices, temp_p, graph_max_seq
+        result = (kv_indptr, kv_indices, temp_p, graph_max_seq)
+        try:
+            metadata._eager_kv_inputs = result
+        except Exception:
+            pass
+        return result
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate stable device buffers for XPU graph capture/replay."""
