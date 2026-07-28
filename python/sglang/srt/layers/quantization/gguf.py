@@ -834,8 +834,10 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
             and M == 1
             and rep[0] in ("q6_k", "q5_k", "q4_k", "q8_0", "q4_0")
         ):
-            xf = x2.to(torch.float16).contiguous()
-            out = _xpu_rep_gemv(xf, rep).to(x.dtype)  # [1, vocab]
+            xf = _as_fp16c(x2)
+            out = _xpu_rep_gemv(xf, rep)  # [1, vocab] fp16
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
             if bias is not None:
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -852,11 +854,12 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
             and 2 <= M <= 16
             and esimd_gemv_q6_k_m is not None
         ):
-            xf = x2.to(torch.float16).contiguous()
+            xf = _as_fp16c(x2)
             N = rep[1].shape[0]
             out = torch.empty(M, N, dtype=torch.float16, device=xf.device)
             esimd_gemv_q6_k_m(xf, rep[1], rep[2], rep[3], out)
-            out = out.to(x.dtype)
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
             if bias is not None:
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -1513,6 +1516,31 @@ def _onednn_scale_t(scale: torch.Tensor) -> torch.Tensor:
     return st
 
 
+def _as_fp16c(x: torch.Tensor) -> torch.Tensor:
+    """Return x as a contiguous fp16 tensor WITHOUT emitting a no-op
+    ``aten::to`` / ``aten::contiguous`` dispatch when x is already fp16 and
+    contiguous (the common ``--dtype float16`` case).
+
+    At M=1 decode the GGUF path is host-dispatch bound; the per-projection
+    ``x.to(torch.float16).contiguous()`` fired ~110 no-op casts/step (plus the
+    matching output cast). ``is_contiguous()`` is a cheap C++ property check,
+    not a device op, so this guard is pure host-overhead reduction and is
+    bit-identical (returns the same storage) for fp16 inputs. bf16/fp32
+    networks still get a real cast + contiguous copy.
+    """
+    if x.dtype == torch.float16:
+        return x if x.is_contiguous() else x.contiguous()
+    return x.to(torch.float16).contiguous()
+
+
+# Per-weight cache for the fp16-resident dense shards (GDN b/a in_proj_ba):
+#   id(weight) -> transposed_contiguous_weight [K, N]
+# Reps are held by the layer for the model's lifetime so id(weight) is stable
+# and this dict is bounded by the number of fp16 shards (~60). See the fp16
+# branch of _xpu_shard_matmul.
+_fp16_wt_cache: dict = {}
+
+
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
     """x [M,K] fp16 @ shard^T -> [M,N] fp16. rep from _xpu_prepare_shard."""
     kind = rep[0]
@@ -1520,7 +1548,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, packed, scale = rep
         N = packed.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: the ESIMD GEMV is bandwidth-optimal (~3x faster than a
             # dense fp16 matmul at M=1).
@@ -1540,7 +1568,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, qs, scale = rep
         N = qs.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: ESIMD q8_0 GEMV (int8 resident, bandwidth-optimal).
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -1572,7 +1600,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, scale, minv = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: ESIMD q4_K GEMV (4.5-bit resident, asymmetric scale+min).
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -1585,7 +1613,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, qh, scale, minv = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q5_k(xf, ql, qh, scale, minv, out)
@@ -1596,16 +1624,28 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, qh, scale = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q6_k(xf, ql, qh, scale, out)
             return out
         w = _xpu_dequant_q6_k(ql, qh, scale, torch.float16)  # [N, K]
         return xf @ w.t()
-    # fp16-resident dense weight [N, K]
-    _, w, _ = rep
-    return x.to(w.dtype) @ w.t()
+    # fp16-resident dense weight [N, K]. Hit by the GDN b/a (beta/decay) shards
+    # of in_proj_ba (each [num_v_heads, hidden] fp16, unquantized in the GGUF),
+    # ~60 GEMVs/decode-step. The naive ``x.to(w.dtype) @ w.t()`` fired ~8 host
+    # dispatches each (no-op cast + t/transpose/as_strided weight-transpose VIEW
+    # rebuilt per call + matmul-wrapper + mm + output empty/resize_). Cache the
+    # contiguous transpose [K, N] once so each call is a single ``torch.mm`` on
+    # two contiguous operands. Bit-identical (same operands, same math). A fresh
+    # output is allocated per call (no persistent-buffer aliasing risk).
+    w = rep[1]
+    xf = x if x.dtype == w.dtype else x.to(w.dtype)
+    wt = _fp16_wt_cache.get(id(w))
+    if wt is None:
+        wt = w.t().contiguous()  # [K, N], computed once per weight
+        _fp16_wt_cache[id(w)] = wt
+    return torch.mm(xf, wt)
 
 
 def _xpu_permute_gdn_out_cols(rep, perm):
@@ -1825,7 +1865,8 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x2 = x.reshape(-1, x.shape[-1])
+        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
+        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
         merged = getattr(layer, "_xpu_merged", None)
         if merged is not None:
             # D1: one big-N GEMV over the merged q8_0/q4_0 shards (§10bj). The
@@ -1840,10 +1881,13 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         # The q4_0 ESIMD kernels are fp16-only (PTL has no bf16 ESIMD), so a
         # bf16 network would otherwise get an fp16 tensor back here. Cast the
         # result to the input activation dtype to keep the graph type-consistent.
-        out = out.to(x.dtype)
+        # Skip the no-op cast on fp16 networks (elides one host dispatch/proj).
+        if out.dtype != x.dtype:
+            out = out.to(x.dtype)
         if bias is not None:
             out = out + bias
-        return out.reshape(*x.shape[:-1], out.shape[-1])
+        # x2 aliased x when x was 2D, so out is already [M, N] — skip no-op reshape.
+        return out if x.dim() == 2 else out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class GGUFMoEMethod(FusedMoEMethodBase):
@@ -2158,15 +2202,17 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
-        x2 = x.reshape(-1, x.shape[-1])
+        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
+        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
         M = x2.shape[0]
-        out = torch.zeros_like(x2)
         if M == 0:
-            return StandardCombineInput(hidden_states=out.reshape_as(x))
+            z = torch.zeros_like(x2)
+            return StandardCombineInput(
+                hidden_states=z if x.dim() == 2 else z.reshape_as(x))
         top_k = topk_ids.shape[1]
         hidden, inter = self.hidden, self.intermediate
         n_routed = M * top_k
-        xf = x2.to(torch.float16).contiguous()
+        xf = _as_fp16c(x2)
         sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
         tw = topk_weights.reshape(-1).to(torch.float16).contiguous()
 
@@ -2181,7 +2227,10 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
                 self.up_ql, self.up_sc, self.up_mn,
                 self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn,
                 down_is_q6=self._down_is_q6)
-            return StandardCombineInput(hidden_states=out_g.to(out.dtype).reshape_as(x))
+            if out_g.dtype != x2.dtype:
+                out_g = out_g.to(x2.dtype)
+            return StandardCombineInput(
+                hidden_states=out_g if x.dim() == 2 else out_g.reshape_as(x))
 
         # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
         # weighted) over ALL routed pairs, then sum the top_k partials. Replaces
@@ -2198,8 +2247,10 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
             esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
                                self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
         # sum the top_k per-route partials back to per-token output (one op).
-        out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
-        return StandardCombineInput(hidden_states=out.reshape_as(x))
+        summed = out_partial.view(M, top_k, hidden).sum(dim=1)
+        out = summed if summed.dtype == x2.dtype else summed.to(x2.dtype)
+        return StandardCombineInput(
+            hidden_states=out if x.dim() == 2 else out.reshape_as(x))
 
 
 class GGUFEmbeddingMethod(GGUFLinearMethod):

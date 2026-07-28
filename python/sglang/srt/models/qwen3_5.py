@@ -664,6 +664,46 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
 
+    def _gdn_seq_to_interleaved(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+    ):
+        """Reorder sglang's sequential qkvz/ba into the GQA-interleaved layout
+        the native ``sgl_kernel.gdn_attention`` kernel reads.
+
+        Input (sglang, per-tp columns):
+          qkvz = [q_all(nk*hk) | k_all(nk*hk) | v_all(nv*hv) | z_all(nv*hv)]
+          ba   = [b_all(nv)    | a_all(nv)]
+        Output (kernel, per-k-head interleaved blocks):
+          qkvz = [ q(hk) k(hk) v(ratio*hv) z(ratio*hv) ] x nk
+          ba   = [ b(ratio) a(ratio) ] x nk
+        where ratio = nv // nk and v-head v belongs to k-head v // ratio
+        (contiguous GQA grouping). Returns contiguous tensors.
+        """
+        T = projected_states_qkvz.shape[0]
+        nk = self.num_k_heads // self.attn_tp_size
+        nv = self.num_v_heads // self.attn_tp_size
+        ratio = nv // nk
+        hk = self.head_k_dim
+        hv = self.head_v_dim
+        key_dim = nk * hk
+        val_dim = nv * hv
+
+        qkvz = projected_states_qkvz
+        q = qkvz[:, 0:key_dim].reshape(T, nk, hk)
+        k = qkvz[:, key_dim : 2 * key_dim].reshape(T, nk, hk)
+        v = qkvz[:, 2 * key_dim : 2 * key_dim + val_dim].reshape(T, nk, ratio * hv)
+        z = qkvz[:, 2 * key_dim + val_dim :].reshape(T, nk, ratio * hv)
+        qkvz_il = torch.cat([q, k, v, z], dim=2).reshape(T, -1).contiguous()
+
+        ba = projected_states_ba
+        b = ba[:, 0:nv].reshape(T, nk, ratio)
+        a = ba[:, nv : 2 * nv].reshape(T, nk, ratio)
+        ba_il = torch.cat([b, a], dim=2).reshape(T, -1).contiguous()
+
+        return qkvz_il, ba_il
+
     def _forward_xpu_fast_path(
         self,
         projected_states_qkvz: torch.Tensor,
@@ -744,9 +784,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         num_actual_tokens = projected_states_qkvz.shape[0]
 
-        # Contiguity the kernel asserts on.
-        projected_states_qkvz = projected_states_qkvz.contiguous()
-        projected_states_ba = projected_states_ba.contiguous()
+        # Layout adapter: sglang produces projected_states_qkvz in SEQUENTIAL
+        # [q_all | k_all | v_all | z_all] order and projected_states_ba as
+        # [b_all | a_all] (see fix_query_key_value_ordering). The native
+        # gdn_attention kernel instead reads qkvz as GQA-INTERLEAVED per-k-head
+        # blocks [q(head_k), k(head_k), v(head_v*ratio), z(head_v*ratio)] and ba
+        # as per-k-head [b(ratio), a(ratio)] (see chunk_causal_conv1d_xe2.hpp:
+        # qkvz_elems_offset = k_head_id*qkvz_dim+off; chunk_reorder_zba step =
+        # (token*num_v + k_head*ratio)*2). Reorder here so the kernel sees the
+        # layout it expects. conv_weights/conv_state/ssm_state stay sequential
+        # (the kernel reads those via reordered_elems_offset), so they are
+        # untouched. All dims are per-tp (the projection is column-parallel).
+        projected_states_qkvz, projected_states_ba = self._gdn_seq_to_interleaved(
+            projected_states_qkvz, projected_states_ba
+        )
 
         # Output buffers (kernel writes into these).
         nv_tp = self.num_v_heads // self.attn_tp_size
@@ -1136,7 +1187,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
             and not forward_batch.forward_mode.is_target_verify()
-            and self.num_v_heads // self.num_k_heads == 1
+            and self.num_v_heads % self.num_k_heads == 0
         ):
             output = self._forward_xpu_fast_path(
                 projected_states_qkvz,
