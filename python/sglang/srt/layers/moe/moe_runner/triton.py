@@ -58,25 +58,7 @@ def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
     return op
 
 
-def _e5m2_gate_up_transposed(w13: torch.Tensor) -> torch.Tensor:
-    """Return gate_up in the layout the e5m2 fused kernel expects.
 
-    ``moe_forward_full_silu_routed_e5m2`` requires gate_up as
-    ``[E, hidden, 2*inter]`` (K-major), whereas sglang's FusedMoE stores w13 as
-    ``[E, 2*inter, hidden]`` (N-major). There is no e5m2 *nmajor* up kernel, so
-    for the e5m2 variant we transpose once and cache the contiguous copy on the
-    weight tensor (amortised across all decode calls). down_weight needs no
-    transform (both layouts are ``[E, hidden, inter]``).
-    """
-    cached = getattr(w13, "_esimd_e5m2_t", None)
-    if cached is not None:
-        return cached
-    t = w13.transpose(1, 2).contiguous()
-    try:
-        w13._esimd_e5m2_t = t
-    except Exception:
-        pass
-    return t
 
 
 def _try_esimd_moe_silu_routed(
@@ -166,14 +148,10 @@ def _try_esimd_moe_silu_routed(
     s13 = _per_expert_pt_scale(quant_info.w13_scale)
     s2 = _per_expert_pt_scale(quant_info.w2_scale)
 
-    # We use the `_sglang` kernel variant which accepts w13 directly in
-    # sglang's [E, 2*intermediate, hidden] layout — no transpose / copy
-    # required, no extra memory cost, and the Triton fallback can still read
-    # the same parameter unchanged.
+    # Both the e4m3 (`_sglang`) and e5m2 kernel variants now accept w13 directly
+    # in sglang's [E, 2*intermediate, hidden] N-major layout — no transpose /
+    # extra copy, and the Triton fallback reads the same parameter unchanged.
     w13_kernel = w13
-    if fp8_variant == "e5m2":
-        # e5m2 fused kernel expects transposed gate_up ([E, hidden, 2*inter]).
-        w13_kernel = _e5m2_gate_up_transposed(w13)
 
     topk_w = runner_input.topk_weights
     topk_i = runner_input.topk_ids
@@ -373,12 +351,9 @@ def _maybe_esimd_moe_silu_fused(
     s13 = _per_expert_pt_scale(quant_info.w13_scale)
     s2 = _per_expert_pt_scale(quant_info.w2_scale)
 
-    # Use the `_sglang` kernel variant: accepts w13 in [E, 2*inter, hidden]
-    # directly, no transpose required.
+    # Both e4m3 and e5m2 kernel variants accept w13 in [E, 2*inter, hidden]
+    # (N-major) directly — no transpose / extra copy.
     w13_kernel = w13
-    if fp8_variant == "e5m2":
-        # e5m2 fused kernel expects transposed gate_up ([E, hidden, 2*inter]).
-        w13_kernel = _e5m2_gate_up_transposed(w13)
 
     if topk_weights.dtype != torch.float16:
         topk_weights = topk_weights.to(torch.float16)

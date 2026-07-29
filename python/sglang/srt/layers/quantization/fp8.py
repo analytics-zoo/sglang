@@ -1726,22 +1726,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-            # e5m2 fused decode kernels need a transposed copy of the routed
-            # gate_up weight, precomputed HERE (load time, before the KV cache
-            # pool is sized) to avoid a decode-time OOM:
-            #   moe_forward_full_silu_routed_e5m2 / moe_forward_full_v2 want
-            #   gate_up as [E, hidden, 2*inter]  (transpose of [E, 2*inter, hidden])
-            # The routed DOWN weight is consumed in its NATURAL sglang layout
-            # ([E, hidden, inter]) by both kernels (v2 uses the vllm-layout down
-            # kernel), so NO transposed down copy is cached — that extra full
-            # weight replica per rank would OOM at load time.
-            if fp8_dtype == torch.float8_e5m2:
-                try:
-                    layer.w13_weight._esimd_e5m2_t = (
-                        layer.w13_weight.data.transpose(1, 2).contiguous()
-                    )
-                except Exception:
-                    pass
+            # NOTE: e5m2 fused decode kernels used to require a transposed copy
+            # of the routed gate_up weight (w13._esimd_e5m2_t = [E, hidden,
+            # 2*inter]), which cost a full extra weight replica per rank
+            # (~10GB/tile at E=256). The e5m2 up kernels now read sglang's
+            # native N-major w13 [E, 2*inter, hidden] directly
+            # (moe_up_routed_e5m2_nmajor_kernel / moe_up_merged_e5m2_nmajor_kernel),
+            # so NO transposed copy is cached. The routed DOWN weight is likewise
+            # consumed in its natural layout ([E, hidden, inter]).
 
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)

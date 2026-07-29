@@ -261,8 +261,8 @@ def _esimd_router_logits(gate, hidden_states: torch.Tensor):
 # activations stay fp16. Gated by SGL_XPU_ESIMD_MOE_FULL=1.
 #
 # Weight layouts the kernel expects (all validated numerically, cos≈1.0):
-#   routed gate_up : [E, hidden, 2*inter]  -> w13_weight._esimd_e5m2_t  (load-time)
-#   routed down    : [E, inter, hidden]    -> w2_weight._esimd_e5m2_t   (load-time)
+#   routed gate_up : [E, 2*inter, hidden]  (native sglang w13, no transpose)
+#   routed down    : [E, hidden, inter]    (native sglang w2, no transpose)
 #   shared gate_up : [NS, 2*inter, hidden] (natural)  -> transpose of stored [hidden,2*inter]
 #   shared down    : [NS, hidden, inter]   (natural)  -> transpose of stored [inter,hidden]
 #   shared_gate    : [NS, hidden] fp16 (not quantised)
@@ -369,11 +369,8 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
     if w13.dtype != torch.float8_e5m2 or w2.dtype != torch.float8_e5m2:
         _moe_full_dbg("routed_not_e5m2", w13=str(w13.dtype), w2=str(w2.dtype))
         return None
-    gate_up_routed = getattr(w13, "_esimd_e5m2_t", None)   # [E, hidden, 2*inter]
+    gate_up_routed = w13                                   # native [E, 2*inter, hidden]
     down_routed = w2                                        # natural [E, hidden, inter]
-    if gate_up_routed is None:
-        _moe_full_dbg("routed_cache_missing", gu=False)
-        return None
     s13 = _pt_scale_1d(getattr(experts, "w13_weight_scale", None))
     s2 = _pt_scale_1d(getattr(experts, "w2_weight_scale", None))
     if s13 is None or s2 is None:
@@ -396,15 +393,6 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
         try:
             shared_gate_up = gw.t().contiguous().unsqueeze(0)  # [1, 2*inter, hidden]
             gw._esimd_moe_full_nat = shared_gate_up
-        except Exception:
-            return None
-    # DPAS/transposed layout [1, hidden, 2*inter] for the merged up kernel (4b).
-    # gw is already stored [hidden, 2*inter], so this is just an unsqueeze.
-    shared_gate_up_dpas = getattr(gw, "_esimd_moe_full_dpas", None)
-    if shared_gate_up_dpas is None:
-        try:
-            shared_gate_up_dpas = gw.unsqueeze(0).contiguous()  # [1, hidden, 2*inter]
-            gw._esimd_moe_full_dpas = shared_gate_up_dpas
         except Exception:
             return None
     shared_down = getattr(dw, "_esimd_moe_full_nat", None)
@@ -432,7 +420,6 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
         "num_shared": int(shared_gate_up.shape[0]),
         "gate_up_routed": gate_up_routed, "s13": s13,
         "shared_gate_up": shared_gate_up, "ss13": ss13,
-        "shared_gate_up_dpas": shared_gate_up_dpas,
         "down_routed": down_routed, "s2": s2,
         "shared_down": shared_down, "ss2": ss2,
         "sgw16": sgw16,
@@ -566,7 +553,7 @@ def _maybe_esimd_moe_full_norm(block, hidden_states, residual, norm_weight_folde
             h_in, res, norm_weight_folded, float(eps),
             wq, sc,
             W["gate_up_routed"], W["s13"],
-            W["shared_gate_up_dpas"], W["ss13"],
+            W["shared_gate_up"], W["ss13"],
             W["down_routed"], W["s2"],
             W["shared_down"], W["ss2"],
             W["sgw16"],
