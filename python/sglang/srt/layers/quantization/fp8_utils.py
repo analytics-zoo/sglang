@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -65,6 +66,9 @@ _is_xpu = is_xpu()
 # Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 # esimd_gemm_fp8_pert kernel wrapper.
 # Only initialised on XPU; None elsewhere or if the package is missing.
+# Output width below which the ESIMD kernel is preferred at any M, because
+# torch._scaled_mm is not reproducible on narrow-N shapes (see apply_fp8_linear).
+_XPU_ESIMD_FP8_NARROW_N = int(os.environ.get("SGL_XPU_ESIMD_FP8_NARROW_N", "128"))
 _esimd_gemm_fp8_pert = None
 if _is_xpu:
     try:
@@ -1670,6 +1674,14 @@ def apply_fp8_linear(
     # Restricted to small M (M<=64) since the kernel's M>=64 weight-stationary
     # path is much slower than torch._scaled_mm (verified: 14000us vs 156us at
     # M=4096). Triggered for decode (M=1) and small chunked-prefill batches.
+    #
+    # Narrow-N GEMMs take the ESIMD path at any M as well: torch._scaled_mm
+    # splits such shapes along K and reduces the partials in an order that
+    # varies with GPU occupancy, so the same operands can yield two different
+    # results (observed on GDN in_proj_ba, N=32, on prefill tail chunks with
+    # M>64 -- it made prefill non-deterministic). N is tiny there, so the
+    # weight-stationary path costs almost nothing at these shapes.
+    _n_out = weight.shape[1]
     if (
         _is_xpu
         and _esimd_gemm_fp8_pert is not None
@@ -1677,7 +1689,7 @@ def apply_fp8_linear(
         and not (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
         and (weight_scale.numel() == 1)
         and bias is None
-        and input_2d.shape[0] <= 64
+        and (input_2d.shape[0] <= 64 or _n_out <= _XPU_ESIMD_FP8_NARROW_N)
     ):
         weight_nk = getattr(weight, "_esimd_t", None)
         if weight_nk is None:
