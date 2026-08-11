@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -18,6 +20,7 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
 
@@ -490,6 +493,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            # Per-chunk intermediate states are only needed when this batch has
+            # to snapshot at a position that is not chunk-aligned; asking for
+            # them unconditionally would materialise a large tensor per layer.
+            need_h = (
+                forward_metadata.has_mamba_track_mask
+                and forward_metadata.track_ssm_h_src.numel() > 0
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -499,6 +509,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                intermediate_chunk_size=(
+                    get_global_server_args().mamba_cache_chunk_size if need_h else 0
+                ),
             )
 
             if (
@@ -509,9 +522,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 ssm_states[cache_indices] = last_recurrent_state
 
-            if h is not None:
-                self._track_mamba_state_extend(
-                    forward_batch, h, ssm_states, forward_metadata
-                )
+
+            # `h` may be None: some kernel backends (XPU) do not emit the
+            # per-chunk intermediate states. Only the unaligned branch of the
+            # tracking needs them, so the call must not be gated on `h` -- doing
+            # so silently dropped *every* extend-time SSM snapshot on XPU.
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
 
         return core_attn_out
