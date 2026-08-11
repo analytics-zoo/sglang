@@ -1286,6 +1286,73 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    def _install_layer_trace_hooks(self):
+        """Dump a per-module fingerprint of every forward output.
+
+        Used to locate where prefill indeterminism first appears: run the same
+        prompt twice, then diff the two traces to find the first module whose
+        output changes. Enabled with SGLANG_XPU_LAYER_TRACE=<path prefix>.
+        """
+        import json as _json
+        import zlib as _zlib
+
+        prefix = os.environ["SGLANG_XPU_LAYER_TRACE"]
+        rank = getattr(self, "tp_rank", 0)
+        path = f"{prefix}.rank{rank}.jsonl"
+        # Truncate any trace left over from a previous server instance.
+        open(path, "w").close()
+
+        def fingerprint(t):
+            if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                return None
+            f = t.detach().to(torch.float64)
+            # A sum/abs-sum pair can collide (any permutation preserves both),
+            # so carry a byte-exact CRC of the raw values as well: "input is
+            # identical" has to be a bit-level claim, not a statistical one.
+            try:
+                b = t.detach().contiguous().cpu().numpy().tobytes()
+                crc = _zlib.crc32(b) & 0xFFFFFFFF
+            except Exception:
+                crc = None
+            return [float(f.sum().item()), float(f.abs().sum().item()),
+                    list(t.shape), crc]
+
+        def make_hook(name):
+            def hook(_mod, inp, out):
+                first = out
+                if isinstance(out, (tuple, list)):
+                    first = next((o for o in out
+                                  if isinstance(o, torch.Tensor)), None)
+                fp = fingerprint(first)
+                if fp is None:
+                    return
+                if name == state["first"]:
+                    state["step"] += 1
+                rec = {"name": name, "fp": fp, "s": state["step"]}
+                # Input fingerprint too: an output-only trace cannot tell a
+                # module that was fed different data from one that is itself
+                # non-deterministic.
+                src = inp[0] if isinstance(inp, (tuple, list)) and inp else inp
+                ifp = fingerprint(src)
+                if ifp is not None:
+                    rec["ifp"] = ifp
+                with open(path, "a") as fh:
+                    fh.write(_json.dumps(rec) + "\n")
+            return hook
+
+        state = {"step": -1, "first": None}
+
+        want = os.environ.get("SGLANG_XPU_LAYER_TRACE_FILTER", "layers.")
+        n = 0
+        for name, mod in self.model.named_modules():
+            if want and want not in name:
+                continue
+            if state["first"] is None:
+                state["first"] = name
+            mod.register_forward_hook(make_hook(name))
+            n += 1
+        logger.warning("[LAYER_TRACE] hooked %d modules -> %s", n, path)
+
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -1395,6 +1462,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
+
+        if os.environ.get("SGLANG_XPU_LAYER_TRACE"):
+            self._install_layer_trace_hooks()
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
