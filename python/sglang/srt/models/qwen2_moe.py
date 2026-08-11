@@ -118,6 +118,39 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = logging.getLogger(__name__)
 
+# ── NaN/Inf probe (env-gated: SGLANG_NAN_PROBE=1) ───────────────────────────
+# Isolates whether a non-finite MoE output originates in the routed experts
+# (e.g. GGUF grouped prefill GGEMV at batch>8) or the shared expert. Zero
+# overhead when SGLANG_NAN_PROBE is unset. See qwen3_5.py for the layer-level
+# probe that pins down the origin layer / prefill-vs-decode / token count.
+import os as _os_np_moe
+
+_NAN_PROBE_MOE = _os_np_moe.environ.get("SGLANG_NAN_PROBE", "0") == "1"
+
+
+def _nan_probe_moe(tag, t, layer_id=None, forward_batch=None):
+    if not _NAN_PROBE_MOE or not torch.is_tensor(t) or t.numel() == 0:
+        return
+    try:
+        if not t.dtype.is_floating_point or bool(torch.isfinite(t).all()):
+            return
+        mode = "?"
+        if forward_batch is not None:
+            fm = getattr(forward_batch, "forward_mode", None)
+            mode = getattr(fm, "name", str(fm)) if fm is not None else "?"
+        logger.error(
+            "[NANPROBE] tag=%s layer=%s mode=%s ntok=%d shape=%s nan=%d inf=%d",
+            tag,
+            layer_id,
+            mode,
+            int(t.shape[0]) if t.dim() > 0 else -1,
+            tuple(t.shape),
+            int(torch.isnan(t).sum().item()),
+            int(torch.isinf(t).sum().item()),
+        )
+    except Exception:
+        pass
+
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -426,6 +459,360 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
     }
 
 
+_GGUF_INTROSPECT_DONE = set()
+def _load_shared_q8_op():
+    try:
+        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401 (registers ops)
+    except Exception:
+        pass
+    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
+    return getattr(ns, "esimd_shared_expert_q8", None) if ns is not None else None
+
+
+_GGUF_MOE_SHARED = bool(
+    os.environ.get("SGL_XPU_GGUF_MOE_SHARED")
+    or os.environ.get("SGLANG_XPU_GGUF_MOE_SHARED")
+)
+_SHARED_Q8_OP = None
+
+
+def _gather_gguf_shared_q8(block):
+    """Collect + validate the Q8_0 shared-expert tensors for the fused decode op.
+    Returns (gu_qs, gu_sc, d_qs, d_sc, wg, inter_s) or False to disable."""
+    se = getattr(block, "shared_expert", None)
+    sg = getattr(block, "shared_expert_gate", None)
+    if se is None or sg is None:
+        return False
+    gu = getattr(se, "gate_up_proj", None)
+    dn = getattr(se, "down_proj", None)
+    if gu is None or dn is None:
+        return False
+
+    # gate_up: prefer the merged rep (rows gate then up); else concat per-shard.
+    merged = getattr(gu, "_xpu_merged", None)
+    if isinstance(merged, tuple) and merged and merged[0] == "q8_0":
+        gu_qs, gu_sc = merged[1].contiguous(), merged[2].contiguous()
+    else:
+        reps = getattr(gu, "_xpu_reps", None)
+        order = getattr(gu, "_xpu_shard_order", None)
+        if not isinstance(reps, dict) or not order:
+            return False
+        parts = [reps[i] for i in order]
+        if any((not isinstance(p, tuple)) or p[0] != "q8_0" for p in parts):
+            return False
+        gu_qs = torch.cat([p[1] for p in parts], dim=0).contiguous()
+        gu_sc = torch.cat([p[2] for p in parts], dim=0).contiguous()
+
+    dreps = getattr(dn, "_xpu_reps", None)
+    drep = dreps.get("_single") if isinstance(dreps, dict) else None
+    if not (isinstance(drep, tuple) and drep[0] == "q8_0"):
+        return False
+    d_qs, d_sc = drep[1].contiguous(), drep[2].contiguous()
+
+    w = getattr(sg, "weight", None)
+    if w is None or w.dim() != 2 or w.shape[0] != 1:
+        return False
+    wg = (w[0] if w.dtype == torch.float16 else w[0].to(torch.float16)).contiguous()
+
+    two_inter, hidden = gu_qs.shape
+    inter_s = two_inter // 2
+    # shape/dtype guards: a bad tensor never reaches the kernel.
+    if gu_qs.dtype != torch.int8 or d_qs.dtype != torch.int8:
+        return False
+    if (hidden % 32) or (inter_s % 32) or (two_inter % 2):
+        return False
+    if tuple(d_qs.shape) != (hidden, inter_s):
+        return False
+    if tuple(gu_sc.shape) != (two_inter, hidden // 32):
+        return False
+    if tuple(d_sc.shape) != (hidden, inter_s // 32):
+        return False
+    if wg.shape[0] != hidden:
+        return False
+    return (gu_qs, gu_sc, d_qs, d_sc, wg, int(inter_s))
+
+
+def _maybe_gguf_shared_q8(block, x):
+    """One-dispatch fused GGUF Q8_0 shared expert (gate_up+silu+down+gate*sigmoid).
+    Returns the shared-expert partial [M, hidden] fp16, or None to fall back to
+    the unfused ``_forward_shared_experts`` path. Env-gated by
+    SGL_XPU_GGUF_MOE_SHARED=1."""
+    if not _GGUF_MOE_SHARED or x.device.type != "xpu" or x.dim() != 2:
+        return None
+    global _SHARED_Q8_OP
+    if _SHARED_Q8_OP is None:
+        _SHARED_Q8_OP = _load_shared_q8_op()
+        if _SHARED_Q8_OP is None:
+            return None
+    cache = getattr(block, "_gguf_shared_q8_cache", None)
+    if cache is None:
+        cache = _gather_gguf_shared_q8(block)
+        block._gguf_shared_q8_cache = cache
+    if not cache:
+        return None
+    gu_qs, gu_sc, d_qs, d_sc, wg, inter_s = cache
+    xf = x if x.dtype == torch.float16 else x.to(torch.float16)
+    try:
+        return _SHARED_Q8_OP(xf, gu_qs, gu_sc, d_qs, d_sc, wg, inter_s)
+    except Exception:
+        block._gguf_shared_q8_cache = False
+        return None
+
+
+# ═══════════════ GGUF FULL MoE fusion (topk + routed + shared -> 1 op) ═══════════════
+_GGUF_MOE_FULL = bool(
+    os.environ.get("SGL_XPU_GGUF_MOE_FULL")
+    or os.environ.get("SGLANG_XPU_GGUF_MOE_FULL")
+)
+_GGUF_FULL_OP = None
+_GGUF_FULL_NORM_OP = None
+
+
+def _env_int(name, default):
+    try:
+        v = os.environ.get(name)
+        return default if v is None or v == "" else int(v)
+    except Exception:
+        return default
+
+
+# Largest decode batch the norm-fused GGUF MoE op is allowed to serve. Every
+# kernel stage behind it (topk / up_q4k / shared_up_q8 / down / finalize) is
+# already M-generic and the C++ side sizes all scratch from x.size(0), so this
+# is purely a policy cap: it keeps the fused path away from prefill-sized M
+# where the per-token GEMV shape stops paying off. Set to 1 to A/B the fusion.
+_GGUF_MOE_FUSE_MAX_M = _env_int("SGL_XPU_GGUF_MOE_FUSE_MAX_M", 64)
+
+
+def _load_gguf_moe_full_norm_op():
+    """Norm-fused GGUF MoE op: absorbs the post-attention GemmaRMSNorm and the
+    fp16 router GEMV, cutting two host dispatches per layer on the (host-bound)
+    decode path. Returns None on older kernel builds."""
+    try:
+        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401
+    except Exception:
+        pass
+    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
+    if ns is None:
+        return None
+    return getattr(ns, "esimd_moe_forward_full_gguf_norm", None)
+
+
+def _gguf_router_weight(gate):
+    """The dense fp16 router weight [E, hidden] behind the MoE gate linear, or
+    None when it cannot be expressed that way.
+
+    Two layouts occur for the 35B GGUF checkpoint: ``ffn_gate_inp`` is stored
+    unquantized (F32), so depending on the quant config the gate is either a
+    plain ``UnquantizedLinearMethod`` (weight on the module) or a GGUF XPU
+    linear holding a single fp16 resident rep. Handle both; the fp16 copy is
+    cached on the module so the (possible) cast happens once, not per step.
+    """
+    w = getattr(gate, "_esimd_router_w16", None)
+    if w is not None:
+        return w
+    reps = getattr(gate, "_xpu_reps", None)
+    if reps is None:
+        qm = getattr(gate, "quant_method", None)
+        reps = getattr(qm, "_xpu_reps", None)
+    if isinstance(reps, dict) and list(reps.keys()) == ["_single"]:
+        rep = reps["_single"]
+        w = rep[1] if rep[0] == "fp16" else None
+    else:
+        w = getattr(gate, "weight", None)
+        w = getattr(w, "data", w)
+    if w is None or w.dim() != 2:
+        return None
+    if w.dtype != torch.float16:
+        w = w.to(torch.float16)
+    w = w.contiguous()
+    gate._esimd_router_w16 = w
+    return w
+
+
+def _load_gguf_moe_full_op():
+    try:
+        import custom_esimd_kernels_sglang.custom_esimd_kernels  # noqa: F401
+    except Exception:
+        pass
+    ns = getattr(torch.ops, "custom_esimd_kernels_sglang", None)
+    return getattr(ns, "esimd_moe_forward_full_gguf", None) if ns is not None else None
+
+
+def _gather_gguf_moe_full(block):
+    """Collect + validate everything the fused GGUF full-MoE op needs:
+    routed Q4_K gate/up + Q5_K/Q6_K down reps (from experts.quant_method),
+    the Q8_0 shared-expert reps, top_k, renorm, and dims. Returns a dict or
+    False. Every layout/dtype check here keeps a bad tensor off the kernel."""
+    experts = getattr(block, "experts", None)
+    topk = getattr(block, "topk", None)
+    gate = getattr(block, "gate", None)
+    if experts is None or topk is None or gate is None:
+        return False
+    qm = getattr(experts, "quant_method", None)
+    if qm is None or not hasattr(qm, "gate_ql") or not hasattr(qm, "down_ql"):
+        return False
+
+    # topk must be plain softmax + renorm (matches the fused kernel selection).
+    tc = getattr(topk, "topk_config", None)
+    if tc is None:
+        return False
+    if getattr(tc, "scoring_func", "softmax") != "softmax":
+        return False
+    if getattr(tc, "use_grouped_topk", False):
+        return False
+    if getattr(tc, "correction_bias", None) is not None:
+        return False
+    if getattr(tc, "custom_routing_function", None) is not None:
+        return False
+    top_k = getattr(tc, "top_k", None)
+    if top_k is None:
+        return False
+    renorm = bool(getattr(tc, "renormalize", True))
+
+    shared = _gather_gguf_shared_q8(block)
+    if not shared:
+        return False
+    gu_qs, gu_sc, d_qs, d_sc, wg, inter_s = shared
+
+    down_mn = getattr(qm, "down_mn", None)
+    down_is_q6 = bool(getattr(qm, "_down_is_q6", False))
+    # q5k needs down_mn; q6k ignores it (pass down_sc as a valid placeholder).
+    if down_mn is None:
+        if not down_is_q6:
+            return False
+        down_mn = qm.down_sc
+
+    hidden = int(getattr(qm, "hidden"))
+    inter = int(getattr(qm, "intermediate"))
+    E = int(getattr(qm, "E"))
+    # shared and routed share the same hidden; inter_s (shared) may differ.
+    if wg.shape[0] != hidden:
+        return False
+    return {
+        "gate": gate, "top_k": int(top_k), "renorm": renorm,
+        "E": E, "hidden": hidden, "inter": inter, "inter_s": int(inter_s),
+        "down_is_q6": down_is_q6,
+        "gate_ql": qm.gate_ql, "gate_sc": qm.gate_sc, "gate_mn": qm.gate_mn,
+        "up_ql": qm.up_ql, "up_sc": qm.up_sc, "up_mn": qm.up_mn,
+        "down_ql": qm.down_ql, "down_qh": qm.down_qh_plain,
+        "down_sc": qm.down_sc, "down_mn": down_mn,
+        "gu_qs": gu_qs, "gu_sc": gu_sc, "d_qs": d_qs, "d_sc": d_sc, "wg": wg,
+    }
+
+
+def _maybe_gguf_moe_full_norm(block, h, residual, nw, eps):
+    """Norm-fused GGUF MoE: GemmaRMSNorm(resadd) + router GEMV + experts in ONE
+    dispatch. Returns ``(moe_out, new_residual)`` or None to fall back.
+
+    ``residual`` is updated in place by the kernel (same as
+    ``gemma_fused_add_rmsnorm``), so a None return must happen BEFORE the call.
+    """
+    if not _GGUF_MOE_FULL or h.device.type != "xpu" or h.dim() != 2:
+        return None
+    if not 1 <= h.shape[0] <= _GGUF_MOE_FUSE_MAX_M:
+        return None
+    global _GGUF_FULL_NORM_OP
+    if _GGUF_FULL_NORM_OP is None:
+        _GGUF_FULL_NORM_OP = _load_gguf_moe_full_norm_op()
+        if _GGUF_FULL_NORM_OP is None:
+            return None
+    cache = getattr(block, "_gguf_moe_full_cache", None)
+    if cache is None:
+        cache = _gather_gguf_moe_full(block)
+        block._gguf_moe_full_cache = cache
+    if not cache:
+        return None
+    if getattr(block, "_gguf_moe_full_norm_off", False):
+        return None
+    rw = cache.get("router_w", None)
+    if rw is None:
+        rw = _gguf_router_weight(cache["gate"])
+        if rw is None or rw.shape != (int(cache["E"]), int(cache["hidden"])):
+            logger.warning(
+                "[gguf_moe_full_norm] disabled: router weight %s, want (%s, %s)",
+                None if rw is None else tuple(rw.shape),
+                cache["E"], cache["hidden"])
+            block._gguf_moe_full_norm_off = True
+            return None
+        cache["router_w"] = rw
+    hf = h if h.dtype == torch.float16 else h.to(torch.float16)
+    hf = hf if hf.is_contiguous() else hf.contiguous()
+    if residual.dtype != torch.float16 or not residual.is_contiguous():
+        if not getattr(block, "_gguf_norm_res_warned", False):
+            block._gguf_norm_res_warned = True
+            logger.warning("[gguf_moe_full_norm] disabled: residual dtype=%s contig=%s",
+                           residual.dtype, residual.is_contiguous())
+        return None
+    try:
+        out, res_out = _GGUF_FULL_NORM_OP(
+            hf, residual, nw, float(eps), rw,
+            cache["gate_ql"], cache["gate_sc"], cache["gate_mn"],
+            cache["up_ql"], cache["up_sc"], cache["up_mn"],
+            cache["down_ql"], cache["down_qh"], cache["down_sc"], cache["down_mn"],
+            cache["gu_qs"], cache["gu_sc"], cache["d_qs"], cache["d_sc"], cache["wg"],
+            int(cache["E"]), int(cache["top_k"]), int(cache["inter"]),
+            int(cache["inter_s"]), bool(cache["down_is_q6"]), bool(cache["renorm"]),
+        )
+    except Exception as e:
+        logger.warning("[gguf_moe_full_norm] disabled: kernel raised %r", e)
+        block._gguf_moe_full_norm_off = True
+        return None
+    if not getattr(block, "_gguf_norm_ok_logged", False):
+        block._gguf_norm_ok_logged = True
+        logger.warning("[gguf_moe_full_norm] ACTIVE (norm + router folded into MoE op)")
+    return out, res_out
+
+
+def _maybe_gguf_moe_full(block, x):
+    """One-dispatch fused GGUF MoE: router topk + routed experts (Q4_K/Q5_K) +
+    Q8_0 shared expert -> the final [M, hidden] fp16 PARTIAL (routed + gate*shared
+    summed; caller does the all_reduce). Returns None to fall back to the unfused
+    router/shared path. Env-gated by SGL_XPU_GGUF_MOE_FULL=1."""
+    if not _GGUF_MOE_FULL or x.device.type != "xpu" or x.dim() != 2 or x.shape[0] > 8:
+        return None
+    global _GGUF_FULL_OP
+    if _GGUF_FULL_OP is None:
+        _GGUF_FULL_OP = _load_gguf_moe_full_op()
+        if _GGUF_FULL_OP is None:
+            _moe_full_dbg("gguf_op_none")
+            return None
+    cache = getattr(block, "_gguf_moe_full_cache", None)
+    if cache is None:
+        cache = _gather_gguf_moe_full(block)
+        block._gguf_moe_full_cache = cache
+    if not cache:
+        return None
+
+    gate = cache["gate"]
+    logits = _esimd_router_logits(gate, x)
+    if logits is None:
+        logits, _ = gate(x)
+    if logits.dtype != torch.float16:
+        logits = logits.to(torch.float16)
+    logits = logits if logits.dim() == 2 else logits.reshape(x.shape[0], -1)
+    logits = logits.contiguous()
+    xf = x if x.dtype == torch.float16 else x.to(torch.float16)
+    try:
+        out = _GGUF_FULL_OP(
+            xf, logits,
+            cache["gate_ql"], cache["gate_sc"], cache["gate_mn"],
+            cache["up_ql"], cache["up_sc"], cache["up_mn"],
+            cache["down_ql"], cache["down_qh"], cache["down_sc"], cache["down_mn"],
+            cache["gu_qs"], cache["gu_sc"], cache["d_qs"], cache["d_sc"], cache["wg"],
+            int(cache["E"]), int(cache["top_k"]), int(cache["inter"]),
+            int(cache["inter_s"]), bool(cache["down_is_q6"]), bool(cache["renorm"]),
+        )
+    except Exception as e:
+        _moe_full_dbg("gguf_kernel_exc", err=repr(e))
+        block._gguf_moe_full_cache = False
+        return None
+    if _MOE_FULL_DEBUG:
+        _moe_full_dbg("SUCCESS", T=int(x.shape[0]), E=int(cache["E"]),
+                      top_k=int(cache["top_k"]), out=tuple(out.shape), path="gguf_full")
+    return out
+
+
 def _maybe_esimd_moe_full(block, hidden_states: torch.Tensor):
     """One-dispatch decode MoE via moe_forward_full_v2. Returns the final
     [T, hidden] fp16 tensor (routed + gate*shared, already summed), or None to
@@ -655,6 +1042,7 @@ class Qwen2MoeMLP(nn.Module):
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
+    _prep_mlp_skip_seen = set()
     def __init__(
         self,
         layer_id: int,
@@ -972,14 +1360,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             fused_full = _maybe_esimd_moe_full(self, hidden_states)
+            if fused_full is None:
+                fused_full = _maybe_gguf_moe_full(self, hidden_states)
             if fused_full is not None:
-                # v2 returns routed + gate*shared already summed → skip the
+                # Fused op returns routed + gate*shared already summed → skip the
                 # separate shared path and its add below.
                 final_hidden_states = fused_full
                 shared_output = None
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = _maybe_gguf_shared_q8(self, hidden_states)
+                if shared_output is None:
+                    shared_output = self._forward_shared_experts(hidden_states)
+                _nan_probe_moe(
+                    "moe_shared_out",
+                    shared_output,
+                    layer_id=getattr(self, "layer_id", None),
+                    forward_batch=forward_batch,
+                )
                 final_hidden_states = self._forward_router_experts(hidden_states)
+                _nan_probe_moe(
+                    "moe_routed_out",
+                    final_hidden_states,
+                    layer_id=getattr(self, "layer_id", None),
+                    forward_batch=forward_batch,
+                )
 
         if shared_output is not None:
             final_hidden_states += shared_output
@@ -1025,37 +1429,57 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         that could invalidate the manual collectives are checked BEFORE any
         communication, so a ``None`` return never leaves a stray all-reduce.
         """
-        if not _ESIMD_MOE_FULL:
+        def _skip(why):
+            # One-shot per reason: tells us which guard blocks the fusion
+            # without spamming a 40-layer x N-token decode loop.
+            seen = Qwen2MoeSparseMoeBlock._prep_mlp_skip_seen
+            if why not in seen:
+                seen.add(why)
+                logger.warning("[esimd_prepare_mlp_moe] disabled: %s", why)
             return None
+
+        if not _ESIMD_MOE_FULL and not _GGUF_MOE_FULL:
+            return _skip("no MOE_FULL env")
         ops = _load_esimd_moe_full_op()
-        if ops is None or ops.get("rtfused_norm") is None:
-            return None
+        # Either the fp8 ESIMD norm-fused op or the GGUF norm-fused op must be
+        # available, otherwise there is nothing to fold the norm into.
+        have_fp8 = (
+            _ESIMD_MOE_FULL and ops is not None and ops.get("rtfused_norm") is not None
+        )
+        have_gguf = _GGUF_MOE_FULL and _load_gguf_moe_full_norm_op() is not None
+        if not have_fp8 and not have_gguf:
+            return _skip("no norm-fused op (fp8=%s gguf=%s)" % (have_fp8, have_gguf))
         if not (
             hidden_states.device.type == "xpu"
             and forward_batch is not None
             and forward_batch.forward_mode.is_decode()
         ):
-            return None
-        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
-            return None
+            return _skip("not xpu decode")
+        # M>1 is only serviceable by the GGUF norm-fused op; the fp8 twin
+        # (_maybe_esimd_moe_full_norm) is still single-token. Without GGUF we
+        # keep the original M==1 gate so fp8-only setups are untouched.
+        max_m = _GGUF_MOE_FUSE_MAX_M if have_gguf else 1
+        if hidden_states.dim() != 2 or not (1 <= hidden_states.shape[0] <= max_m):
+            return _skip("shape %s" % (tuple(hidden_states.shape),))
         if residual is None or residual.shape != hidden_states.shape:
-            return None
+            return _skip("residual mismatch")
         # Only the plain-TP path (no input-scatter, no DP-attention, no
         # all-reduce fusion, no reduce-scatter) matches the manual collectives.
         if use_reduce_scatter or should_allreduce_fusion:
-            return None
+            return _skip("reduce_scatter=%s allreduce_fusion=%s"
+                         % (use_reduce_scatter, should_allreduce_fusion))
         if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
-            return None
+            return _skip("needs_allreduce_fusion flag")
         try:
             from sglang.srt.layers.communicator import get_attn_tp_context
             from sglang.srt.layers.dp_attention import get_attention_dp_size
 
             if get_attn_tp_context().input_scattered:
-                return None
+                return _skip("input_scattered")
             if get_attention_dp_size() != 1:
-                return None
-        except Exception:
-            return None
+                return _skip("dp_size != 1")
+        except Exception as e:
+            return _skip("ctx probe exc %r" % (e,))
         # Fold GemmaRMSNorm (1 + weight) once per layer.
         nw = getattr(norm_module, "_esimd_moe_nw", None)
         if nw is None:
@@ -1070,7 +1494,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ── Commit: reproduce prepare_mlp's attention-output all-reduce ──
         h_ar = attention_tensor_model_parallel_all_reduce(hidden_states)
 
-        fused = _maybe_esimd_moe_full_norm(self, h_ar, residual, nw, eps)
+        fused = None
+        if have_gguf:
+            fused = _maybe_gguf_moe_full_norm(self, h_ar, residual, nw, eps)
+        if fused is None and have_fp8:
+            fused = _maybe_esimd_moe_full_norm(self, h_ar, residual, nw, eps)
         if fused is not None:
             moe_out, new_residual = fused
             # Reproduce mlp.forward's post-experts all-reduce (kernel is per-rank).

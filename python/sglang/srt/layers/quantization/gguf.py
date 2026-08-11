@@ -631,6 +631,9 @@ def apply_gguf_embedding_xpu(
     return dequant.view(*x.shape, hidden_size)
 
 
+_XPU_EMB_DEBUG = os.environ.get("SGLANG_GGUF_EMB_DEBUG", "0") == "1"
+
+
 class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
     """GGUF embedding for Intel XPU (PTL Xe3).
 
@@ -655,18 +658,35 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         layer._xpu_emb_rep = _xpu_prepare_shard(
             layer.qweight.data, int(qweight_type), self.params_dtype
         )
+        if _XPU_EMB_DEBUG:
+            rep = layer._xpu_emb_rep
+            msg = ["kind=%s" % rep[0]]
+            for i, t in enumerate(rep[1:]):
+                if not torch.is_tensor(t):
+                    continue
+                if t.dtype.is_floating_point:
+                    nb = int((~torch.isfinite(t)).sum().item())
+                    msg.append(
+                        "t%d %s %s nonfinite=%d absmax=%.6g"
+                        % (i, tuple(t.shape), t.dtype, nb,
+                           float(t.abs().float().max().item()))
+                    )
+                else:
+                    msg.append("t%d %s %s" % (i, tuple(t.shape), t.dtype))
+            logger.error("[EMBDEBUG] rep health: %s", " | ".join(msg))
         if hasattr(layer, "qweight"):
             del layer.qweight
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
-        debug_bounds = False
+        debug_bounds = _XPU_EMB_DEBUG
 
         def _log_nonfinite_once(flag_name: str, stage: str, t: torch.Tensor):
             if not debug_bounds or t.numel() == 0 or bool(torch.isfinite(t).all().item()):
                 return
-            if getattr(layer, flag_name, False):
+            n = getattr(layer, flag_name, 0)
+            if n >= 8:
                 return
-            setattr(layer, flag_name, True)
+            setattr(layer, flag_name, n + 1)
             row_bad = ~torch.isfinite(t.reshape(t.shape[0], -1)).all(dim=1)
             bad_rows = row_bad.nonzero(as_tuple=False).flatten()
             bad_rows_head = bad_rows[:16].tolist()
@@ -677,16 +697,26 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
                 and x_flat_dbg.numel() >= int(bad_rows.max().item()) + 1
                 else []
             )
+            # Element-level (not whole-row) badness: report the exact flat
+            # positions so a partial-row corruption is distinguishable from a
+            # bad table row.
+            bad_flat = (~torch.isfinite(t)).nonzero(as_tuple=False)
             logger.error(
                 "GGUFEmbeddingXPUMethod non-finite at %s: dtype=%s shape=%s "
-                "nan=%d inf=%d bad_rows_head=%s bad_token_ids_head=%s",
+                "nan=%d inf=%d n_bad_rows=%d bad_rows_head=%s bad_token_ids_head=%s "
+                "bad_elem_head=%s id_min=%d id_max=%d ntok=%d",
                 stage,
                 str(t.dtype),
                 tuple(t.shape),
                 int(torch.isnan(t).sum().item()),
                 int(torch.isinf(t).sum().item()),
+                int(bad_rows.numel()),
                 bad_rows_head,
                 bad_ids_head,
+                bad_flat[:8].tolist(),
+                int(x_flat_dbg.min().item()) if x_flat_dbg.numel() else -1,
+                int(x_flat_dbg.max().item()) if x_flat_dbg.numel() else -1,
+                int(x_flat_dbg.numel()),
             )
 
         # Eagle/NEXTN embed-share: set_embed_and_head may have replaced this
@@ -895,6 +925,13 @@ _Q4_K_SB = 256          # q4_K super-block elements
 _Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
 _MOE_DOWN_REPACK_CHUNK_ROWS = int(
     os.environ.get("SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS", "65536"))
+# Cap on the transient int32 intermediate produced per repack chunk. The q5/q6
+# repack path materializes several [rows, K] int32 tensors at once, so a fixed
+# row count scales badly with K: the 248320x2048 embedding needs ~1.5-2 GB per
+# 65536-row chunk, which OOMs at TP=1 (the whole table lives on one card).
+# Chunk rows are derived from this budget so wide tensors are split finer.
+_REPACK_CHUNK_BUDGET_BYTES = int(
+    os.environ.get("SGLANG_GGUF_XPU_REPACK_CHUNK_BYTES", str(32 << 20)))
 
 
 def _xpu_repack_q4_k(qweight: torch.Tensor):
@@ -979,7 +1016,7 @@ def _xpu_repack_q4_k_chunked(qweight: torch.Tensor,
 
 
 def _xpu_repack_rows_chunked(repack_fn, qweight: torch.Tensor,
-                             chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS,
+                             chunk_rows: int = None,
                              **kwargs):
     """Generic row-chunked wrapper for any of the _xpu_repack_q{4,5,6}_k
     functions (col_perm only reorders the K/column dim, so it composes
@@ -987,8 +1024,18 @@ def _xpu_repack_rows_chunked(repack_fn, qweight: torch.Tensor,
     lm_head weight, vocab_size rows) where a single whole-tensor repack call
     creates multi-GB int32 intermediates and was the cause of a second
     TP=1-loading OOM (in _xpu_prepare_shard, downstream of
-    GGUFEmbeddingXPUMethod.process_weights_after_loading)."""
+    GGUFEmbeddingXPUMethod.process_weights_after_loading).
+
+    chunk_rows defaults to whatever keeps one chunk's int32 intermediates
+    under _REPACK_CHUNK_BUDGET_BYTES, so narrow tensors keep using large
+    chunks while wide ones (big K) are split finer."""
     N = qweight.shape[0]
+    if chunk_rows is None:
+        # qweight rows are packed bytes; the repack blows them up to int32
+        # elements, so estimate the per-row cost from the byte width.
+        row_bytes = max(1, int(qweight.shape[1])) * 4
+        chunk_rows = max(1024, _REPACK_CHUNK_BUDGET_BYTES // row_bytes)
+        chunk_rows = min(chunk_rows, _MOE_DOWN_REPACK_CHUNK_ROWS)
     if N <= chunk_rows:
         return repack_fn(qweight, **kwargs)
     outs = None
@@ -1746,14 +1793,30 @@ def _xpu_try_merge_shards(reps: dict, ids: list):
     """D1: if every shard in `ids` is the SAME GEMV rep kind (q8_0 or q4_0) with
     the same K, build one merged rep by row-concatenating the per-shard weights,
     plus the per-shard N sizes (to slice the output). Returns
-    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds / fp16 /
-    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0 rows are
+    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds /
+    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0/fp16 rows are
     independent, so cat-then-GEMV == per-shard-GEMV-then-cat.
     notes §10bj."""
     kinds = {reps[i][0] for i in ids}
     if len(ids) < 2 or len(kinds) != 1:
         return None
     kind = next(iter(kinds))
+    if kind == "fp16":
+        # D2: the GDN in_proj_ba shards (ssm_beta/ssm_alpha) are unquantized F32
+        # -> two fp16 dense reps of N=num_v_heads/tp. Unmerged they cost 2 tiny
+        # oneDNN mm (25us host each) + a torch.cat (62us host) per layer, i.e.
+        # ~3.4ms/step at 30 GDN layers — pure launch overhead, the GEMVs are 64KB.
+        # Row-cat them into one [sumN, K] weight so apply() issues a single mm
+        # and the cat disappears. Bit-exact (dense rows are independent).
+        Ks = {reps[i][1].shape[1] for i in ids if reps[i][1].dim() == 2}
+        if len(Ks) != 1:
+            return None
+        # An unloaded/empty shard must keep the per-shard path (shape is bogus).
+        if any(reps[i][1].dim() != 2 or reps[i][1].numel() == 0 for i in ids):
+            return None
+        sizes = [reps[i][1].shape[0] for i in ids]
+        w = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()
+        return (("fp16", w, None), sizes)
     if kind == "q8_0":
         # rep = ("q8_0", qs[N,K] int8, scale[N,K/32] f16)
         Ks = {reps[i][1].shape[1] for i in ids}
