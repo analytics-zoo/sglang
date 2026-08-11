@@ -50,6 +50,12 @@ from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
+# Accelerator device types whose caching allocator requires record_stream() when a tensor
+# is consumed by a stream other than the one it was allocated on. "npu" is deliberately
+# absent: NPU has the same requirement, but we have no NPU hardware to validate against,
+# so enabling it there would be an untested behaviour change. Tracked as a TODO.
+_RECORD_STREAM_DEVICES = ("cuda", "xpu")
+
 device_module = get_device_module()
 
 
@@ -653,6 +659,15 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
 
+        # KV geometry for the storage key. Read from the device pool rather than
+        # ServerArgs, because that is the dtype actually in use after "auto" has been
+        # resolved against the model. Stays None when the pool exposes no dtype:
+        # str(None) is the string "None", which passes HiCacheFile's `is not None` check
+        # and would append a meaningless "_dtNone" to every key instead of omitting the
+        # field as intended.
+        device_kv_dtype = getattr(self.mem_pool_device, "dtype", None)
+        kv_cache_dtype = None if device_kv_dtype is None else str(device_kv_dtype)
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
@@ -667,6 +682,9 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            # KV geometry, so an L3 entry cannot be read back under a different encoding.
+            kv_cache_dtype=kv_cache_dtype,
+            page_size=getattr(self.mem_pool_device, "page_size", None),
             extra_config=storage_backend_extra_config,
         )
 
@@ -749,9 +767,17 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
-            if host_indices.is_cuda:
+            #
+            # `.is_cuda` is False on every non-CUDA accelerator, so this guard silently
+            # skipped record_stream on XPU (and still does on NPU). record_stream is what
+            # stops the caching allocator recycling these tensors while the async copy on
+            # write_stream is still reading them -- without it the failure mode is rare,
+            # load-dependent KV corruption, not a crash. Match on device type instead.
+            # TODO(npu): NPU has the same latent use-after-free. Not enabled here because
+            #            we have no NPU hardware to validate it on.
+            if host_indices.device.type in _RECORD_STREAM_DEVICES:
                 host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type in _RECORD_STREAM_DEVICES:
                 device_indices.record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
@@ -776,7 +802,9 @@ class HiCacheController:
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
-            if not host_indices.is_cuda:
+            # `.is_cuda` is False for an XPU tensor that is ALREADY on the right device,
+            # so this re-issued a redundant .to() on every call. Compare device types.
+            if host_indices.device.type != torch.device(self.device).type:
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
         elif self.io_backend == "direct":
@@ -830,9 +858,11 @@ class HiCacheController:
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
-            if host_indices.is_cuda:
+            # See the note in start_writing(): `.is_cuda` skips this entirely on
+            # non-CUDA accelerators. TODO(npu): same latent UAF, untested here.
+            if host_indices.device.type in _RECORD_STREAM_DEVICES:
                 host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
+            if device_indices.device.type in _RECORD_STREAM_DEVICES:
                 device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
