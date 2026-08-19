@@ -89,6 +89,86 @@ if os.environ.get("SGLANG_GEMMA4_DISABLE_ESIMD_NORM", "0") == "1":
     _esimd_norm_add_norm = None
 
 
+# Diagnostic: locate the first decoder layer whose output turns non-finite.
+# Forces a device sync per layer, so it is off by default.
+_DEBUG_LAYER_NAN = os.environ.get("SGLANG_GEMMA4_DEBUG_LAYER_NAN", "0") == "1"
+_layer_nan_reports = 0
+
+
+_kv_pool_reports = 0
+
+
+def _debug_probe_kv_pool(attn, attn_output, forward_batch):
+    """When core attention emits non-finite output, decide whether the KV cache
+    itself already holds non-finite values (garbage written earlier) or whether
+    the attention math produced them (fp16 overflow)."""
+    global _kv_pool_reports
+    if _kv_pool_reports >= 4 or attn_output is None:
+        return
+    if not bool((~torch.isfinite(attn_output)).any().item()):
+        return
+    pool = getattr(forward_batch, "token_to_kv_pool", None)
+    if pool is None:
+        try:
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
+        except Exception:
+            pool = None
+    if pool is None:
+        _kv_pool_reports += 1
+        logger.error("[kv-probe] no token_to_kv_pool reachable")
+        return
+    try:
+        kbuf = pool.get_key_buffer(attn.layer_id)
+        vbuf = pool.get_value_buffer(attn.layer_id)
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        logger.error("[kv-probe] cannot read pool: %r", exc)
+        _kv_pool_reports += 1
+        return
+    _kv_pool_reports += 1
+    k_bad = int((~torch.isfinite(kbuf)).sum().item())
+    v_bad = int((~torch.isfinite(vbuf)).sum().item())
+    logger.error(
+        "[kv-probe] layer=%d kbuf%s dtype=%s nonfinite_k=%d absmax_k=%.6g "
+        "| vbuf nonfinite_v=%d absmax_v=%.6g",
+        attn.layer_id,
+        tuple(kbuf.shape),
+        kbuf.dtype,
+        k_bad,
+        float(kbuf[torch.isfinite(kbuf)].abs().amax().item()) if k_bad < kbuf.numel() else float("nan"),
+        v_bad,
+        float(vbuf[torch.isfinite(vbuf)].abs().amax().item()) if v_bad < vbuf.numel() else float("nan"),
+    )
+
+
+def _debug_layer_nan_check(layer_idx, hidden_states, forward_batch, tag="layer_out"):
+    """Log the first tensor that turns non-finite, plus enough batch context to
+    tell prefill from decode."""
+    global _layer_nan_reports
+    if _layer_nan_reports >= 12 or hidden_states is None:
+        return
+    bad = ~torch.isfinite(hidden_states)
+    if not bool(bad.any().item()):
+        return
+    _layer_nan_reports += 1
+    rows = bad.reshape(bad.shape[0], -1).any(dim=-1).nonzero().flatten().tolist()
+    logger.error(
+        "[layer-nan] non-finite at layer=%d tag=%s mode=%s shape=%s "
+        "bad_rows=%s seq_lens=%s",
+        layer_idx,
+        tag,
+        getattr(forward_batch.forward_mode, "name", "?"),
+        tuple(hidden_states.shape),
+        rows[:8],
+        (
+            forward_batch.seq_lens.tolist()[:8]
+            if forward_batch.seq_lens is not None
+            else None
+        ),
+    )
+
+
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
 def get_attention_sliding_window_size(config):
@@ -510,6 +590,14 @@ class Gemma4Attention(nn.Module):
             attn_output = self.attn(
                 q, k, v, forward_batch=forward_batch, save_kv_cache=True,
             )
+            if _DEBUG_LAYER_NAN:
+                _debug_layer_nan_check(self.layer_id, q, forward_batch, tag="esimd_q")
+                _debug_layer_nan_check(self.layer_id, k, forward_batch, tag="esimd_k")
+                _debug_layer_nan_check(self.layer_id, v, forward_batch, tag="esimd_v")
+                _debug_layer_nan_check(
+                    self.layer_id, attn_output, forward_batch, tag="core_attn_out"
+                )
+                _debug_probe_kv_pool(self.attn, attn_output, forward_batch)
             if attn_output.dim() == 3:
                 attn_output = attn_output.flatten(-2, -1)
             output, _ = self.o_proj(attn_output)
@@ -770,6 +858,10 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        if _DEBUG_LAYER_NAN:
+            _debug_layer_nan_check(
+                self.layer_id, hidden_states, forward_batch, tag="attn_out"
+            )
 
         if self.enable_moe_block:
             # MoE path keeps the standalone post-attention norm.
@@ -1158,6 +1250,8 @@ class Gemma4TextModel(PreTrainedModel):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
+            if _DEBUG_LAYER_NAN:
+                _debug_layer_nan_check(layer_idx, hidden_states, forward_batch)
             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
             # the residual is fused inside the layer, so nothing to thread.
 
