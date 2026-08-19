@@ -1726,6 +1726,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
+            # NOTE: e5m2 fused decode kernels used to require a transposed copy
+            # of the routed gate_up weight (w13._esimd_e5m2_t = [E, hidden,
+            # 2*inter]), which cost a full extra weight replica per rank
+            # (~10GB/tile at E=256). The e5m2 up kernels now read sglang's
+            # native N-major w13 [E, 2*inter, hidden] directly
+            # (moe_up_routed_e5m2_nmajor_kernel / moe_up_merged_e5m2_nmajor_kernel),
+            # so NO transposed copy is cached. The routed DOWN weight is likewise
+            # consumed in its natural layout ([E, hidden, inter]).
+
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
 

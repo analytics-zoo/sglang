@@ -34,7 +34,8 @@ def chunk_gated_delta_rule_torch(
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
-) -> Tuple[torch.Tensor, None, Optional[torch.Tensor]]:
+    intermediate_chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Drop-in for sglang.srt.layers.attention.fla.chunk.chunk_gated_delta_rule.
 
     Shapes (head_first=False, the only mode sglang uses today):
@@ -87,6 +88,23 @@ def chunk_gated_delta_rule_torch(
         (n_seqs, H, V, K), dtype=torch.float32, device=q.device
     )
 
+    # Optional per-chunk intermediate states. h[i] is the recurrent state after
+    # i full chunks (h[0] == the initial state), packed per sequence with
+    # ceil(L_s / chunk) entries each -- the layout _init_track_ssm_indices
+    # assumes. Only materialised when the caller asks for it.
+    chunk = int(intermediate_chunk_size or 0)
+    h_out = None
+    h_offsets = None
+    if chunk > 0:
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        n_h_per_seq = [(L + chunk - 1) // chunk for L in seq_lens]
+        h_offsets = [0]
+        for c in n_h_per_seq[:-1]:
+            h_offsets.append(h_offsets[-1] + c)
+        h_out = torch.empty(
+            (sum(n_h_per_seq), H, V, K), dtype=torch.float32, device=q.device
+        )
+
     cu = cu_seqlens.tolist()
     idx_list = (
         initial_state_indices.tolist() if initial_state_indices is not None else None
@@ -107,6 +125,9 @@ def chunk_gated_delta_rule_torch(
             state = torch.zeros((H, V, K), dtype=torch.float32, device=q.device)
 
         for t in range(t0, t1):
+            if chunk > 0 and (t - t0) % chunk == 0:
+                h_out[h_offsets[s] + (t - t0) // chunk] = state
+
             q_t = q[t].to(torch.float32)                     # [H_k, K]
             k_t = k[t].to(torch.float32)                     # [H_k, K]
             v_t = v[t].to(torch.float32)                     # [H, V]
@@ -141,4 +162,6 @@ def chunk_gated_delta_rule_torch(
     # gdn_backend.forward_extend scatters last_recurrent_state back into
     # ssm_states[cache_indices] on non-CUDA backends; returning it as the
     # middle element (not as h_aux) is required for that scatter to run.
-    return o, last_state, None
+    if h_out is not None:
+        h_out = h_out.unsqueeze(0)  # [1, total_chunks, H, V, K]
+    return o, last_state, h_out

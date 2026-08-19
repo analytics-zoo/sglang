@@ -1779,6 +1779,41 @@ else:
             shape = (max(num_token_padding, input.shape[0]), shape[1])
         output = torch.empty(shape, device=input.device, dtype=fp8_dtype)
 
+        # The sgl_kernel C++ quant ops (sgl_per_tensor_quant_fp8 /
+        # sgl_per_token_quant_fp8) hardcode a Float8_e4m3fn output tensor and
+        # raise "output must be Float8_e4m3fn tensor" for any other fp8 dtype.
+        # When the global weight dtype is switched to e5m2 (SGLANG_FP8_DTYPE=e5m2)
+        # fall back to a native torch quantization that honours fp8_dtype.
+        if fp8_dtype != torch.float8_e4m3fn:
+            m = shape[0]
+            src = input if num_token_padding is None else input[:m]
+            if scale is None and use_per_token_if_dynamic:
+                scale = torch.empty(
+                    (shape[0], 1), device=input.device, dtype=torch.float32
+                )
+                absmax = src.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+                s = absmax / fp8_max
+                scale[:m].copy_(s)
+                output[:m].copy_(
+                    (src / s).clamp(fp8_min, fp8_max).to(fp8_dtype)
+                )
+            elif scale is None:
+                scale = torch.zeros(1, device=input.device, dtype=torch.float32)
+                absmax = src.abs().amax().clamp(min=1e-12)
+                s = absmax / fp8_max
+                scale.copy_(s.view(-1))
+                output[:m].copy_(
+                    (src / s).clamp(fp8_min, fp8_max).to(fp8_dtype)
+                )
+            else:
+                assert (
+                    scale.numel() == 1
+                ), f"Expected scalar scale, got numel={scale.numel()}"
+                output[:m].copy_(
+                    (src / scale).clamp(fp8_min, fp8_max).to(fp8_dtype)
+                )
+            return output, scale
+
         if scale is None:
             # Dynamic scaling
             if use_per_token_if_dynamic:

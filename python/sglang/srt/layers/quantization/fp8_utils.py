@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from enum import Enum
 from functools import lru_cache
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Union
@@ -112,6 +113,9 @@ if _is_xpu and _XPU_FP8_W8A16_PREFILL:
 # Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 # esimd_gemm_fp8_pert kernel wrapper.
 # Only initialised on XPU; None elsewhere or if the package is missing.
+# Output width below which the ESIMD kernel is preferred at any M, because
+# torch._scaled_mm is not reproducible on narrow-N shapes (see apply_fp8_linear).
+_XPU_ESIMD_FP8_NARROW_N = int(os.environ.get("SGL_XPU_ESIMD_FP8_NARROW_N", "128"))
 _esimd_gemm_fp8_pert = None
 if _is_xpu:
     try:
@@ -182,6 +186,9 @@ if _is_cuda:
 
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
+# Cached once at import: read on every apply_fp8_linear call (100+/decode step)
+# otherwise, and the value is constant for the process lifetime.
+_enable_torch_compile = get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
@@ -954,7 +961,8 @@ def triton_w8a8_block_fp8_linear(
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
         _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_pt, output)
-        return output.to(input.dtype).view(*output_shape)
+        out = output if output.dtype == input.dtype else output.to(input.dtype)
+        return out.view(*output_shape)
 
     q_input, x_scale = per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=False
@@ -1612,6 +1620,55 @@ def _apply_fallback_scaled_mm(
     input_dtype,
 ):
     global TORCH_DEVICE_IDENTITY
+
+    # XPU fast path: fuse the (X*W) dequant scaling into torch._scaled_mm's
+    # RowWise epilogue instead of running an identity-scaled fp32 GEMM followed
+    # by two fp32 elementwise multiplies and an fp32->fp16 cast. XPU _scaled_mm
+    # RowWise requires scale_a=(M,1) and scale_b=(1,N), both contiguous float;
+    # per-tensor weight scales are broadcast up to (1,N). Bit-exact vs the
+    # unfused path (cos=1.0) and ~3x faster on 4k prefill. Falls back on any
+    # shape/dtype mismatch.
+    if _is_xpu:
+        try:
+            N = weight.shape[1]
+            sa = x_scale
+            if sa.dim() == 1:
+                sa = sa.reshape(-1, 1)
+            if (
+                sa.dim() == 2
+                and sa.shape[0] == qinput.shape[0]
+                and sa.shape[1] == 1
+                and sa.dtype == torch.float32
+                and sa.is_contiguous()
+            ):
+                # scale_b=(1,N) is constant per weight — build once and cache on
+                # the weight_scale tensor (mirrors the _esimd_1d caching below).
+                sb = getattr(weight_scale, "_rowwise_1N", None)
+                if sb is None or sb.shape[1] != N:
+                    sb = weight_scale.reshape(1, -1).to(torch.float32)
+                    if sb.shape[1] == 1:
+                        sb = sb.expand(1, N)
+                    sb = sb.contiguous()
+                    if sb.shape[1] == N:
+                        try:
+                            weight_scale._rowwise_1N = sb
+                        except Exception:
+                            pass
+                if sb.shape[1] == N:
+                    output = torch._scaled_mm(
+                        qinput,
+                        weight,
+                        scale_a=sa,
+                        scale_b=sb,
+                        out_dtype=input_dtype,
+                        bias=bias,
+                    )
+                    return _process_scaled_mm_output(
+                        output, input_2d_shape, output_shape
+                    )
+        except Exception:
+            pass  # fall through to the portable unfused path below
+
     if TORCH_DEVICE_IDENTITY is None:
         TORCH_DEVICE_IDENTITY = torch.ones(1, dtype=torch.float32, device=weight.device)
 
@@ -1650,9 +1707,7 @@ def apply_fp8_linear(
     # We also don't pad when using torch.compile,
     # as it breaks with dynamic shapes.
     if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
-            "SGLANG_ENABLE_TORCH_COMPILE"
-        )
+        pad_output = not cutlass_fp8_supported and not _enable_torch_compile
     output_padding = 17 if pad_output else None
 
     # View input as 2D matrix for fp8 methods
@@ -1666,6 +1721,14 @@ def apply_fp8_linear(
     # Restricted to small M (M<=64) since the kernel's M>=64 weight-stationary
     # path is much slower than torch._scaled_mm (verified: 14000us vs 156us at
     # M=4096). Triggered for decode (M=1) and small chunked-prefill batches.
+    #
+    # Narrow-N GEMMs take the ESIMD path at any M as well: torch._scaled_mm
+    # splits such shapes along K and reduces the partials in an order that
+    # varies with GPU occupancy, so the same operands can yield two different
+    # results (observed on GDN in_proj_ba, N=32, on prefill tail chunks with
+    # M>64 -- it made prefill non-deterministic). N is tiny there, so the
+    # weight-stationary path costs almost nothing at these shapes.
+    _n_out = weight.shape[1]
     if (
         _is_xpu
         and _esimd_gemm_fp8_pert is not None
@@ -1673,7 +1736,7 @@ def apply_fp8_linear(
         and not (cutlass_fp8_supported and weight_scale.numel() == weight.shape[1])
         and (weight_scale.numel() == 1)
         and bias is None
-        and input_2d.shape[0] <= 64
+        and (input_2d.shape[0] <= 64 or _n_out <= _XPU_ESIMD_FP8_NARROW_N)
     ):
         weight_nk = getattr(weight, "_esimd_t", None)
         if weight_nk is None:
@@ -1697,7 +1760,8 @@ def apply_fp8_linear(
         N = weight_nk.shape[0]
         output = torch.empty(M, N, dtype=torch.float16, device=input_2d.device)
         _esimd_gemm_fp8_pert(input_fp16, weight_nk, scale_1d, output)
-        return output.to(input.dtype).view(*output_shape)
+        out = output if output.dtype == input.dtype else output.to(input.dtype)
+        return out.view(*output_shape)
 
     # opt#2 XPU W8A16 prefill (alternative to opt#1): skip activation quant entirely
     # and run a mixed f16 x f8 oneDNN matmul. Decode (M<=64) already returned above via

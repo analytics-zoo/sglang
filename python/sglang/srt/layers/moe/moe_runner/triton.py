@@ -27,6 +27,12 @@ if TYPE_CHECKING:
 
 # Lazy-loaded esimd MoE op: registers torch.ops.moe_ops.moe_forward_full_silu_routed.
 # Returns the op handle on success, None on failure (so we always fall back to Triton).
+# ESIMD MoE gates: set once at launch, constant for the process. Cached to avoid an
+# os.environ read on the per-layer MoE hot path each decode step.
+_ESIMD_MOE = os.environ.get("SGL_XPU_ESIMD_MOE", "0") == "1"
+_ESIMD_MOE_PREFILL = os.environ.get("SGL_XPU_ESIMD_MOE_PREFILL", "0") == "1"
+
+
 def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
     """Load the right ESIMD MoE silu-routed kernel for the given fp8 variant.
 
@@ -50,6 +56,9 @@ def _load_esimd_moe_op(fp8_variant: str = "e4m3"):
         op = None
     cache[fp8_variant] = op
     return op
+
+
+
 
 
 def _try_esimd_moe_silu_routed(
@@ -139,10 +148,9 @@ def _try_esimd_moe_silu_routed(
     s13 = _per_expert_pt_scale(quant_info.w13_scale)
     s2 = _per_expert_pt_scale(quant_info.w2_scale)
 
-    # We use the `_sglang` kernel variant which accepts w13 directly in
-    # sglang's [E, 2*intermediate, hidden] layout — no transpose / copy
-    # required, no extra memory cost, and the Triton fallback can still read
-    # the same parameter unchanged.
+    # Both the e4m3 (`_sglang`) and e5m2 kernel variants now accept w13 directly
+    # in sglang's [E, 2*intermediate, hidden] N-major layout — no transpose /
+    # extra copy, and the Triton fallback reads the same parameter unchanged.
     w13_kernel = w13
 
     topk_w = runner_input.topk_weights
@@ -220,11 +228,11 @@ class TritonRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> TritonRunnerOutput:
-        # XPU fast path: gated by SGLANG_ENABLE_ESIMD_MOE=1. The fused-func
+        # XPU fast path: gated by SGL_XPU_ESIMD_MOE=1. The fused-func
         # path (`fused_experts_none_to_triton`) is the one that actually fires
         # under the default runner config; this branch is here for the future
         # case where a runner_input gets routed straight into the runner_core.
-        if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+        if _ESIMD_MOE:
             out = _try_esimd_moe_silu_routed(runner_input, quant_info, self.config)
             if out is not None:
                 return TritonRunnerOutput(hidden_states=out)
@@ -343,8 +351,8 @@ def _maybe_esimd_moe_silu_fused(
     s13 = _per_expert_pt_scale(quant_info.w13_scale)
     s2 = _per_expert_pt_scale(quant_info.w2_scale)
 
-    # Use the `_sglang` kernel variant: accepts w13 in [E, 2*inter, hidden]
-    # directly, no transpose required.
+    # Both e4m3 and e5m2 kernel variants accept w13 in [E, 2*inter, hidden]
+    # (N-major) directly — no transpose / extra copy.
     w13_kernel = w13
 
     if topk_weights.dtype != torch.float16:
@@ -463,7 +471,7 @@ def _maybe_esimd_moe_silu_prefill(
         return None
     # NOTE: this routed-only path does NOT yet handle Qwen3.6 shared-expert
     # fusion (shared_expert_intermediate_size == moe_intermediate_size), so the
-    # full MoE output is incomplete -> SGLANG_ENABLE_ESIMD_MOE_PREFILL must stay
+    # full MoE output is incomplete -> SGL_XPU_ESIMD_MOE_PREFILL must stay
     # off until the shared expert contribution is added. Kept wired + scale-fixed
     # for when that lands.
 
@@ -502,7 +510,7 @@ def fused_experts_none_to_triton(
     # a single linear layer, so a single scalar per expert is too lossy.
     # TODO: migrate the per-block FP8 MoE GEMM kernel from llm-scaler/vllm
     # (or feed 2D scale through a future kernel variant) before re-enabling.
-    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE", "0") == "1":
+    if _ESIMD_MOE:
         esimd_out = _maybe_esimd_moe_silu_fused(
             dispatch_output, quant_info, runner_config
         )
@@ -511,7 +519,7 @@ def fused_experts_none_to_triton(
 
     # Large-T (prefill) M-tiled DPAS FP8 MoE kernel. Separate env gate so it can
     # be enabled independently of the decode kernel.
-    if os.environ.get("SGLANG_ENABLE_ESIMD_MOE_PREFILL", "0") == "1":
+    if _ESIMD_MOE_PREFILL:
         esimd_out = _maybe_esimd_moe_silu_prefill(
             dispatch_output, quant_info, runner_config
         )

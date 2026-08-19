@@ -40,7 +40,7 @@ if _is_cuda:
 # NHD KV layout `[n_slots, Hkv, D]` directly via kv_indptr/kv_indices, no
 # paged-cache reshape required. 2-phase split-K kernel; supports radix cache.
 _ENABLE_XPU_ESIMD_DECODE = get_bool_env_var(
-    "SGLANG_ENABLE_XPU_ESIMD_DECODE", "false"
+    "SGL_XPU_ESIMD_DECODE", "false"
 )
 _XPU_ESIMD_DECODE_FN = None
 if _ENABLE_XPU_ESIMD_DECODE:

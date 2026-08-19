@@ -631,6 +631,9 @@ def apply_gguf_embedding_xpu(
     return dequant.view(*x.shape, hidden_size)
 
 
+_XPU_EMB_DEBUG = os.environ.get("SGLANG_GGUF_EMB_DEBUG", "0") == "1"
+
+
 class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
     """GGUF embedding for Intel XPU (PTL Xe3).
 
@@ -655,10 +658,67 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         layer._xpu_emb_rep = _xpu_prepare_shard(
             layer.qweight.data, int(qweight_type), self.params_dtype
         )
+        if _XPU_EMB_DEBUG:
+            rep = layer._xpu_emb_rep
+            msg = ["kind=%s" % rep[0]]
+            for i, t in enumerate(rep[1:]):
+                if not torch.is_tensor(t):
+                    continue
+                if t.dtype.is_floating_point:
+                    nb = int((~torch.isfinite(t)).sum().item())
+                    msg.append(
+                        "t%d %s %s nonfinite=%d absmax=%.6g"
+                        % (i, tuple(t.shape), t.dtype, nb,
+                           float(t.abs().float().max().item()))
+                    )
+                else:
+                    msg.append("t%d %s %s" % (i, tuple(t.shape), t.dtype))
+            logger.error("[EMBDEBUG] rep health: %s", " | ".join(msg))
         if hasattr(layer, "qweight"):
             del layer.qweight
 
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        debug_bounds = _XPU_EMB_DEBUG
+
+        def _log_nonfinite_once(flag_name: str, stage: str, t: torch.Tensor):
+            if not debug_bounds or t.numel() == 0 or bool(torch.isfinite(t).all().item()):
+                return
+            n = getattr(layer, flag_name, 0)
+            if n >= 8:
+                return
+            setattr(layer, flag_name, n + 1)
+            row_bad = ~torch.isfinite(t.reshape(t.shape[0], -1)).all(dim=1)
+            bad_rows = row_bad.nonzero(as_tuple=False).flatten()
+            bad_rows_head = bad_rows[:16].tolist()
+            x_flat_dbg = x.flatten().to(torch.long)
+            bad_ids_head = (
+                x_flat_dbg.index_select(0, bad_rows[:16]).tolist()
+                if bad_rows.numel() > 0
+                and x_flat_dbg.numel() >= int(bad_rows.max().item()) + 1
+                else []
+            )
+            # Element-level (not whole-row) badness: report the exact flat
+            # positions so a partial-row corruption is distinguishable from a
+            # bad table row.
+            bad_flat = (~torch.isfinite(t)).nonzero(as_tuple=False)
+            logger.error(
+                "GGUFEmbeddingXPUMethod non-finite at %s: dtype=%s shape=%s "
+                "nan=%d inf=%d n_bad_rows=%d bad_rows_head=%s bad_token_ids_head=%s "
+                "bad_elem_head=%s id_min=%d id_max=%d ntok=%d",
+                stage,
+                str(t.dtype),
+                tuple(t.shape),
+                int(torch.isnan(t).sum().item()),
+                int(torch.isinf(t).sum().item()),
+                int(bad_rows.numel()),
+                bad_rows_head,
+                bad_ids_head,
+                bad_flat[:8].tolist(),
+                int(x_flat_dbg.min().item()) if x_flat_dbg.numel() else -1,
+                int(x_flat_dbg.max().item()) if x_flat_dbg.numel() else -1,
+                int(x_flat_dbg.numel()),
+            )
+
         # Eagle/NEXTN embed-share: set_embed_and_head may have replaced this
         # layer's table with the TARGET's shared dequantized `.weight`
         # ([vocab, hidden] fp16). When present it takes priority over the GGUF
@@ -667,46 +727,113 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         if isinstance(shared_w, torch.Tensor):
             x_flat = x.flatten()
             out = torch.nn.functional.embedding(x_flat, shared_w.to(self.params_dtype))
-            return out.view(*x.shape, shared_w.shape[1])
+            out = out.view(*x.shape, shared_w.shape[1])
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_shared_weight_out_logged",
+                "shared_weight_embedding_out",
+                out.reshape(-1, out.shape[-1]),
+            )
+            return out
         rep = getattr(layer, "_xpu_emb_rep", None)
         if rep is None:  # not yet processed (shouldn't happen post-load)
             qweight = layer.qweight
-            return apply_gguf_embedding_xpu(
+            out = apply_gguf_embedding_xpu(
                 x, qweight, layer.qweight_type.weight_type,
                 qweight.tensor_shape[1], dtype=self.params_dtype)
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_fallback_out_logged",
+                "fallback_apply_gguf_embedding_xpu_out",
+                out.reshape(-1, out.shape[-1]),
+            )
+            return out
         kind = rep[0]
+        if debug_bounds and not getattr(layer, "_xpu_emb_input_logged", False):
+            layer._xpu_emb_input_logged = True
+            logger.warning(
+                "GGUFEmbeddingXPUMethod input ids: shape=%s min_id=%d max_id=%d rep_kind=%s",
+                tuple(x.shape),
+                int(x.min().item()) if x.numel() > 0 else -1,
+                int(x.max().item()) if x.numel() > 0 else -1,
+                kind,
+            )
         x_flat = x.flatten()
         # Gather the looked-up rows of the packed rep (index_select is graph-safe
         # on XPU), then dequant ONLY those rows fully on-device — no .cpu().
         if kind == "fp16":
             out = torch.nn.functional.embedding(x_flat, rep[1].to(self.params_dtype))
-            return out.view(*x.shape, rep[1].shape[1])
+            out = out.view(*x.shape, rep[1].shape[1])
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_fp16_out_logged",
+                "fp16_rep_embedding_out",
+                out.reshape(-1, out.shape[-1]),
+            )
+            return out
         if kind == "q6_k":
             ql, qh, sc = rep[1], rep[2], rep[3]
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q6k_scale_logged",
+                "q6_k_scale_rows",
+                sc.index_select(0, x_flat),
+            )
             g = _xpu_dequant_q6_k(ql.index_select(0, x_flat),
                                   qh.index_select(0, x_flat),
                                   sc.index_select(0, x_flat), self.params_dtype)
         elif kind == "q8_0":
             qs, sc = rep[1], rep[2]
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q8_scale_logged",
+                "q8_0_scale_rows",
+                sc.index_select(0, x_flat),
+            )
             g = _xpu_dequant_q8_0(qs.index_select(0, x_flat),
                                   sc.index_select(0, x_flat), self.params_dtype)
         elif kind == "q5_k":
             ql, qh, sc, mn = rep[1], rep[2], rep[3], rep[4]
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q5_scale_logged",
+                "q5_k_scale_rows",
+                sc.index_select(0, x_flat),
+            )
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q5_min_logged",
+                "q5_k_min_rows",
+                mn.index_select(0, x_flat),
+            )
             g = _xpu_dequant_q5_k(ql.index_select(0, x_flat),
                                   qh.index_select(0, x_flat),
                                   sc.index_select(0, x_flat),
                                   mn.index_select(0, x_flat), self.params_dtype)
         elif kind == "q4_k":
             ql, sc, mn = rep[1], rep[2], rep[3]
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q4k_scale_logged",
+                "q4_k_scale_rows",
+                sc.index_select(0, x_flat),
+            )
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q4k_min_logged",
+                "q4_k_min_rows",
+                mn.index_select(0, x_flat),
+            )
             g = _xpu_dequant_q4_k(ql.index_select(0, x_flat),
                                   sc.index_select(0, x_flat),
                                   mn.index_select(0, x_flat), self.params_dtype)
         elif kind == "q4_0":
             packed, sc = rep[1], rep[2]
+            _log_nonfinite_once(
+                "_xpu_emb_nonfinite_q40_scale_logged",
+                "q4_0_scale_rows",
+                sc.index_select(0, x_flat),
+            )
             g = _xpu_dequant_q4_0_packed(packed.index_select(0, x_flat),
                                          sc.index_select(0, x_flat), self.params_dtype)
         else:
             raise NotImplementedError(f"GGUF embedding rep '{kind}' on XPU")
+        _log_nonfinite_once(
+            "_xpu_emb_nonfinite_quant_dequant_out_logged",
+            f"{kind}_dequant_rows_out",
+            g,
+        )
         return g.view(*x.shape, g.shape[-1])
 
     def apply(
@@ -737,8 +864,10 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
             and M == 1
             and rep[0] in ("q6_k", "q5_k", "q4_k", "q8_0", "q4_0")
         ):
-            xf = x2.to(torch.float16).contiguous()
-            out = _xpu_rep_gemv(xf, rep).to(x.dtype)  # [1, vocab]
+            xf = _as_fp16c(x2)
+            out = _xpu_rep_gemv(xf, rep)  # [1, vocab] fp16
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
             if bias is not None:
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -755,11 +884,12 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
             and 2 <= M <= 16
             and esimd_gemv_q6_k_m is not None
         ):
-            xf = x2.to(torch.float16).contiguous()
+            xf = _as_fp16c(x2)
             N = rep[1].shape[0]
             out = torch.empty(M, N, dtype=torch.float16, device=xf.device)
             esimd_gemv_q6_k_m(xf, rep[1], rep[2], rep[3], out)
-            out = out.to(x.dtype)
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
             if bias is not None:
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
@@ -793,6 +923,15 @@ _Q4_K_TYPE = int(WeightType.Q4_K)
 
 _Q4_K_SB = 256          # q4_K super-block elements
 _Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
+_MOE_DOWN_REPACK_CHUNK_ROWS = int(
+    os.environ.get("SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS", "65536"))
+# Cap on the transient int32 intermediate produced per repack chunk. The q5/q6
+# repack path materializes several [rows, K] int32 tensors at once, so a fixed
+# row count scales badly with K: the 248320x2048 embedding needs ~1.5-2 GB per
+# 65536-row chunk, which OOMs at TP=1 (the whole table lives on one card).
+# Chunk rows are derived from this budget so wide tensors are split finer.
+_REPACK_CHUNK_BUDGET_BYTES = int(
+    os.environ.get("SGLANG_GGUF_XPU_REPACK_CHUNK_BYTES", str(32 << 20)))
 
 
 def _xpu_repack_q4_k(qweight: torch.Tensor):
@@ -856,6 +995,61 @@ def _xpu_dequant_q4_k(ql: torch.Tensor, scale: torch.Tensor, minv: torch.Tensor,
     w = (nib.view(N, nb, 32) * scale.to(out_dtype).unsqueeze(-1)
          - minv.to(out_dtype).unsqueeze(-1))
     return w.view(N, K).contiguous()
+
+
+def _xpu_repack_q4_k_chunked(qweight: torch.Tensor,
+                             chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS):
+    """Row-chunked wrapper around _xpu_repack_q4_k (see _xpu_repack_q5_k_down_combined
+    docstring for why: bounds the u4-family int32 intermediates to chunk_rows
+    regardless of how many experts (E*half rows) are stacked)."""
+    N = qweight.shape[0]
+    if N <= chunk_rows:
+        return _xpu_repack_q4_k(qweight)
+    ql_out, sc_out, mn_out = [], [], []
+    for lo in range(0, N, chunk_rows):
+        hi = min(lo + chunk_rows, N)
+        ql, sc, mn = _xpu_repack_q4_k(qweight[lo:hi])
+        ql_out.append(ql); sc_out.append(sc); mn_out.append(mn)
+        if qweight.device.type == "xpu":
+            torch.xpu.empty_cache()
+    return torch.cat(ql_out, 0), torch.cat(sc_out, 0), torch.cat(mn_out, 0)
+
+
+def _xpu_repack_rows_chunked(repack_fn, qweight: torch.Tensor,
+                             chunk_rows: int = None,
+                             **kwargs):
+    """Generic row-chunked wrapper for any of the _xpu_repack_q{4,5,6}_k
+    functions (col_perm only reorders the K/column dim, so it composes
+    cleanly with row-chunking). Used for large tables (e.g. the embedding /
+    lm_head weight, vocab_size rows) where a single whole-tensor repack call
+    creates multi-GB int32 intermediates and was the cause of a second
+    TP=1-loading OOM (in _xpu_prepare_shard, downstream of
+    GGUFEmbeddingXPUMethod.process_weights_after_loading).
+
+    chunk_rows defaults to whatever keeps one chunk's int32 intermediates
+    under _REPACK_CHUNK_BUDGET_BYTES, so narrow tensors keep using large
+    chunks while wide ones (big K) are split finer."""
+    N = qweight.shape[0]
+    if chunk_rows is None:
+        # qweight rows are packed bytes; the repack blows them up to int32
+        # elements, so estimate the per-row cost from the byte width.
+        row_bytes = max(1, int(qweight.shape[1])) * 4
+        chunk_rows = max(1024, _REPACK_CHUNK_BUDGET_BYTES // row_bytes)
+        chunk_rows = min(chunk_rows, _MOE_DOWN_REPACK_CHUNK_ROWS)
+    if N <= chunk_rows:
+        return repack_fn(qweight, **kwargs)
+    outs = None
+    for lo in range(0, N, chunk_rows):
+        hi = min(lo + chunk_rows, N)
+        r = repack_fn(qweight[lo:hi], **kwargs)
+        if outs is None:
+            outs = [[t] for t in r]
+        else:
+            for i, t in enumerate(r):
+                outs[i].append(t)
+        if qweight.device.type == "xpu":
+            torch.xpu.empty_cache()
+    return tuple(torch.cat(o, 0) for o in outs)
 
 
 _Q5_K_TYPE = int(WeightType.Q5_K)
@@ -986,6 +1180,59 @@ def _xpu_repack_q6_k_plain(qweight: torch.Tensor):
     shifts = (2 * torch.arange(4, dtype=torch.int32, device=u6.device))
     qh = (h2 << shifts).sum(dim=2).to(torch.uint8)   # [N, K/4]
     return ql.contiguous(), qh.contiguous(), scale.contiguous()
+
+
+def _xpu_repack_q5_k_down_combined(qweight: torch.Tensor,
+                                   chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS):
+    """MEMORY: combined decode-packed + grouped-prefill-plain Q5_K down repack,
+    processed in row chunks. Calling _xpu_repack_q5_k + _xpu_repack_q5_k_plain
+    separately each re-derives the element-order u5/scale/minv from scratch via
+    _xpu_q5_k_elem (int32 [N,K] tensors -> several GB for a full MoE down layer
+    at N=E*Nd rows), so doing both on the FULL tensor doubles that cost and was
+    the proximate cause of the TP=1 loading OOM (line ~1068 hbit alloc). This
+    derives u5/scale/minv ONCE per chunk and produces both reps from it, with
+    N bounded by chunk_rows regardless of how many experts are stacked."""
+    N = qweight.shape[0]
+    if N <= chunk_rows:
+        u5, scale, minv = _xpu_q5_k_elem(qweight)
+        K = u5.shape[1]
+        ql = _pack_nibble_interleaved(u5)
+        hbit = ((u5 >> 4) & 1).to(torch.uint8).view(N, K // 8, 8)
+        weights = (1 << torch.arange(8, dtype=torch.int32, device=u5.device))
+        qh_plain = (hbit.to(torch.int32) * weights).sum(dim=2).to(torch.uint8)
+        return ql, scale.contiguous(), minv.contiguous(), qh_plain.contiguous()
+    ql_out, qhp_out, sc_out, mn_out = [], [], [], []
+    for lo in range(0, N, chunk_rows):
+        hi = min(lo + chunk_rows, N)
+        r = _xpu_repack_q5_k_down_combined(qweight[lo:hi], chunk_rows)
+        ql_out.append(r[0]); sc_out.append(r[1])
+        mn_out.append(r[2]); qhp_out.append(r[3])
+        if qweight.device.type == "xpu":
+            torch.xpu.empty_cache()
+    return (torch.cat(ql_out, 0), torch.cat(sc_out, 0),
+            torch.cat(mn_out, 0), torch.cat(qhp_out, 0))
+
+
+def _xpu_repack_q6_k_down_combined(qweight: torch.Tensor,
+                                   chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS):
+    """Q6_K analogue of _xpu_repack_q5_k_down_combined (see its docstring)."""
+    N = qweight.shape[0]
+    if N <= chunk_rows:
+        u6, scale = _xpu_q6_k_elem(qweight)
+        K = u6.shape[1]
+        ql = _pack_nibble_interleaved(u6)
+        h2 = ((u6 >> 4) & 3).to(torch.int32).view(N, K // 4, 4)
+        shifts = (2 * torch.arange(4, dtype=torch.int32, device=u6.device))
+        qh_plain = (h2 << shifts).sum(dim=2).to(torch.uint8)
+        return ql, scale.contiguous(), qh_plain.contiguous()
+    ql_out, qhp_out, sc_out = [], [], []
+    for lo in range(0, N, chunk_rows):
+        hi = min(lo + chunk_rows, N)
+        r = _xpu_repack_q6_k_down_combined(qweight[lo:hi], chunk_rows)
+        ql_out.append(r[0]); sc_out.append(r[1]); qhp_out.append(r[2])
+        if qweight.device.type == "xpu":
+            torch.xpu.empty_cache()
+    return torch.cat(ql_out, 0), torch.cat(sc_out, 0), torch.cat(qhp_out, 0)
 
 
 def _xpu_moe_grouped_prefill(xf, topk_ids, topk_weights, E, hidden, inter,
@@ -1241,13 +1488,13 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
     # rest of the GGUF integration.
     _force_dq = os.environ.get("SGLANG_GGUF_XPU_FORCE_DEQUANT") == "1"
     if qweight_type == _Q4_0_TYPE and esimd_gemv_q4_0 is not None and not _force_dq:
-        packed, scale = _xpu_repack_q4_0(qweight)
+        packed, scale = _xpu_repack_rows_chunked(_xpu_repack_q4_0, qweight)
         # q4_0 is interleaved nibble [N,K/2]; a head_v_dim col-perm is not used
         # by any q4_0 GDN layer in Qwen3.5/3.6 (out_proj is Q5_K/Q8_0). Guard.
         assert col_perm is None, "q4_0 GDN out_proj col-perm unsupported"
         return ("q4_0", packed, scale)
     if qweight_type == _Q8_0_TYPE and esimd_gemv_q8_0 is not None and not _force_dq:
-        qs, scale = _xpu_repack_q8_0(qweight)  # qs [N,K] int8, scale [N,K/32] f16
+        qs, scale = _xpu_repack_rows_chunked(_xpu_repack_q8_0, qweight)  # qs [N,K] int8, scale [N,K/32] f16
         if col_perm is not None and qs.numel() > 0:
             # GDN out_proj (35B ssm_out is Q8_0): permute K (input) columns in
             # element order, head_v_dim-granular; scale follows at hvd//32.
@@ -1256,17 +1503,19 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
             scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
         return ("q8_0", qs, scale)
     if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
-        ql, scale, minv = _xpu_repack_q4_k(qweight)
+        ql, scale, minv = _xpu_repack_q4_k_chunked(qweight)
         return ("q4_k", ql, scale, minv)
     _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
     _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
     if (qweight_type == _Q5_K_TYPE and esimd_gemv_q5_k is not None
             and not _force_dq and not _no_q5):
-        ql, qh, scale, minv = _xpu_repack_q5_k(qweight, col_perm=col_perm)
+        ql, qh, scale, minv = _xpu_repack_rows_chunked(
+            _xpu_repack_q5_k, qweight, col_perm=col_perm)
         return ("q5_k", ql, qh, scale, minv)
     if (qweight_type == _Q6_K_TYPE and esimd_gemv_q6_k is not None
             and not _force_dq and not _no_q6):
-        ql, qh, scale = _xpu_repack_q6_k(qweight, col_perm=col_perm)
+        ql, qh, scale = _xpu_repack_rows_chunked(
+            _xpu_repack_q6_k, qweight, col_perm=col_perm)
         return ("q6_k", ql, qh, scale)
     if qweight_type in UNQUANTIZED_TYPES:
         rep = ("fp16", qweight.to(params_dtype), None)
@@ -1314,6 +1563,31 @@ def _onednn_scale_t(scale: torch.Tensor) -> torch.Tensor:
     return st
 
 
+def _as_fp16c(x: torch.Tensor) -> torch.Tensor:
+    """Return x as a contiguous fp16 tensor WITHOUT emitting a no-op
+    ``aten::to`` / ``aten::contiguous`` dispatch when x is already fp16 and
+    contiguous (the common ``--dtype float16`` case).
+
+    At M=1 decode the GGUF path is host-dispatch bound; the per-projection
+    ``x.to(torch.float16).contiguous()`` fired ~110 no-op casts/step (plus the
+    matching output cast). ``is_contiguous()`` is a cheap C++ property check,
+    not a device op, so this guard is pure host-overhead reduction and is
+    bit-identical (returns the same storage) for fp16 inputs. bf16/fp32
+    networks still get a real cast + contiguous copy.
+    """
+    if x.dtype == torch.float16:
+        return x if x.is_contiguous() else x.contiguous()
+    return x.to(torch.float16).contiguous()
+
+
+# Per-weight cache for the fp16-resident dense shards (GDN b/a in_proj_ba):
+#   id(weight) -> transposed_contiguous_weight [K, N]
+# Reps are held by the layer for the model's lifetime so id(weight) is stable
+# and this dict is bounded by the number of fp16 shards (~60). See the fp16
+# branch of _xpu_shard_matmul.
+_fp16_wt_cache: dict = {}
+
+
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
     """x [M,K] fp16 @ shard^T -> [M,N] fp16. rep from _xpu_prepare_shard."""
     kind = rep[0]
@@ -1321,7 +1595,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, packed, scale = rep
         N = packed.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: the ESIMD GEMV is bandwidth-optimal (~3x faster than a
             # dense fp16 matmul at M=1).
@@ -1341,7 +1615,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, qs, scale = rep
         N = qs.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: ESIMD q8_0 GEMV (int8 resident, bandwidth-optimal).
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -1373,7 +1647,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, scale, minv = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             # Decode: ESIMD q4_K GEMV (4.5-bit resident, asymmetric scale+min).
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
@@ -1386,7 +1660,7 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, qh, scale, minv = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q5_k(xf, ql, qh, scale, minv, out)
@@ -1397,16 +1671,28 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
         _, ql, qh, scale = rep
         N = ql.shape[0]
         M = x.shape[0]
-        xf = x.to(torch.float16).contiguous()
+        xf = _as_fp16c(x)
         if M == 1:
             out = torch.empty(M, N, dtype=torch.float16, device=x.device)
             esimd_gemv_q6_k(xf, ql, qh, scale, out)
             return out
         w = _xpu_dequant_q6_k(ql, qh, scale, torch.float16)  # [N, K]
         return xf @ w.t()
-    # fp16-resident dense weight [N, K]
-    _, w, _ = rep
-    return x.to(w.dtype) @ w.t()
+    # fp16-resident dense weight [N, K]. Hit by the GDN b/a (beta/decay) shards
+    # of in_proj_ba (each [num_v_heads, hidden] fp16, unquantized in the GGUF),
+    # ~60 GEMVs/decode-step. The naive ``x.to(w.dtype) @ w.t()`` fired ~8 host
+    # dispatches each (no-op cast + t/transpose/as_strided weight-transpose VIEW
+    # rebuilt per call + matmul-wrapper + mm + output empty/resize_). Cache the
+    # contiguous transpose [K, N] once so each call is a single ``torch.mm`` on
+    # two contiguous operands. Bit-identical (same operands, same math). A fresh
+    # output is allocated per call (no persistent-buffer aliasing risk).
+    w = rep[1]
+    xf = x if x.dtype == w.dtype else x.to(w.dtype)
+    wt = _fp16_wt_cache.get(id(w))
+    if wt is None:
+        wt = w.t().contiguous()  # [K, N], computed once per weight
+        _fp16_wt_cache[id(w)] = wt
+    return torch.mm(xf, wt)
 
 
 def _xpu_permute_gdn_out_cols(rep, perm):
@@ -1507,14 +1793,30 @@ def _xpu_try_merge_shards(reps: dict, ids: list):
     """D1: if every shard in `ids` is the SAME GEMV rep kind (q8_0 or q4_0) with
     the same K, build one merged rep by row-concatenating the per-shard weights,
     plus the per-shard N sizes (to slice the output). Returns
-    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds / fp16 /
-    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0 rows are
+    (merged_rep, [N0, N1, ...]) or None if not mergeable (mixed kinds /
+    k-quant — those keep the per-shard path). Bit-exact: q8_0/q4_0/fp16 rows are
     independent, so cat-then-GEMV == per-shard-GEMV-then-cat.
     notes §10bj."""
     kinds = {reps[i][0] for i in ids}
     if len(ids) < 2 or len(kinds) != 1:
         return None
     kind = next(iter(kinds))
+    if kind == "fp16":
+        # D2: the GDN in_proj_ba shards (ssm_beta/ssm_alpha) are unquantized F32
+        # -> two fp16 dense reps of N=num_v_heads/tp. Unmerged they cost 2 tiny
+        # oneDNN mm (25us host each) + a torch.cat (62us host) per layer, i.e.
+        # ~3.4ms/step at 30 GDN layers — pure launch overhead, the GEMVs are 64KB.
+        # Row-cat them into one [sumN, K] weight so apply() issues a single mm
+        # and the cat disappears. Bit-exact (dense rows are independent).
+        Ks = {reps[i][1].shape[1] for i in ids if reps[i][1].dim() == 2}
+        if len(Ks) != 1:
+            return None
+        # An unloaded/empty shard must keep the per-shard path (shape is bogus).
+        if any(reps[i][1].dim() != 2 or reps[i][1].numel() == 0 for i in ids):
+            return None
+        sizes = [reps[i][1].shape[0] for i in ids]
+        w = torch.cat([reps[i][1] for i in ids], dim=0).contiguous()
+        return (("fp16", w, None), sizes)
     if kind == "q8_0":
         # rep = ("q8_0", qs[N,K] int8, scale[N,K/32] f16)
         Ks = {reps[i][1].shape[1] for i in ids}
@@ -1626,7 +1928,8 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x2 = x.reshape(-1, x.shape[-1])
+        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
+        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
         merged = getattr(layer, "_xpu_merged", None)
         if merged is not None:
             # D1: one big-N GEMV over the merged q8_0/q4_0 shards (§10bj). The
@@ -1641,10 +1944,13 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         # The q4_0 ESIMD kernels are fp16-only (PTL has no bf16 ESIMD), so a
         # bf16 network would otherwise get an fp16 tensor back here. Cast the
         # result to the input activation dtype to keep the graph type-consistent.
-        out = out.to(x.dtype)
+        # Skip the no-op cast on fp16 networks (elides one host dispatch/proj).
+        if out.dtype != x.dtype:
+            out = out.to(x.dtype)
         if bias is not None:
             out = out + bias
-        return out.reshape(*x.shape[:-1], out.shape[-1])
+        # x2 aliased x when x was 2D, so out is already [M, N] — skip no-op reshape.
+        return out if x.dim() == 2 else out.reshape(*x.shape[:-1], out.shape[-1])
 
 
 class GGUFMoEMethod(FusedMoEMethodBase):
@@ -1889,6 +2195,18 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
             w13 = w13.to("xpu"); w2 = w2.to("xpu")
         dev = w13.device
         self._down_is_q6 = (w2_type == _Q6_K_TYPE)
+        # MEMORY (TP=1 OOM fix): this function used to keep w13/w2 (on-device
+        # copies of the raw GGUF bytes) alive for the WHOLE repack, on top of
+        # every derived gate/up/down tensor plus a duplicate down_b reshape for
+        # the grouped-prefill path -> a large transient peak per MoE layer
+        # (worst at TP=1, where half/Nd are 2x the TP=2 size and nothing is
+        # sharded). mem_fraction_static does NOT help here: it only sizes the
+        # KV-cache pool reserved AFTER weight loading finishes, not the
+        # transient peak during this per-layer repack. Fix: free each
+        # intermediate the moment its repacked output exists, reuse the single
+        # down_b for both the decode and grouped-prefill repacks, and drop the
+        # XPU allocator cache between layers so peak usage doesn't accumulate
+        # across the 40 MoE layers.
         # BATCH repack (notes #137g): the old per-expert loop (E=256 x ~5 repacks
         # x 40 layers) was the 35B load bottleneck. The _xpu_repack_* helpers are
         # pure per-ROW ops, so flatten the [E, N, Kb] expert stack to [E*N, Kb],
@@ -1898,42 +2216,46 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         Kb13 = w13.shape[2]
         gate_b = w13[:, :half, :].reshape(E * half, Kb13).contiguous()
         up_b = w13[:, half:, :].reshape(E * half, Kb13).contiguous()
-        ql, sc, mn = _xpu_repack_q4_k(gate_b)
+        del w13
+        ql, sc, mn = _xpu_repack_q4_k_chunked(gate_b)
         self.gate_ql = ql.reshape(E, half, -1).contiguous(); self.gate_sc = sc.reshape(E, half, -1).contiguous(); self.gate_mn = mn.reshape(E, half, -1).contiguous()
-        ql, sc, mn = _xpu_repack_q4_k(up_b)
+        del gate_b, ql, sc, mn
+        ql, sc, mn = _xpu_repack_q4_k_chunked(up_b)
         self.up_ql = ql.reshape(E, half, -1).contiguous(); self.up_sc = sc.reshape(E, half, -1).contiguous(); self.up_mn = mn.reshape(E, half, -1).contiguous()
+        del up_b, ql, sc, mn
         Nd, Kbd = w2.shape[1], w2.shape[2]
         down_b = w2.reshape(E * Nd, Kbd).contiguous()
+        del w2
+        self._grouped_ok = _moe_grouped is not None
+        # Down proj: decode + grouped-prefill kernels both read PLAIN qh, so
+        # down_qh_plain is the only high-bit rep we keep (no 512-tile pre-shuffle).
+        # The *_down_combined helpers derive u5/u6 ONCE and chunk over rows (see
+        # SGLANG_GGUF_XPU_MOE_REPACK_CHUNK_ROWS) so peak memory does not scale
+        # with E*Nd.
         if self._down_is_q6:
-            ql, qh, sc = _xpu_repack_q6_k(down_b)
-            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
+            ql, sc, qh_plain = _xpu_repack_q6_k_down_combined(down_b)
+            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
+            del qh_plain
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous()
             self.down_mn = torch.zeros(1, dtype=torch.float16, device=dev)
+            del ql, sc
         else:
-            ql, qh, sc, mn = _xpu_repack_q5_k(down_b)
-            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_qh = qh.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
+            ql, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
+            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
+            del qh_plain
+            self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
+            del ql, sc, mn
+        del down_b
         # dims: w13 gate rows = intermediate; hidden from gate K (=ql cols*2).
         self.intermediate = half
         self.hidden = self.gate_ql.shape[2] * 2
         self.E = E
 
-        # Grouped prefill (M>1): reuse the decode reps with ZERO extra resident
-        # memory. The up GGEMV takes gate_ql/up_ql separately (no [E,2*inter,...]
-        # concat copy). The down GGEMV reuses down_ql/down_sc/down_mn and only
-        # needs a small PLAIN element-order qh (the decode qh is pre-shuffled and
-        # can't be reused). Both Q5_K (1-bit qh) and Q6_K (2-bit qh) down supported.
-        self._grouped_ok = _moe_grouped is not None
-        if self._grouped_ok:
-            # BATCH (notes #137g): same flatten-[E*Nd,Kbd] one-call repack as above.
-            down_b = w2.reshape(E * Nd, Kbd).contiguous()
-            if self._down_is_q6:
-                _, qh_plain, _ = _xpu_repack_q6_k_plain(down_b)
-            else:
-                _, qh_plain, _, _ = _xpu_repack_q5_k_plain(down_b)
-            self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
-
         layer._xpu_moe_ready = True
         del layer.w13_qweight
         del layer.w2_qweight
+        if dev.type == "xpu":
+            torch.xpu.empty_cache()
 
     def apply(self, layer: torch.nn.Module, dispatch_output) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1943,15 +2265,17 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
-        x2 = x.reshape(-1, x.shape[-1])
+        # At M=1 decode x is already 2D [1, K]; skip the no-op reshape dispatch.
+        x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
         M = x2.shape[0]
-        out = torch.zeros_like(x2)
         if M == 0:
-            return StandardCombineInput(hidden_states=out.reshape_as(x))
+            z = torch.zeros_like(x2)
+            return StandardCombineInput(
+                hidden_states=z if x.dim() == 2 else z.reshape_as(x))
         top_k = topk_ids.shape[1]
         hidden, inter = self.hidden, self.intermediate
         n_routed = M * top_k
-        xf = x2.to(torch.float16).contiguous()
+        xf = _as_fp16c(x2)
         sel = topk_ids.reshape(-1).to(torch.int32).contiguous()
         tw = topk_weights.reshape(-1).to(torch.float16).contiguous()
 
@@ -1966,7 +2290,10 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
                 self.up_ql, self.up_sc, self.up_mn,
                 self.down_ql, self.down_qh_plain, self.down_sc, self.down_mn,
                 down_is_q6=self._down_is_q6)
-            return StandardCombineInput(hidden_states=out_g.to(out.dtype).reshape_as(x))
+            if out_g.dtype != x2.dtype:
+                out_g = out_g.to(x2.dtype)
+            return StandardCombineInput(
+                hidden_states=out_g if x.dim() == 2 else out_g.reshape_as(x))
 
         # Fused: 1 up launch (gate/up Q4_K + silu*up) + 1 down launch (Q5_K/Q6_K
         # weighted) over ALL routed pairs, then sum the top_k partials. Replaces
@@ -1977,14 +2304,16 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
                          M, hidden, inter, top_k)
         out_partial = torch.empty(n_routed, hidden, dtype=torch.float16, device=x2.device)
         if self._down_is_q6:
-            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+            esimd_moe_down_q6k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
                                sel, tw, out_partial, M, hidden, inter, top_k)
         else:
-            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh, self.down_sc,
+            esimd_moe_down_q5k(inter_buf, self.down_ql, self.down_qh_plain, self.down_sc,
                                self.down_mn, sel, tw, out_partial, M, hidden, inter, top_k)
         # sum the top_k per-route partials back to per-token output (one op).
-        out = out_partial.view(M, top_k, hidden).sum(dim=1).to(out.dtype)
-        return StandardCombineInput(hidden_states=out.reshape_as(x))
+        summed = out_partial.view(M, top_k, hidden).sum(dim=1)
+        out = summed if summed.dtype == x2.dtype else summed.to(x2.dtype)
+        return StandardCombineInput(
+            hidden_states=out if x.dim() == 2 else out.reshape_as(x))
 
 
 class GGUFEmbeddingMethod(GGUFLinearMethod):

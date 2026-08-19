@@ -17,7 +17,7 @@
 import logging
 import os
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,96 @@ from sglang.srt.utils import (
 from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
+
+# ── NaN/Inf probe (env-gated: SGLANG_NAN_PROBE=1) ───────────────────────────
+# Debug instrumentation to locate the first non-finite tensor in the forward
+# pass (symptom: "！！！" garbage generations, more frequent at batch>8/16).
+# Logs the ORIGIN stage (input clean -> output NaN/Inf) with layer id, forward
+# mode (EXTEND/DECODE), and token count so we can tell which kernel/batch size
+# introduces the NaN. Zero overhead when SGLANG_NAN_PROBE is unset.
+import os as _os_np
+
+_NAN_PROBE = _os_np.environ.get("SGLANG_NAN_PROBE", "0") == "1"
+
+_nan_probe_state = {"origin_found": False, "fwd": -1}
+
+
+def _np_bad(t):
+    """Return (n_nan, n_inf) as python ints; (0, 0) if finite / not applicable."""
+    if t is None or not torch.is_tensor(t) or t.numel() == 0:
+        return (0, 0)
+    if not t.dtype.is_floating_point:
+        return (0, 0)
+    if bool(torch.isfinite(t).all()):
+        return (0, 0)
+    return (int(torch.isnan(t).sum().item()), int(torch.isinf(t).sum().item()))
+
+
+def _nan_probe(tag, t, layer_id=None, forward_batch=None, residual=None):
+    if not _NAN_PROBE:
+        return
+    try:
+        nan_h, inf_h = _np_bad(t)
+        nan_r, inf_r = _np_bad(residual)
+        if (nan_h + inf_h + nan_r + inf_r) == 0:
+            return
+        mode = "?"
+        if forward_batch is not None:
+            fm = getattr(forward_batch, "forward_mode", None)
+            mode = getattr(fm, "name", str(fm)) if fm is not None else "?"
+        ntok = int(t.shape[0]) if (torch.is_tensor(t) and t.dim() > 0) else -1
+        first = not _nan_probe_state["origin_found"]
+        if first:
+            _nan_probe_state["origin_found"] = True
+        extra = ""
+        if tag == "embed_out" and torch.is_tensor(t) and t.dim() == 2:
+            bad = ~torch.isfinite(t)
+            rows = bad.any(dim=1).nonzero(as_tuple=False).flatten()
+            full = int(bad.all(dim=1).sum().item())
+            ids = getattr(forward_batch, "input_ids", None)
+            idh = []
+            if torch.is_tensor(ids) and ids.numel() >= t.shape[0]:
+                idh = (
+                    ids.flatten()[: t.shape[0]].index_select(0, rows[:16]).tolist()
+                )
+            extra = (
+                " | bad_rows=%d full_nan_rows=%d rows_head=%s ids_head=%s"
+                " ids_shape=%s elem_head=%s"
+                % (
+                    int(rows.numel()),
+                    full,
+                    rows[:16].tolist(),
+                    idh,
+                    (tuple(ids.shape) if torch.is_tensor(ids) else None),
+                    bad.nonzero(as_tuple=False)[:8].tolist(),
+                )
+            )
+        logger.error(
+            "[NANPROBE]%s fwd=%d tag=%s layer=%s mode=%s ntok=%d | "
+            "hidden nan=%d inf=%d | residual nan=%d inf=%d%s",
+            " ORIGIN" if first else "",
+            _nan_probe_state["fwd"],
+            tag,
+            layer_id,
+            mode,
+            ntok,
+            nan_h,
+            inf_h,
+            nan_r,
+            inf_r,
+            extra,
+        )
+    except Exception:
+        pass
+
+
+def _nan_probe_new_forward():
+    if not _NAN_PROBE:
+        return
+    _nan_probe_state["origin_found"] = False
+    _nan_probe_state["fwd"] += 1
+
+
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -116,6 +206,240 @@ _qknorm_use_alt_stream = (
     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
 )
 _is_amx_available = cpu_has_amx_support()
+# XPU ESIMD fast-path gates. These SGL_XPU_* env vars are set once at launch and
+# are constant for the process lifetime, so cache them at import instead of
+# re-reading os.environ on every decode-step call (30-60 reads/step otherwise).
+_XPU_GDN_NORM_GEMV = os.environ.get("SGL_XPU_GDN_NORM_GEMV", "0") == "1"
+_XPU_GDN_RESADD_NORM = os.environ.get("SGL_XPU_GDN_RESADD_NORM", "0") == "1"
+_XPU_GDN_FAST_PATH = os.environ.get("SGLANG_XPU_GDN_FAST_PATH", "0") == "1"
+_XPU_GDN_ESIMD = os.environ.get("SGL_XPU_GDN_ESIMD", "0") == "1"
+_XPU_FA_ESIMD_QKV = os.environ.get("SGL_XPU_FA_ESIMD_QKV", "0") == "1"
+# Fuse the GDN in_proj_qkvz + in_proj_ba GEMVs (same hidden input, both fp8) into a
+# single esimd_gemv_fp8_pert_fused2 call, removing one GEMM dispatch + its glue per
+# GDN layer (~30/step). Decode-only (M=1). Falls back to two separate linears.
+_XPU_GDN_INPROJ_FUSED2 = os.environ.get("SGL_XPU_GDN_INPROJ_FUSED2", "0") == "1"
+# Phase 5b: fuse the full-attention layers' input_layernorm (GemmaRMSNorm resadd +
+# rmsnorm) into the qkv_proj GEMV via the single deployed
+# esimd_resadd_norm_gemv2_fp8_pert op (qkv as matrix-0, a 1-row dummy as matrix-1),
+# with kernel-written new_residual. Removes the per-full-attn-layer
+# gemma_fused_add_rmsnorm dispatch (~10/step). Decode single-token, fp8 qkv only.
+_XPU_FA_RESADD_NORM = os.environ.get("SGL_XPU_FA_RESADD_NORM", "0") == "1"
+
+# Phase 5c (GGUF): the Phase-5b resadd-norm fusions above are fp8-only, but the
+# 35B GGUF build runs its attention projections as ESIMD q8_0 GEMVs, so they
+# never fire. `esimd_resadd_norm_gemv_q8_ba` is the GGUF counterpart: it folds
+# GemmaRMSNorm(input_layernorm) plus the q8_0 in_proj/qkv GEMV plus (for GDN)
+# the unquantised fp16 in_proj_ba GEMV into ONE op call. Decode at bs=1 is
+# host-bound (~13-25us of torch dispatch per call vs ~4us of actual enqueue), so
+# collapsing 70 op calls/step is worth far more than any kernel-level tuning.
+# On by default whenever the GGUF MoE full fusion is on; SGL_XPU_GGUF_RESADD_NORM=0
+# forces the unfused fallback.
+_XPU_GGUF_RESADD_NORM = (
+    os.environ.get("SGL_XPU_GGUF_MOE_FULL", "0") == "1"
+    and os.environ.get("SGL_XPU_GGUF_RESADD_NORM", "1") == "1"
+)
+# DEPRECATED. First iteration of the GGUF norm+proj fusion, superseded by
+# _gguf_norm_gemv() / _XPU_GGUF_RESADD_NORM above. It drove a single-matrix
+# `esimd_resadd_norm_gemv_q8_0` op that was never landed in
+# custom-esimd-kernels, so the path always ImportErrors and falls back; the
+# shipped design instead uses `esimd_resadd_norm_gemv_q8_ba`, which folds the
+# unquantised fp16 in_proj_ba GEMV into the SAME op call (one launch instead of
+# two) and keeps the q/k/v-merged rep. Kept for reference behind its own opt-in
+# flag so it can never shadow the supported path; remove once the q8_0-only
+# variant is confirmed unnecessary.
+_XPU_GGUF_RESADD_NORM_LEGACY = (
+    os.environ.get("SGL_XPU_GGUF_RESADD_NORM_LEGACY", "0") == "1"
+)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Largest decode batch the GGUF resadd-norm fusion will handle.
+#
+# The kernel (Moe_norm_q8_kernel) has always been M-generic: its grid is
+# M*blocks*K_SPLIT and every access is indexed off `token = gid / blocks`. The
+# bs=1 restriction lived purely in this file, because the cached output buffers
+# were allocated as [1, N]. Real serving decode batches are almost never 1 (a
+# BFCL multi_turn run spends 87% of its decode steps at batch > 8), so that
+# restriction meant the fusion was bypassed for the large majority of steps.
+#
+# Buffers are now allocated per distinct M, so the only reason for an upper
+# bound is to stop an unbounded prefill-sized M from allocating one buffer set
+# per batch size ever seen. Set to 1 to restore the old single-token behaviour.
+_GGUF_FUSE_MAX_M = _env_int("SGL_XPU_GGUF_FUSE_MAX_M", 64)
+_GGUF_NORM_Q8_OP = None
+
+
+def _load_gguf_norm_q8_op():
+    global _GGUF_NORM_Q8_OP
+    if _GGUF_NORM_Q8_OP is None:
+        try:
+            import custom_esimd_kernels_sglang  # noqa: F401  (registers the lib)
+
+            _GGUF_NORM_Q8_OP = (
+                torch.ops.custom_esimd_kernels_sglang.esimd_resadd_norm_gemv_q8_ba
+            )
+        except Exception as e:
+            logger.warning("[gguf_resadd_norm] op unavailable: %r", e)
+            _GGUF_NORM_Q8_OP = False
+    return _GGUF_NORM_Q8_OP or None
+
+
+def _gguf_xpu_rep(lin, kind):
+    """The single ESIMD weight rep of a GGUF XPU linear, if it is `kind`.
+
+    A GGUF linear keeps one rep per loaded shard; when every shard shares a
+    quant type they are pre-merged into ``_xpu_merged`` (row-cat in output
+    order), which is exactly the ``[N, K]`` matrix the fused kernel needs. A
+    single-shard linear has no merge, so fall back to its only rep.
+    """
+    if lin is None or getattr(lin, "bias", None) is not None:
+        return None
+    merged = getattr(lin, "_xpu_merged", None)
+    rep = merged[0] if merged is not None else None
+    if rep is None:
+        reps = getattr(lin, "_xpu_reps", None)
+        order = getattr(lin, "_xpu_shard_order", None)
+        if isinstance(reps, dict) and order is not None and len(order) == 1:
+            rep = reps[order[0]]
+    if rep is None or rep[0] != kind:
+        return None
+    return rep
+
+
+def _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
+    """True when the plain-TP decode path is what will run, i.e. prepare_attn
+    reduces to a bare input_layernorm and the fused op is a drop-in."""
+    if not _XPU_GGUF_RESADD_NORM or not _is_xpu:
+        return False
+    if forward_batch is None or not forward_batch.forward_mode.is_decode():
+        return False
+    if forward_batch.forward_mode.is_target_verify():
+        return False
+    if hidden_states.dim() != 2:
+        return False
+    # The kernel handles any M; the bound only caps how many distinct output
+    # buffer sets we are willing to cache (see _GGUF_FUSE_MAX_M).
+    if not 1 <= hidden_states.shape[0] <= _GGUF_FUSE_MAX_M:
+        return False
+    if hidden_states.dtype != torch.float16:
+        return False
+    # Layer 0 has no residual yet. The kernel always does the add, so it is fed
+    # a cached zero buffer: ``h + 0.0`` is exact in fp16 and reproduces the
+    # plain path's ``residual = hidden_states; hidden = norm(hidden)``. Leaving
+    # layer 0 on the unfused path meant its in_proj_ba ran a oneDNN fp16 GEMV
+    # whose split-K reduction order is not reproducible under load, which made
+    # decode non-deterministic (identical operands, two possible results).
+    if residual is not None:
+        if residual.shape != hidden_states.shape:
+            return False
+        if residual.dtype != torch.float16:
+            return False
+    if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+        return False
+    try:
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
+        if get_attn_tp_context().input_scattered:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _gguf_norm_gemv(layer, norm, lin0, lin1, hidden_states, residual, tag):
+    """Run the fused resadd-norm + q8_0 GEMV (+ optional fp16 GEMV).
+
+    ``lin1`` is the GDN ``in_proj_ba`` (unquantised fp16) or None for the
+    full-attention layers. Returns ``(out0, out1_or_None, new_residual)`` or
+    None to fall back. Weights and norm constants are resolved once and cached
+    on the layer; output buffers are cached per distinct token count M, so the
+    steady-state cost stays exactly one op dispatch at any batch size.
+    """
+    op = _load_gguf_norm_q8_op()
+    if op is None or getattr(layer, "_gguf_norm_q8_off", False):
+        return None
+    cache = getattr(layer, "_gguf_norm_q8_cache", None)
+    if cache is None:
+        rep0 = _gguf_xpu_rep(lin0, "q8_0")
+        if rep0 is None:
+            logger.warning("[gguf_resadd_norm] %s: proj is not a single q8_0 rep", tag)
+            layer._gguf_norm_q8_off = True
+            return None
+        qs, sc = rep0[1], rep0[2]
+        hidden = hidden_states.shape[1]
+        if qs.dim() != 2 or qs.shape[1] != hidden:
+            logger.warning("[gguf_resadd_norm] %s: q8_0 K=%s != hidden=%s",
+                           tag, tuple(qs.shape), hidden)
+            layer._gguf_norm_q8_off = True
+            return None
+        dev = qs.device
+        w1 = torch.empty(0, dtype=torch.float16, device=dev)
+        if lin1 is not None:
+            rep1 = _gguf_xpu_rep(lin1, "fp16")
+            if rep1 is None or rep1[1].dim() != 2 or rep1[1].shape[1] != hidden:
+                logger.warning("[gguf_resadd_norm] %s: ba is not a single fp16 [N,%s] rep",
+                               tag, hidden)
+                layer._gguf_norm_q8_off = True
+                return None
+            w1 = rep1[1].contiguous()
+        nw = ((norm.weight.data.to(torch.float32) + 1.0)
+              .to(torch.float16).contiguous())
+        cache = {
+            "nw": nw,
+            "eps": float(norm.variance_epsilon),
+            "qs": qs,
+            "sc": sc,
+            "w1": w1,
+            "hidden": hidden,
+            "dev": dev,
+            "has_ba": lin1 is not None,
+            # Output buffers, keyed by token count. Decode batch sizes repeat,
+            # so this is allocated a handful of times and then only looked up.
+            "bufs": {},
+        }
+        layer._gguf_norm_q8_cache = cache
+        logger.warning("[gguf_resadd_norm] %s ACTIVE (norm + proj folded, ba=%s)",
+                       tag, cache["has_ba"])
+
+    M = int(hidden_states.shape[0])
+    buf = cache["bufs"].get(M)
+    if buf is None:
+        dev, hidden = cache["dev"], cache["hidden"]
+        w1 = cache["w1"]
+        buf = {
+            "o0": torch.empty((M, cache["qs"].shape[0]), dtype=torch.float16, device=dev),
+            "o1": (torch.empty((M, w1.shape[0]), dtype=torch.float16, device=dev)
+                   if cache["has_ba"]
+                   else torch.empty(0, dtype=torch.float16, device=dev)),
+            "xn": torch.empty((M, hidden), dtype=torch.float16, device=dev),
+            # Post-add residual goes to its own buffer: the kernel's block 0
+            # stores it while the other row-blocks still read the OLD residual.
+            # Per-layer, so it is never the same buffer the kernel reads (the
+            # incoming residual belongs to the previous layer).
+            "nr": torch.empty((M, hidden), dtype=torch.float16, device=dev),
+            # Zero residual for layer 0 (residual is None there).
+            "zr": torch.zeros((M, hidden), dtype=torch.float16, device=dev),
+        }
+        cache["bufs"][M] = buf
+
+    h = hidden_states if hidden_states.is_contiguous() else hidden_states.contiguous()
+    res = buf["zr"] if residual is None else (
+        residual if residual.is_contiguous() else residual.contiguous())
+    try:
+        op(h, res, cache["nw"], cache["eps"], buf["xn"], buf["nr"],
+           cache["qs"], cache["sc"], buf["o0"], cache["w1"], buf["o1"])
+    except Exception as e:
+        logger.warning("[gguf_resadd_norm] %s: kernel raised %r", tag, e)
+        layer._gguf_norm_q8_off = True
+        return None
+    return buf["o0"], (buf["o1"] if cache["has_ba"] else None), buf["nr"]
+
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -124,6 +448,134 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
     return get_global_server_args().disable_shared_experts_fusion
+
+
+def _esimd_fp8_weight_nk_scale(lin):
+    """Resolve an fp8 Linear's weight as row-major ``[N, K]`` plus a per-tensor
+    scalar scale, for the ESIMD GEMV fusion kernels.
+
+    Handles the two fp8 weight layouts SGLang produces:
+
+    * **block-quant** (``weight_scale_inv`` present): ``layer.weight`` is stored
+      ``[N, K]`` already; the block scale is collapsed to its mean.
+    * **online / dynamic per-tensor** (``weight_scale`` present): the loader
+      stores ``layer.weight`` **transposed** as ``[K, N]`` (see
+      ``Fp8LinearMethod.process_weights_after_loading``). ESIMD needs ``[N, K]``,
+      so we transpose (reusing the ``_esimd_t`` cache shared with the dense fp8
+      fast path) and take the per-tensor scalar.
+
+    Returns ``(weight_nk, scale_pt_fp32_1d)`` on success, or ``None`` to force a
+    safe fallback. The result is validated against the layer's known
+    ``output_size_per_partition`` / ``input_size_per_partition`` so a layout we
+    did not anticipate never reaches the kernel (which reads raw pointers and
+    would otherwise fault with UR_RESULT_ERROR_DEVICE_LOST).
+    """
+    w = getattr(lin, "weight", None)
+    if w is None or w.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return None
+    # Weight and its fp8 scale are static after loading, so the transposed
+    # [N, K] layout and the scalar per-tensor scale never change across decode
+    # steps. Cache the fully-resolved (w_nk, scale_pt) on the weight so we skip
+    # the per-step t()/contiguous()/to(fp32)/mean()/contiguous() device ops
+    # (~5 dispatched ops x 60 calls/step of pure redundant recompute).
+    _cached = getattr(w, "_esimd_nk_scale", None)
+    if _cached is not None:
+        return _cached
+    if w.dim() != 2:
+        return None
+    N = getattr(lin, "output_size_per_partition", None)
+    K = getattr(lin, "input_size_per_partition", None)
+    if N is None or K is None:
+        return None
+
+    ws_inv = getattr(lin, "weight_scale_inv", None)
+    if ws_inv is not None:
+        # Block-quant: weight already [N, K].
+        if w.shape[0] != N or w.shape[1] != K:
+            return None
+        w_nk = w
+        scale_src = ws_inv
+    else:
+        ws = getattr(lin, "weight_scale", None)
+        if ws is None:
+            return None
+        # Online per-tensor: stored [K, N] -> transpose to [N, K].
+        if w.shape[0] != K or w.shape[1] != N:
+            return None
+        w_nk = getattr(w, "_esimd_t", None)
+        if w_nk is None:
+            w_nk = w.t().contiguous()
+            try:
+                w._esimd_t = w_nk
+            except Exception:
+                pass
+        scale_src = ws
+
+    if w_nk.shape[0] != N or w_nk.shape[1] != K:
+        return None
+    scale_pt = (
+        scale_src.data.to(torch.float32).reshape(-1).mean().reshape(1).contiguous()
+    )
+    result = (w_nk, scale_pt)
+    try:
+        w._esimd_nk_scale = result
+    except Exception:
+        pass
+    return result
+
+
+def _esimd_q8_0_weight_scale(lin):
+    """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
+
+    Resolve a GGUF-q8_0 Linear's quant weight as ``(qs [N, K] int8, scale
+    [N, K/32] fp16)`` for the legacy single-matrix ESIMD q8_0 GEMV kernel.
+
+    Superseded by ``_gguf_xpu_rep()``, which returns the packed rep tuple
+    directly and additionally handles the fp16 ``in_proj_ba`` shard so both
+    projections can be folded into one ``esimd_resadd_norm_gemv_q8_ba`` call.
+
+    The GGUF XPU linear method stores its resident quant reps on the module:
+      * ``layer._xpu_merged`` = ``(merged_rep, sizes)`` when q/k/v shards were
+        row-concatenated into one big-N GEMV (the D1 optimization); or
+      * ``layer._xpu_reps`` / ``layer._xpu_shard_order`` for the per-shard reps.
+    A single-matrix fused GEMV needs the *whole* projection as one q8_0 matrix,
+    so this returns a value only when the projection is a lone q8_0 shard or a
+    merged q8_0 rep; anything else (multi-shard unmerged, non-q8_0) yields
+    ``None`` and the caller safely falls back. Cached on the module.
+    """
+    cached = getattr(lin, "_esimd_q8_0_ws", None)
+    if cached is not None:
+        return cached
+    rep = None
+    merged = getattr(lin, "_xpu_merged", None)
+    if merged is not None:
+        rep = merged[0]
+    else:
+        order = getattr(lin, "_xpu_shard_order", None)
+        reps = getattr(lin, "_xpu_reps", None)
+        if order is not None and reps is not None and len(order) == 1:
+            rep = reps.get(order[0])
+    if rep is None or rep[0] != "q8_0":
+        return None
+    _, qs, scale = rep
+    # Validate the exact [N, K] int8 + [N, K/32] fp16 layout the kernel reads
+    # from raw pointers (a mismatch would fault with DEVICE_LOST).
+    if qs.dim() != 2 or scale.dim() != 2:
+        return None
+    if qs.dtype != torch.int8 or scale.dtype != torch.float16:
+        return None
+    if qs.shape[1] % 32 != 0 or scale.shape[0] != qs.shape[0]:
+        return None
+    if scale.shape[1] != qs.shape[1] // 32:
+        return None
+    if not (qs.is_contiguous() and scale.is_contiguous()):
+        return None
+    result = (qs, scale)
+    try:
+        lin._esimd_q8_0_ws = result
+    except Exception:
+        pass
+    return result
 
 
 if _is_npu:
@@ -493,7 +945,58 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
+    def _esimd_fused_input_proj(self, hidden_states: torch.Tensor):
+        """Fuse in_proj_qkvz + in_proj_ba into one esimd_gemv_fp8_pert_fused2 call.
+
+        Both projections read the same ``hidden_states`` and share the contraction
+        dim K, so the two fp8 GEMVs collapse into a single kernel dispatch. Returns
+        ``(qkvz, ba)`` on success or ``None`` to fall back to two separate linears.
+        Guarded to decode single-token (M=1), fp16 input, both weights fp8.
+        """
+        if not _XPU_GDN_INPROJ_FUSED2:
+            return None
+        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
+            return None
+        # A bias'd projection would need a post-GEMV add; keep it simple.
+        if getattr(self.in_proj_qkvz, "bias", None) is not None:
+            return None
+        if getattr(self.in_proj_ba, "bias", None) is not None:
+            return None
+        r0 = _esimd_fp8_weight_nk_scale(self.in_proj_qkvz)
+        r1 = _esimd_fp8_weight_nk_scale(self.in_proj_ba)
+        if r0 is None or r1 is None:
+            return None
+        w0, s0 = r0
+        w1, s1 = r1
+        if w0.shape[1] != w1.shape[1] or w0.shape[1] != hidden_states.shape[1]:
+            return None
+        try:
+            from custom_esimd_kernels_sglang import esimd_gemv_fp8_pert_fused2
+        except Exception:
+            return None
+        x = (
+            hidden_states
+            if hidden_states.dtype == torch.float16
+            else hidden_states.to(torch.float16)
+        )
+        x = x if x.is_contiguous() else x.contiguous()
+        scratch = getattr(self, "_esimd_inproj_scratch", None)
+        if scratch is None or scratch[0].shape[1] != w0.shape[0] or scratch[1].shape[1] != w1.shape[0]:
+            o0 = torch.empty((1, w0.shape[0]), dtype=torch.float16, device=x.device)
+            o1 = torch.empty((1, w1.shape[0]), dtype=torch.float16, device=x.device)
+            self._esimd_inproj_scratch = (o0, o1)
+        else:
+            o0, o1 = scratch
+        try:
+            esimd_gemv_fp8_pert_fused2(x, w0, s0, o0, w1, s1, o1)
+        except Exception:
+            return None
+        return o0, o1
+
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        fused = self._esimd_fused_input_proj(hidden_states)
+        if fused is not None:
+            return fused
         if (
             _is_cpu
             or _is_npu
@@ -520,6 +1023,46 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
         return projected_states_qkvz, projected_states_ba
+
+    def _gdn_seq_to_interleaved(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+    ):
+        """Reorder sglang's sequential qkvz/ba into the GQA-interleaved layout
+        the native ``sgl_kernel.gdn_attention`` kernel reads.
+
+        Input (sglang, per-tp columns):
+          qkvz = [q_all(nk*hk) | k_all(nk*hk) | v_all(nv*hv) | z_all(nv*hv)]
+          ba   = [b_all(nv)    | a_all(nv)]
+        Output (kernel, per-k-head interleaved blocks):
+          qkvz = [ q(hk) k(hk) v(ratio*hv) z(ratio*hv) ] x nk
+          ba   = [ b(ratio) a(ratio) ] x nk
+        where ratio = nv // nk and v-head v belongs to k-head v // ratio
+        (contiguous GQA grouping). Returns contiguous tensors.
+        """
+        T = projected_states_qkvz.shape[0]
+        nk = self.num_k_heads // self.attn_tp_size
+        nv = self.num_v_heads // self.attn_tp_size
+        ratio = nv // nk
+        hk = self.head_k_dim
+        hv = self.head_v_dim
+        key_dim = nk * hk
+        val_dim = nv * hv
+
+        qkvz = projected_states_qkvz
+        q = qkvz[:, 0:key_dim].reshape(T, nk, hk)
+        k = qkvz[:, key_dim : 2 * key_dim].reshape(T, nk, hk)
+        v = qkvz[:, 2 * key_dim : 2 * key_dim + val_dim].reshape(T, nk, ratio * hv)
+        z = qkvz[:, 2 * key_dim + val_dim :].reshape(T, nk, ratio * hv)
+        qkvz_il = torch.cat([q, k, v, z], dim=2).reshape(T, -1).contiguous()
+
+        ba = projected_states_ba
+        b = ba[:, 0:nv].reshape(T, nk, ratio)
+        a = ba[:, nv : 2 * nv].reshape(T, nk, ratio)
+        ba_il = torch.cat([b, a], dim=2).reshape(T, -1).contiguous()
+
+        return qkvz_il, ba_il
 
     def _forward_xpu_fast_path(
         self,
@@ -601,9 +1144,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         num_actual_tokens = projected_states_qkvz.shape[0]
 
-        # Contiguity the kernel asserts on.
-        projected_states_qkvz = projected_states_qkvz.contiguous()
-        projected_states_ba = projected_states_ba.contiguous()
+        # Layout adapter: sglang produces projected_states_qkvz in SEQUENTIAL
+        # [q_all | k_all | v_all | z_all] order and projected_states_ba as
+        # [b_all | a_all] (see fix_query_key_value_ordering). The native
+        # gdn_attention kernel instead reads qkvz as GQA-INTERLEAVED per-k-head
+        # blocks [q(head_k), k(head_k), v(head_v*ratio), z(head_v*ratio)] and ba
+        # as per-k-head [b(ratio), a(ratio)] (see chunk_causal_conv1d_xe2.hpp:
+        # qkvz_elems_offset = k_head_id*qkvz_dim+off; chunk_reorder_zba step =
+        # (token*num_v + k_head*ratio)*2). Reorder here so the kernel sees the
+        # layout it expects. conv_weights/conv_state/ssm_state stay sequential
+        # (the kernel reads those via reordered_elems_offset), so they are
+        # untouched. All dims are per-tp (the projection is column-parallel).
+        projected_states_qkvz, projected_states_ba = self._gdn_seq_to_interleaved(
+            projected_states_qkvz, projected_states_ba
+        )
 
         # Output buffers (kernel writes into these).
         nv_tp = self.num_v_heads // self.attn_tp_size
@@ -671,6 +1225,178 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         output, _ = self.out_proj(core_attn_out)
         return output
 
+    def _gguf_norm_out_proj(
+        self, core_attn_out: torch.Tensor, z_out: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """RMSNormGated + GGUF q8_0 out_proj in one op dispatch.
+
+        The GGUF counterpart of ``_esimd_norm_out_proj`` (which is fp8-only).
+        Removes the standalone ``gdn_rms_norm_gated`` launch plus the reshape /
+        cast glue around it, ~30 dispatches per decode step.
+
+        The out_proj rep already carries the GGUF->HF value-head column permute
+        (baked into the global pre-shard weight, see __init__), so feeding the
+        raw rep is exactly what the unfused ``out_proj(...)`` would do.
+        """
+        op = getattr(torch.ops.custom_esimd_kernels_sglang,
+                     "esimd_norm_gemv_q8_0", None)
+        if op is None or getattr(self, "_gguf_outproj_off", False):
+            return None
+        cache = getattr(self, "_gguf_outproj_const", None)
+        if cache is None:
+            rep = _gguf_xpu_rep(self.out_proj, "q8_0")
+            if rep is None:
+                logger.warning("[gguf_norm_out_proj] out_proj is not a single q8_0 rep")
+                self._gguf_outproj_off = True
+                return None
+            qs, sc = rep[1], rep[2]
+            HV, V = int(core_attn_out.shape[1]), int(core_attn_out.shape[2])
+            if qs.shape[1] != HV * V:
+                logger.warning("[gguf_norm_out_proj] K=%s != HV*V=%s",
+                               qs.shape[1], HV * V)
+                self._gguf_outproj_off = True
+                return None
+            nw = self.norm.weight
+            nw = nw.to(torch.float16).contiguous() if nw.dtype != torch.float16 \
+                else nw.contiguous()
+            if nw.numel() != V:
+                logger.warning("[gguf_norm_out_proj] norm weight %s != V=%s",
+                               nw.numel(), V)
+                self._gguf_outproj_off = True
+                return None
+            cache = {
+                "qs": qs, "sc": sc, "nw": nw, "HV": HV, "V": V,
+                "eps": float(self.layer_norm_epsilon),
+                # Buffers keyed by token count; the kernel takes any M.
+                "bufs": {},
+            }
+            self._gguf_outproj_const = cache
+            logger.warning("[gguf_norm_out_proj] ACTIVE (gated norm + out_proj folded)")
+        HV, V = cache["HV"], cache["V"]
+        M = int(core_attn_out.shape[0])
+        buf = cache["bufs"].get(M)
+        if buf is None:
+            dev = cache["qs"].device
+            buf = {
+                "y": torch.empty((M * HV, V), dtype=torch.float16, device=dev),
+                "out": torch.empty((M, cache["qs"].shape[0]),
+                                   dtype=torch.float16, device=dev),
+            }
+            cache["bufs"][M] = buf
+        x = core_attn_out.reshape(M * HV, V)
+        z = z_out.reshape(M * HV, V)
+        if not x.is_contiguous():
+            x = x.contiguous()
+        if not z.is_contiguous():
+            z = z.contiguous()
+        try:
+            op(x, z, cache["nw"], buf["y"],
+               cache["qs"], cache["sc"], buf["out"],
+               HV, V, cache["eps"])
+        except Exception as e:
+            logger.warning("[gguf_norm_out_proj] kernel raised %r", e)
+            self._gguf_outproj_off = True
+            return None
+        return buf["out"]
+
+    def _esimd_norm_out_proj(
+        self, core_attn_out: torch.Tensor, z_out: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Fused RMSNormGated + FP8 out_proj GEMV for the GDN decode path.
+
+        Replaces ``self.norm(x, z)`` (a standalone RMSNormGated launch) +
+        ``self.out_proj(...)`` (a separate fp8 GEMV) + the surrounding
+        cast/reshape/empty glue with a single ESIMD launch
+        (``esimd_norm_gemv_fp8_pert``). Gated by ``SGL_XPU_GDN_NORM_GEMV=1``.
+
+        Semantics matched to RMSNormGated(norm_before_gate=True,
+        activation="swish"): ``out = (rmsnorm(x) * norm_weight * silu(z)) @
+        out_proj.weight^T * scale``. The per-block out_proj weight_scale is
+        collapsed to a single per-tensor scalar (mean), mirroring the dense
+        ESIMD fp8 GEMV fast path.
+
+        Returns the layer output ``[M, hidden]`` on success, or ``None`` to fall
+        back to the eager norm + out_proj path. The GGUF q8_0 branch handles any
+        decode batch size; the fp8 branch below is still single-token only
+        (``esimd_norm_gemv_fp8_pert`` emits ``[1, N]``).
+        """
+        if core_attn_out.dim() != 3:
+            return None
+        if core_attn_out.shape != z_out.shape:
+            return None
+        if getattr(self.norm, "activation", "swish") not in ("swish", "silu"):
+            return None
+        if not getattr(self.norm, "norm_before_gate", True):
+            return None
+        # Phase 5c: GGUF q8_0 out_proj (the fp8 path below never matches it).
+        # M-generic: x/z are [M, HV, V] and the kernel derives M from the row
+        # count, so batched decode is still a single launch.
+        if (
+            _XPU_GGUF_RESADD_NORM
+            and core_attn_out.dtype == torch.float16
+            and 1 <= core_attn_out.shape[0] <= _GGUF_FUSE_MAX_M
+        ):
+            r = self._gguf_norm_out_proj(core_attn_out, z_out)
+            if r is not None:
+                return r
+        # fp8 kernel assumes a single decode token: x/z are [HV, V].
+        if core_attn_out.shape[0] != 1:
+            return None
+        if not _XPU_GDN_NORM_GEMV:
+            return None
+        try:
+            from custom_esimd_kernels_sglang import esimd_norm_gemv_fp8_pert
+        except ImportError:
+            return None
+        resolved = _esimd_fp8_weight_nk_scale(self.out_proj)
+        if resolved is None:
+            return None
+        w_nk, scale_pt = resolved
+        HV = core_attn_out.shape[1]
+        V = core_attn_out.shape[2]
+        # Kernel contracts along HV*V; must equal out_proj in_features (K).
+        if HV * V != w_nk.shape[1]:
+            return None
+        x = core_attn_out.reshape(HV, V)
+        z = z_out.reshape(HV, V)
+        if x.dtype != torch.float16:
+            x = x.to(torch.float16)
+        if z.dtype != torch.float16:
+            z = z.to(torch.float16)
+        x = x.contiguous()
+        z = z.contiguous()
+        # Cache fp16 norm weight, collapsed per-tensor scale, and the output
+        # buffer once per layer (constants across calls; the buffer is reused so
+        # its data ptr stays stable across XPU-graph replays).
+        cache = getattr(self, "_esimd_outproj_const", None)
+        if cache is None:
+            nw = self.norm.weight
+            nw = (
+                nw.to(torch.float16).contiguous()
+                if nw.dtype != torch.float16
+                else nw.contiguous()
+            )
+            out_buf = torch.empty(
+                (1, w_nk.shape[0]), dtype=torch.float16, device=w_nk.device
+            )
+            cache = {"nw": nw, "scale": scale_pt, "w": w_nk, "out": out_buf}
+            self._esimd_outproj_const = cache
+        try:
+            esimd_norm_gemv_fp8_pert(
+                x,
+                z,
+                cache["nw"],
+                cache["w"],
+                cache["scale"],
+                cache["out"],
+                HV,
+                V,
+                float(self.layer_norm_epsilon),
+            )
+        except Exception:
+            return None
+        return cache["out"]
+
     def _forward_xpu_esimd_gdn_decode(
         self,
         projected_states_qkvz: torch.Tensor,
@@ -712,24 +1438,33 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mamba_cache_params = linear_backend.req_to_token_pool.mamba2_layer_cache(
             self.layer_id
         )
-        # sglang pool conv: (cache, conv_dim, W-1); kernel expects
-        # (cache, W-1, conv_dim) view (per-batch contiguous via stride).
+        # sglang pool conv native layout: (cache, conv_dim, W-1). The updated
+        # ESIMD kernel reads AND writes conv_state directly in this native
+        # layout (auto-detected in C++ by the small trailing dim W-1), so when
+        # the pool is fp16 we pass it in-place and skip both the whole-pool
+        # transpose copy and the per-layer index_copy_ writeback (~3 dispatched
+        # ops/layer * 30 GDN layers eliminated). Falls back to the legacy
+        # transposed-copy path when the pool dtype is not fp16.
         pool_conv = mamba_cache_params.conv[0]
         pool_ssm = mamba_cache_params.temporal
-        # The kernel reads conv state in (cache, W-1, conv_dim) layout, which
-        # the pool does not store, so we materialize a transposed-contiguous
-        # copy. Reuse a fixed buffer (copy_ rather than a fresh
-        # transpose().contiguous() each call) so its data ptr stays stable
-        # across XPU-graph replays.
-        cvcache = getattr(self, "_esimd_gdn_conv_view", None)
-        if cvcache is None or cvcache.shape != pool_conv.shape[:1] + pool_conv.shape[1:][::-1]:
-            cvcache = torch.empty(
-                (pool_conv.size(0), pool_conv.size(2), pool_conv.size(1)),
-                dtype=pool_conv.dtype, device=pool_conv.device,
-            )
-            self._esimd_gdn_conv_view = cvcache
-        cvcache.copy_(pool_conv.transpose(-1, -2))
-        conv_state_view = cvcache
+        _conv_native = (pool_conv.dtype == torch.float16)
+        if _conv_native:
+            conv_state_view = pool_conv
+        else:
+            # The kernel reads conv state in (cache, W-1, conv_dim) layout, which
+            # the pool does not store, so we materialize a transposed-contiguous
+            # copy. Reuse a fixed buffer (copy_ rather than a fresh
+            # transpose().contiguous() each call) so its data ptr stays stable
+            # across XPU-graph replays.
+            cvcache = getattr(self, "_esimd_gdn_conv_view", None)
+            if cvcache is None or cvcache.shape != pool_conv.shape[:1] + pool_conv.shape[1:][::-1]:
+                cvcache = torch.empty(
+                    (pool_conv.size(0), pool_conv.size(2), pool_conv.size(1)),
+                    dtype=pool_conv.dtype, device=pool_conv.device,
+                )
+                self._esimd_gdn_conv_view = cvcache
+            cvcache.copy_(pool_conv.transpose(-1, -2))
+            conv_state_view = cvcache
 
         # Cache the conv1d.weight view + zeros bias once per layer.
         if getattr(self, "_esimd_conv_weights", None) is None:
@@ -808,22 +1543,44 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         except Exception:
             return None
 
-        # Write conv_state back into pool: (cache, W-1, conv_dim) → (cache, conv_dim, W-1).
-        # index_copy_ writes only the touched slots; the conv_state_view above
-        # was a fresh copy of the whole pool, so untouched slots round-trip
-        # unchanged.
-        cache_indices_long = cache_indices.to(torch.long)
-        pool_conv.index_copy_(
-            0, cache_indices_long,
-            conv_state_view.index_select(0, cache_indices_long).transpose(-1, -2).contiguous().to(pool_conv.dtype),
-        )
-        if pool_ssm.dtype != torch.float16:
+        # conv_state writeback. In the native fp16 path the ESIMD kernel already
+        # shifted conv_state in-place into pool_conv, so no python writeback is
+        # needed. Only the legacy transposed-copy path (or a non-fp16 ssm pool)
+        # needs the index_copy_ round-trip.
+        # cache_indices is a step-level (batch) tensor identical for all 30 GDN
+        # layers; ``.to(torch.long)`` is a real dispatched copy (int32->int64).
+        # Memoize the long view on the per-step fwd_md object so only the first
+        # GDN layer that needs it pays the cast and the other layers reuse it.
+        need_conv_wb = not _conv_native
+        need_ssm_wb = pool_ssm.dtype != torch.float16
+        if need_conv_wb or need_ssm_wb:
+            cache_indices_long = getattr(fwd_md, "_cache_indices_long", None)
+            if cache_indices_long is None or cache_indices_long.numel() != cache_indices.numel():
+                cache_indices_long = cache_indices.to(torch.long)
+                try:
+                    fwd_md._cache_indices_long = cache_indices_long
+                except Exception:
+                    pass
+        if need_conv_wb:
+            # (cache, W-1, conv_dim) → (cache, conv_dim, W-1); only touched slots.
+            pool_conv.index_copy_(
+                0, cache_indices_long,
+                conv_state_view.index_select(0, cache_indices_long).transpose(-1, -2).contiguous().to(pool_conv.dtype),
+            )
+        if need_ssm_wb:
             pool_ssm.index_copy_(
                 0, cache_indices_long,
                 ssm_state_view.index_select(0, cache_indices_long).to(pool_ssm.dtype),
             )
 
         # Norm + out_proj. Mirrors the default path.
+        # Fast path: fuse RMSNormGated + fp8 out_proj into one ESIMD launch,
+        # eliminating the standalone norm kernel + separate GEMV + cast/reshape
+        # glue (decode single-token, SGL_XPU_GDN_NORM_GEMV=1). Falls back on None.
+        fused_out = self._esimd_norm_out_proj(core_attn_out, z_out)
+        if fused_out is not None:
+            return fused_out
+
         core_attn_out = core_attn_out.to(orig_dtype)
         z_out = z_out.to(orig_dtype)
         z_shape_og = z_out.shape
@@ -853,18 +1610,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+        return self._forward_from_projected(
+            projected_states_qkvz, projected_states_ba, forward_batch
+        )
 
+    def _forward_from_projected(
+        self,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        """Core attention + output path starting from the in_proj outputs.
+
+        Split out of ``forward`` so the fused input_layernorm + in_proj decode
+        path (esimd_resadd_norm_gemv2_fp8_pert) can supply the projected states
+        directly, skipping the standalone in_proj GEMV launches.
+        """
         # --- XPU native conv1d+GDN fast path (sgl_kernel.gdn_attention) ---
         # Cherry-picked from origin/dev 7680aecdd4. Env-gated; falls back to
         # the default Triton path if the kernel isn't usable on this shape.
-        _ENABLE_XPU_FAST_PATH = os.environ.get(
-            "SGLANG_XPU_GDN_FAST_PATH", "0"
-        ) == "1"
+        # Prefill(extend)-only: decode keeps the tuned ESIMD recurrent path
+        # below (esimd_gdn_conv_fused_seq); the native Xe2 kernel is a chunked
+        # (parallel) algorithm that only wins on long prefill sequences.
+        _ENABLE_XPU_FAST_PATH = _XPU_GDN_FAST_PATH
         if (
             _ENABLE_XPU_FAST_PATH
             and _is_xpu
+            and not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
-            and self.num_v_heads // self.num_k_heads == 1
+            and self.num_v_heads % self.num_k_heads == 0
         ):
             output = self._forward_xpu_fast_path(
                 projected_states_qkvz,
@@ -878,9 +1652,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Calls the BMG-validated ESIMD kernel that fuses conv1d + the GDN
         # recurrence in one launch. Sequential [q|k|v|z] layout — no gather.
         # Decode-only; prefill stays on the Triton/PyTorch path.
-        _ENABLE_XPU_GDN_ESIMD = os.environ.get(
-            "SGL_XPU_GDN_ESIMD", "0"
-        ) == "1"
+        _ENABLE_XPU_GDN_ESIMD = _XPU_GDN_ESIMD
         if (
             _ENABLE_XPU_GDN_ESIMD
             and _is_xpu
@@ -1031,6 +1803,253 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
+    def _esimd_fused_input_norm_in_proj_q8_0(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        qkvz_lin,
+        ba_lin,
+        r0q,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]],
+    ):
+        """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
+
+        GGUF-q8_0 variant of the fused input_layernorm + GDN in_proj.
+
+        ``in_proj_qkvz`` is q8_0; ``in_proj_ba`` is fp16 (GGUF keeps the tiny
+        b/a tensors unquantized). A single-matrix q8_0 kernel cannot fuse both,
+        so this fuses the GemmaRMSNorm into the q8_0 qkvz GEMV
+        (``esimd_resadd_norm_gemv_q8_0``, which also writes ``normed_out`` and a
+        separate ``new_residual``), then runs the fp16 ba projection on the
+        kernel-written normed hidden (its fp16 matmul is already
+        transpose-cached). Returns ``(qkvz, ba, new_residual)`` or ``None``.
+        Shared guards are checked by the caller.
+
+        Superseded by ``_gguf_norm_gemv()``: ``esimd_resadd_norm_gemv_q8_ba``
+        folds the fp16 ba GEMV into the same launch, so the shipped path costs
+        one op call here instead of two. ``esimd_resadd_norm_gemv_q8_0`` was
+        never landed, so this always ImportErrors and falls back.
+        """
+        try:
+            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv_q8_0
+        except ImportError:
+            return None
+        qs, scale = r0q
+        K = hidden_states.shape[1]
+        if qs.shape[1] != K:
+            return None
+        cache = getattr(self, "_esimd_resadd_q8_const", None)
+        if cache is None:
+            nw = (
+                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
+                .to(torch.float16)
+                .contiguous()
+            )
+            o0 = torch.empty((1, qs.shape[0]), dtype=torch.float16, device=qs.device)
+            normed = torch.empty((1, K), dtype=torch.float16, device=qs.device)
+            nr = torch.empty((1, K), dtype=torch.float16, device=qs.device)
+            cache = {
+                "nw": nw,
+                "qs": qs,
+                "scale": scale,
+                "o0": o0,
+                "normed": normed,
+                "nr": nr,
+            }
+            self._esimd_resadd_q8_const = cache
+        h = (
+            hidden_states
+            if hidden_states.dtype == torch.float16
+            else hidden_states.to(torch.float16)
+        )
+        h = h.contiguous()
+        res = residual if residual.is_contiguous() else residual.contiguous()
+        try:
+            esimd_resadd_norm_gemv_q8_0(
+                h,
+                res,
+                cache["nw"],
+                cache["qs"],
+                cache["scale"],
+                cache["o0"],
+                cache["normed"],
+                cache["nr"],
+                float(self.input_layernorm.variance_epsilon),
+            )
+        except Exception:
+            return None
+        # ba projection reads the normed hidden (matches in_proj_ba(normed) in
+        # the standard prepare_attn -> in_proj flow). fp16 GGUF matmul path.
+        try:
+            o1, _ = ba_lin(cache["normed"])
+        except Exception:
+            return None
+        new_residual = cache["nr"]
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.append(new_residual.clone())
+        return cache["o0"], o1, new_residual
+
+    def _esimd_fused_input_norm_in_proj(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]],
+    ):
+        """Fused GemmaRMSNorm(input_layernorm) + GDN in_proj (qkvz + ba).
+
+        Replaces the prepare_attn ``input_layernorm`` launch plus the two
+        ``in_proj`` fp8 GEMV launches with a single
+        ``esimd_resadd_norm_gemv2_fp8_pert`` launch. Gated by
+        ``SGL_XPU_GDN_RESADD_NORM=1``; decode single-token only.
+
+        Returns ``(projected_qkvz, projected_ba, new_residual)`` on success, or
+        ``None`` to fall back to the standard prepare_attn + in_proj path. Only
+        the plain TP decode path (no input-scatter, no allreduce-fusion) is
+        intercepted; every other configuration falls back.
+        """
+        # Phase 5c: GGUF q8_0 build (the fp8 path below never matches it).
+        if _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
+            gdn = self.linear_attn
+            r = _gguf_norm_gemv(
+                self,
+                self.input_layernorm,
+                gdn.in_proj_qkvz,
+                gdn.in_proj_ba,
+                hidden_states,
+                residual,
+                "gdn_in_proj",
+            )
+            if r is not None:
+                o0, o1, new_residual = r
+                if captured_last_layer_outputs is not None:
+                    captured_last_layer_outputs.append(new_residual.clone())
+                return o0, o1, new_residual
+        # DEPRECATED legacy GGUF q8_0 path, opt-in only and never reached unless
+        # SGL_XPU_GGUF_RESADD_NORM_LEGACY=1 (see the flag's comment).
+        if _XPU_GGUF_RESADD_NORM_LEGACY and residual is not None and _gguf_resadd_norm_guard(
+            hidden_states, residual, forward_batch
+        ):
+            gdn = self.linear_attn
+            r0q = _esimd_q8_0_weight_scale(gdn.in_proj_qkvz)
+            if r0q is not None:
+                q8out = self._esimd_fused_input_norm_in_proj_q8_0(
+                    hidden_states,
+                    residual,
+                    gdn.in_proj_qkvz,
+                    gdn.in_proj_ba,
+                    r0q,
+                    captured_last_layer_outputs,
+                )
+                if q8out is not None:
+                    return q8out
+        if not _XPU_GDN_RESADD_NORM:
+            return None
+        if not (_is_xpu and forward_batch.forward_mode.is_decode()):
+            return None
+        if forward_batch.forward_mode.is_target_verify():
+            return None
+        # Single decode token only (kernel emits [1, N]).
+        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
+            return None
+        # First layer has no residual yet; kernel requires the residual add.
+        if residual is None:
+            return None
+        # Only interceptable when prepare_attn reduces to plain input_layernorm.
+        try:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            if get_attn_tp_context().input_scattered:
+                return None
+        except Exception:
+            return None
+        if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+            return None
+        gdn = self.linear_attn
+        qkvz_lin = gdn.in_proj_qkvz
+        ba_lin = gdn.in_proj_ba
+        try:
+            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv2_fp8_pert
+        except ImportError:
+            return None
+
+        # Cache row-major [N, K] fp8 weights + per-tensor scales, the
+        # (1 + weight) Gemma norm weight, and the reusable output buffers once
+        # per layer. _esimd_fp8_weight_nk_scale handles both the block-quant
+        # ([N, K]) and online per-tensor (stored [K, N], transposed) layouts and
+        # validates shapes so a bad layout never reaches the kernel.
+        cache = getattr(self, "_esimd_resadd_const", None)
+        if cache is None:
+            r0 = _esimd_fp8_weight_nk_scale(qkvz_lin)
+            r1 = _esimd_fp8_weight_nk_scale(ba_lin)
+            if r0 is None or r1 is None:
+                return None
+            w0, s0 = r0
+            w1, s1 = r1
+            # Contraction dim (K) must match the hidden size for both.
+            K = hidden_states.shape[1]
+            if w0.shape[1] != K or w1.shape[1] != K:
+                return None
+            # GemmaRMSNorm scales by (1 + weight); the kernel expects the
+            # pre-folded weight.
+            nw = (
+                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
+                .to(torch.float16)
+                .contiguous()
+            )
+            o0 = torch.empty((1, w0.shape[0]), dtype=torch.float16, device=w0.device)
+            o1 = torch.empty((1, w1.shape[0]), dtype=torch.float16, device=w1.device)
+            # Per-layer buffer for the kernel-written post-add residual
+            # (hidden + residual). Safe: each layer object owns a distinct nr, so
+            # the kernel never reads and writes the same buffer within one launch
+            # (input residual belongs to the *previous* layer's nr).
+            nr = torch.empty(
+                (1, hidden_states.shape[1]), dtype=torch.float16, device=w0.device
+            )
+            cache = {
+                "nw": nw,
+                "w0": w0,
+                "s0": s0,
+                "w1": w1,
+                "s1": s1,
+                "o0": o0,
+                "o1": o1,
+                "nr": nr,
+            }
+            self._esimd_resadd_const = cache
+
+        h = (
+            hidden_states
+            if hidden_states.dtype == torch.float16
+            else hidden_states.to(torch.float16)
+        )
+        h = h.contiguous()
+        # ESIMD kernels read raw contiguous pointers; guard residual layout.
+        res = residual if residual.is_contiguous() else residual.contiguous()
+        try:
+            esimd_resadd_norm_gemv2_fp8_pert(
+                h,
+                res,
+                cache["nw"],
+                cache["w0"],
+                cache["s0"],
+                cache["o0"],
+                cache["w1"],
+                cache["s1"],
+                cache["o1"],
+                cache["nr"],
+                float(self.input_layernorm.variance_epsilon),
+            )
+        except Exception:
+            return None
+        # The kernel now writes the post-add residual (hidden + residual, fp16)
+        # into cache["nr"] via its gid==0 group, eliminating the separate
+        # aten::add dispatch.
+        new_residual = cache["nr"]
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.append(new_residual.clone())
+        return cache["o0"], cache["o1"], new_residual
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1039,48 +2058,86 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+        fused = None
+        if not forward_batch.forward_mode.is_idle():
+            fused = self._esimd_fused_input_norm_in_proj(
                 hidden_states,
                 residual,
                 forward_batch,
-                captured_last_layer_outputs=kwargs.get(
-                    "captured_last_layer_outputs", None
-                ),
+                kwargs.get("captured_last_layer_outputs", None),
             )
+
+        if fused is not None:
+            projected_qkvz, projected_ba, residual = fused
+            hidden_states = self.linear_attn._forward_from_projected(
+                projected_qkvz, projected_ba, forward_batch
+            )
+        else:
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=kwargs.get(
+                        "captured_last_layer_outputs", None
+                    ),
+                )
+            )
+
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.linear_attn(
+                    hidden_states,
+                    forward_batch,
+                )
+
+        if _NAN_PROBE: _nan_probe(
+            "gdn_attn_out",
+            hidden_states,
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            residual=residual,
         )
-
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(
-                hidden_states,
-                forward_batch,
-            )
-
         # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
+
+        # Phase 3: fold the post_attention_layernorm (resadd + rmsnorm) into the
+        # fused MoE router kernel, removing a per-layer dispatch. Falls back to
+        # the standard prepare_mlp + mlp path when not applicable.
+        fused_mlp = None
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
+            fused_mlp = self.mlp.esimd_prepare_mlp_moe(
                 hidden_states,
+                residual,
+                self.post_attention_layernorm,
                 forward_batch,
                 use_reduce_scatter,
                 should_allreduce_fusion,
             )
+
+        if fused_mlp is not None:
+            hidden_states, residual = fused_mlp
         else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
             )
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1317,18 +2374,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        precomputed_qkv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Full attention forward pass."""
+        """Full attention forward pass.
+
+        When ``precomputed_qkv`` is provided (Phase 5b fused input-norm + qkv
+        path), the ``qkv_proj`` GEMV is skipped and the supplied ``[1, N]`` fp16
+        qkv tensor is fed straight into the ESIMD split/norm/rope path.
+        """
         # vllm parity: fuse split + qk_norm + rope into single ESIMD call.
         # Hard-coded requirements: head_dim=256, fp16 model, GemmaRMSNorm
         # weight+1.0 convention. The kernel is fp16-only; on a bf16 model the
         # implicit cast loses dynamic range during RoPE and gsm8k drops from
         # 0.80 to 0.40 (verified). Restrict to fp16 inputs only.
         if (
-            os.environ.get("SGL_XPU_FA_ESIMD_QKV") == "1"
+            _XPU_FA_ESIMD_QKV
             and self.head_dim == 256
-            and hidden_states.dim() == 2
-            and hidden_states.dtype == torch.float16
+            and (
+                precomputed_qkv is not None
+                or (hidden_states.dim() == 2 and hidden_states.dtype == torch.float16)
+            )
         ):
             try:
                 # Prefer the BMG sglang variant; fall back to the vllm one
@@ -1342,7 +2407,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             except ImportError:
                 esimd_qkv_split_norm_rope = None
             if esimd_qkv_split_norm_rope is not None:
-                qkv, _ = self.qkv_proj(hidden_states)
+                if precomputed_qkv is not None:
+                    qkv = precomputed_qkv
+                else:
+                    qkv, _ = self.qkv_proj(hidden_states)
                 nTokens = qkv.shape[0]
                 orig_dtype = qkv.dtype
                 qkv_fp16 = qkv.to(torch.float16).contiguous()
@@ -1393,7 +2461,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     )
                 else:
                     _, q_out, gate_out, k_out, v_out = scratch
-                pos_i32 = positions.to(torch.int32).contiguous()
+                # Phase 5c: positions is identical across all full-attention
+                # layers within a decode step, so the int32 conversion (a real
+                # dispatched copy) is redundant after the first layer. Memoize it
+                # on the per-step forward_batch (fresh each step -> auto-invalidates)
+                # keyed by the positions object identity. Saves ~9/step copy_.
+                pos_i32 = getattr(forward_batch, "_esimd_pos_i32", None)
+                if pos_i32 is None or getattr(
+                    forward_batch, "_esimd_pos_id", None
+                ) != id(positions):
+                    pos_i32 = positions.to(torch.int32).contiguous()
+                    try:
+                        forward_batch._esimd_pos_i32 = pos_i32
+                        forward_batch._esimd_pos_id = id(positions)
+                    except Exception:
+                        pass
                 esimd_qkv_split_norm_rope(
                     qkv_fp16,
                     q_out, gate_out, k_out, v_out,
@@ -1404,10 +2486,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     self.attn_output_gate,
                     cache["rotary_dim"], cache["cos_sin"],
                 )
-                q = q_out.to(orig_dtype)
-                k = k_out.to(orig_dtype)
-                v = v_out.to(orig_dtype)
-                gate = gate_out.to(orig_dtype) if self.attn_output_gate else None
+                q = q_out if q_out.dtype == orig_dtype else q_out.to(orig_dtype)
+                k = k_out if k_out.dtype == orig_dtype else k_out.to(orig_dtype)
+                v = v_out if v_out.dtype == orig_dtype else v_out.to(orig_dtype)
+                gate = (
+                    (gate_out if gate_out.dtype == orig_dtype else gate_out.to(orig_dtype))
+                    if self.attn_output_gate
+                    else None
+                )
                 attn_output = self.attn(q, k, v, forward_batch)
                 if self.attn_output_gate:
                     # ESIMD kernel already applies sigmoid; don't re-sigmoid.
@@ -1440,6 +2526,227 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
+    def _esimd_fused_input_norm_qkv_q8_0(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        r0q,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]],
+    ):
+        """DEPRECATED (see _XPU_GGUF_RESADD_NORM_LEGACY).
+
+        GGUF-q8_0 variant of the fused input_layernorm + qkv_proj.
+
+        Uses the single-matrix ``esimd_resadd_norm_gemv_q8_0`` op (int8 weight +
+        per-32-block fp16 scale). ``normed_out`` is a scratch buffer here (the
+        full-attn path feeds ``o0`` straight into ``esimd_qkv_split_norm_rope``
+        and does not reuse the normed hidden). Returns ``(qkv, new_residual)`` or
+        ``None`` to fall back. Shared guards are checked by the caller.
+
+        Superseded by ``_gguf_norm_gemv()`` on ``esimd_resadd_norm_gemv_q8_ba``.
+        ``esimd_resadd_norm_gemv_q8_0`` was never landed in
+        custom-esimd-kernels, so this always ImportErrors and falls back.
+        """
+        try:
+            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv_q8_0
+        except ImportError:
+            return None
+        qs, scale = r0q
+        K = hidden_states.shape[1]
+        if qs.shape[1] != K:
+            return None
+        cache = getattr(self, "_esimd_fa_norm_q8_const", None)
+        if cache is None:
+            nw = (
+                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
+                .to(torch.float16)
+                .contiguous()
+            )
+            o0 = torch.empty((1, qs.shape[0]), dtype=torch.float16, device=qs.device)
+            normed = torch.empty((1, K), dtype=torch.float16, device=qs.device)
+            nr = torch.empty((1, K), dtype=torch.float16, device=qs.device)
+            cache = {
+                "nw": nw,
+                "qs": qs,
+                "scale": scale,
+                "o0": o0,
+                "normed": normed,
+                "nr": nr,
+            }
+            self._esimd_fa_norm_q8_const = cache
+        h = (
+            hidden_states
+            if hidden_states.dtype == torch.float16
+            else hidden_states.to(torch.float16)
+        )
+        h = h.contiguous()
+        res = residual if residual.is_contiguous() else residual.contiguous()
+        try:
+            esimd_resadd_norm_gemv_q8_0(
+                h,
+                res,
+                cache["nw"],
+                cache["qs"],
+                cache["scale"],
+                cache["o0"],
+                cache["normed"],
+                cache["nr"],
+                float(self.input_layernorm.variance_epsilon),
+            )
+        except Exception:
+            return None
+        new_residual = cache["nr"]
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.append(new_residual.clone())
+        return cache["o0"], new_residual
+
+    def _esimd_fused_input_norm_qkv(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[List[torch.Tensor]],
+    ):
+        """Fused GemmaRMSNorm(input_layernorm) + qkv_proj (Phase 5b).
+
+        Replaces the prepare_attn ``input_layernorm`` launch
+        (gemma_fused_add_rmsnorm) plus the ``qkv_proj`` fp8 GEMV with a single
+        ``esimd_resadd_norm_gemv2_fp8_pert`` launch (qkv as matrix-0, a 1-row
+        dummy as matrix-1), with the post-add residual written back by the
+        kernel. Gated by ``SGL_XPU_FA_RESADD_NORM=1``; decode single-token, fp8
+        qkv only. Requires the ESIMD qkv split path (head_dim==256, fp16) since
+        the resulting qkv feeds ``esimd_qkv_split_norm_rope``.
+
+        Returns ``(qkv, new_residual)`` on success, or ``None`` to fall back to
+        the standard prepare_attn + self_attention path.
+        """
+        # Phase 5c: GGUF q8_0 build (the fp8 path below never matches it).
+        if _gguf_resadd_norm_guard(hidden_states, residual, forward_batch):
+            r = _gguf_norm_gemv(
+                self,
+                self.input_layernorm,
+                # self_attention is a method on this layer, not a submodule:
+                # qkv_proj hangs off the layer itself.
+                self.qkv_proj,
+                None,
+                hidden_states,
+                residual,
+                "fa_qkv",
+            )
+            if r is not None:
+                o0, _, new_residual = r
+                if captured_last_layer_outputs is not None:
+                    captured_last_layer_outputs.append(new_residual.clone())
+                return o0, new_residual
+        # DEPRECATED legacy GGUF q8_0 path, opt-in only and never reached unless
+        # SGL_XPU_GGUF_RESADD_NORM_LEGACY=1 (see the flag's comment).
+        if (
+            _XPU_GGUF_RESADD_NORM_LEGACY
+            and _XPU_FA_ESIMD_QKV
+            and residual is not None
+            and _gguf_resadd_norm_guard(hidden_states, residual, forward_batch)
+        ):
+            r0q = _esimd_q8_0_weight_scale(self.qkv_proj)
+            if r0q is not None:
+                q8out = self._esimd_fused_input_norm_qkv_q8_0(
+                    hidden_states, residual, r0q, captured_last_layer_outputs
+                )
+                if q8out is not None:
+                    return q8out
+        if not (_XPU_FA_RESADD_NORM and _XPU_FA_ESIMD_QKV):
+            return None
+        if not (_is_xpu and forward_batch.forward_mode.is_decode()):
+            return None
+        if forward_batch.forward_mode.is_target_verify():
+            return None
+        if self.head_dim != 256:
+            return None
+        # Single decode token only (kernel emits [1, N]).
+        if hidden_states.dim() != 2 or hidden_states.shape[0] != 1:
+            return None
+        # First layer has no residual yet; kernel requires the residual add.
+        if residual is None:
+            return None
+        # Only interceptable when prepare_attn reduces to plain input_layernorm.
+        try:
+            from sglang.srt.layers.communicator import get_attn_tp_context
+
+            if get_attn_tp_context().input_scattered:
+                return None
+        except Exception:
+            return None
+        if getattr(hidden_states, "_sglang_needs_allreduce_fusion", False):
+            return None
+        try:
+            from custom_esimd_kernels_sglang import esimd_resadd_norm_gemv2_fp8_pert
+        except ImportError:
+            return None
+
+        # Cache row-major [N, K] fp8 qkv weight + per-tensor scale, the
+        # (1 + weight) Gemma norm weight, the reusable output/residual buffers,
+        # and a 1-row dummy second matrix (the deployed op fuses two matrices;
+        # the dummy contributes a discarded zero column but lets us reuse the op
+        # without a new kernel). All static after load.
+        cache = getattr(self, "_esimd_fa_norm_const", None)
+        if cache is None:
+            r0 = _esimd_fp8_weight_nk_scale(self.qkv_proj)
+            if r0 is None:
+                return None
+            w0, s0 = r0
+            K = hidden_states.shape[1]
+            if w0.shape[1] != K:
+                return None
+            nw = (
+                (self.input_layernorm.weight.data.to(torch.float32) + 1.0)
+                .to(torch.float16)
+                .contiguous()
+            )
+            o0 = torch.empty((1, w0.shape[0]), dtype=torch.float16, device=w0.device)
+            # 1-row dummy second matrix (zeros -> contributes nothing).
+            w1 = torch.zeros((1, K), dtype=w0.dtype, device=w0.device)
+            s1 = torch.ones((1,), dtype=torch.float32, device=w0.device)
+            o1 = torch.empty((1, 1), dtype=torch.float16, device=w0.device)
+            nr = torch.empty((1, K), dtype=torch.float16, device=w0.device)
+            cache = {
+                "nw": nw,
+                "w0": w0,
+                "s0": s0,
+                "w1": w1,
+                "s1": s1,
+                "o0": o0,
+                "o1": o1,
+                "nr": nr,
+            }
+            self._esimd_fa_norm_const = cache
+
+        h = (
+            hidden_states
+            if hidden_states.dtype == torch.float16
+            else hidden_states.to(torch.float16)
+        )
+        h = h.contiguous()
+        res = residual if residual.is_contiguous() else residual.contiguous()
+        try:
+            esimd_resadd_norm_gemv2_fp8_pert(
+                h,
+                res,
+                cache["nw"],
+                cache["w0"],
+                cache["s0"],
+                cache["o0"],
+                cache["w1"],
+                cache["s1"],
+                cache["o1"],
+                cache["nr"],
+                float(self.input_layernorm.variance_epsilon),
+            )
+        except Exception:
+            return None
+        new_residual = cache["nr"]
+        if captured_last_layer_outputs is not None:
+            captured_last_layer_outputs.append(new_residual.clone())
+        return cache["o0"], new_residual
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1449,46 +2756,93 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+        # Phase 5b: try to fuse input_layernorm (resadd + rmsnorm) into the
+        # qkv_proj GEMV, replacing prepare_attn's gemma_fused_add_rmsnorm launch.
+        # On a hit we get qkv + new_residual directly and feed qkv straight into
+        # self_attention, skipping prepare_attn and qkv_proj. Falls back to the
+        # standard prepare_attn path otherwise.
+        fused_qkv = None
+        if not forward_batch.forward_mode.is_idle():
+            fused_qkv = self._esimd_fused_input_norm_qkv(
                 hidden_states,
                 residual,
                 forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
+                captured_last_layer_outputs,
             )
-        )
 
-        if not forward_batch.forward_mode.is_idle():
+        if fused_qkv is not None:
+            qkv, residual = fused_qkv
             hidden_states = self.self_attention(
                 positions=positions,
-                hidden_states=hidden_states,
+                hidden_states=None,
                 forward_batch=forward_batch,
+                precomputed_qkv=qkv,
+            )
+        else:
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        if _NAN_PROBE: _nan_probe(
+            "full_attn_out",
+            hidden_states,
+            layer_id=self.layer_id,
+            forward_batch=forward_batch,
+            residual=residual,
         )
+        # Fully Connected
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
+
+        # Phase 3: fold the post_attention_layernorm (resadd + rmsnorm) into the
+        # fused MoE router kernel, removing a per-layer dispatch. Falls back to
+        # the standard prepare_mlp + mlp path when not applicable.
+        fused_mlp = None
         if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-            hidden_states = self.mlp(
+            fused_mlp = self.mlp.esimd_prepare_mlp_moe(
                 hidden_states,
+                residual,
+                self.post_attention_layernorm,
                 forward_batch,
                 use_reduce_scatter,
                 should_allreduce_fusion,
             )
+
+        if fused_mlp is not None:
+            hidden_states, residual = fused_mlp
         else:
-            hidden_states = self.mlp(
-                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
             )
+            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    use_reduce_scatter,
+                    should_allreduce_fusion,
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states, should_allreduce_fusion, use_reduce_scatter
+                )
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
@@ -1677,6 +3031,9 @@ class Qwen3_5ForCausalLM(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        if _NAN_PROBE:
+            _nan_probe_new_forward()
+            _nan_probe("embed_out", hidden_states, forward_batch=forward_batch)
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1694,6 +3051,13 @@ class Qwen3_5ForCausalLM(nn.Module):
                         else None
                     ),
                 )
+            if _NAN_PROBE: _nan_probe(
+                "layer_out",
+                hidden_states,
+                layer_id=layer_idx,
+                forward_batch=forward_batch,
+                residual=residual,
+            )
 
             # Process deepstack embeddings if provided
             if (

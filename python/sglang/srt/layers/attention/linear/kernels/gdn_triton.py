@@ -174,19 +174,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and hasattr(torch.ops.eagle_ops, "chunk_gated_delta_rule_extend")
         ):
             scale = float(q.size(-1)) ** -0.5
-            # Kernel contract: (q, k, v, g, beta, initial_state, cu_seqlens, scale)
-            # Returns (out [1, T, H_v, V], last_state [n_seqs, H_v, V, K]).
+            # Kernel contract: (q, k, v, g, beta, initial_state, cu_seqlens,
+            # scale, h_chunk_size) -> (out, last_state, h).
+            # h (per-chunk intermediate states) is only materialised when
+            # h_chunk_size > 0, i.e. when this batch actually has to write a
+            # mamba track snapshot at a non-chunk-aligned position.
             # g is fp32 log-space decay; kernel expects exactly that.
             # initial_state is IN/OUT: kernel mutates it to last_state.
+            h_chunk = int(kwargs.get("intermediate_chunk_size") or 0)
             state_in = recurrent_state.contiguous()
-            out, last_state = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
+            out, last_state, h = torch.ops.eagle_ops.chunk_gated_delta_rule_extend(
                 q.contiguous(), k.contiguous(), v.contiguous(),
                 g.contiguous(), beta.contiguous(),
                 state_in, query_start_loc.to(torch.int32).contiguous(),
-                scale,
+                scale, h_chunk,
             )
-            # Match chunk_gated_delta_rule_torch return: (o, last_recurrent_state, h_aux)
-            return out, last_state, None
+            return out, last_state, (h if h_chunk > 0 else None)
 
         return chunk_gated_delta_rule(
             q=q,
@@ -198,6 +201,11 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cu_seqlens=query_start_loc,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
+            **(
+                {"intermediate_chunk_size": kwargs["intermediate_chunk_size"]}
+                if is_xpu() and kwargs.get("intermediate_chunk_size")
+                else {}
+            ),
             **recurrent_state_indices_args,
         )
 

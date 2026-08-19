@@ -208,6 +208,108 @@ class XPUAttentionBackend(AttentionBackend):
         # XPU graph capture/replay state. Populated by init_cuda_graph_state.
         self._graph_state: dict = {}
 
+    def _build_sglang_decode_attn_inputs_eager(
+        self, forward_batch: ForwardBatch, metadata, tp_q_head_num: int, head_dim: int
+    ):
+        """Build the flat-NHD kv_indptr/kv_indices/temp_p inputs that
+        sglang_decode_attn needs, without requiring XPU device-graph capture
+        (SGL_XPU_ENABLE_GRAPH=1) to be enabled. init_forward_metadata_capture
+        only builds these when graphs are on, which left sglang_decode_attn
+        (the proven-correct kernel for GQA ratio=8 / single-KV-head configs)
+        unreachable in eager decode -- so decode silently fell back to the
+        numerically-wrong eagle_page_attn_decode / flash kernel instead.
+
+        Optimization (P0+P1) for the disable-XPU-graph path: the scratch
+        buffers (kv_indptr / kv_indices / temp_p) are kept as a single
+        *persistent, grow-only* cache reused across decode steps instead of
+        being re-allocated every step, and the per-step
+        ``int(kv_indptr[-1].item())`` device->host sync (which stalled the
+        CPU-GPU pipeline on every full-attention layer) is removed:
+        kv_indices is sized to the upper bound ``bs * max_seq_len_k`` (a CPU
+        int already available on ``metadata``, no device readback needed).
+        create_flashinfer_kv_indices_triton only writes into the ranges
+        indexed by kv_indptr, so an over-sized buffer is safe, and
+        sglang_decode_attn only reads the kv_indptr-delimited ranges."""
+        bs = forward_batch.batch_size
+        # kv_indptr/kv_indices/temp_p depend only on this step's cache_seqlens
+        # (batch-level), not on the attention layer, so they are identical for
+        # every full-attention layer in a decode step. ``metadata`` is a fresh
+        # object built once per step in init_forward_metadata, so memoizing the
+        # built inputs on it lets the first full-attn layer build them and the
+        # remaining layers reuse them -- removing ~9x (cumsum + kv_indptr fill +
+        # create_flashinfer_kv_indices) dispatched ops per step on the
+        # disable-XPU-graph path.
+        cached = getattr(metadata, "_eager_kv_inputs", None)
+        if cached is not None and cached[0].numel() == bs + 1:
+            return cached
+        device = metadata.cache_seqlens_int32.device
+        _SPLIT_TILE = 64
+        _MAX_N_SPLITS = 256
+        graph_max_seq = _SPLIT_TILE * _MAX_N_SPLITS  # 16384
+
+        # Upper bound on total kv entries this step: sum(seq_lens) <= bs * max_seq_len_k.
+        # max_seq_len_k is a plain python int already computed on the CPU-side
+        # seq_lens_cpu in init_forward_metadata, so reading it here costs no
+        # device synchronization (unlike kv_indptr[-1].item()).
+        max_seq_len_k = getattr(metadata, "max_seq_len_k", None)
+        if not isinstance(max_seq_len_k, int) or max_seq_len_k <= 0:
+            max_seq_len_k = self.max_context_len
+        need_kv = max(bs * max_seq_len_k, 1)
+        need_temp = max(bs * tp_q_head_num * _MAX_N_SPLITS * (1 + 1 + 256), 1)
+
+        # Persistent grow-only scratch: allocate once, reuse (and only grow)
+        # across decode steps. No per-step torch.empty, no per-bs rebuild.
+        cache = getattr(self, "_sglang_decode_eager_scratch", None)
+        if (
+            cache is None
+            or cache["kv_indptr"].numel() < bs + 1
+            or cache["kv_indices"].numel() < need_kv
+            or cache["temp_p"].numel() < need_temp
+        ):
+            cache = {
+                "kv_indptr": torch.zeros(
+                    max(bs + 1, 1), dtype=torch.int32, device=device
+                ),
+                "kv_indices": torch.empty(
+                    need_kv, dtype=torch.int32, device=device
+                ),
+                "temp_p": torch.empty(
+                    need_temp, dtype=torch.float32, device=device
+                ),
+            }
+            self._sglang_decode_eager_scratch = cache
+
+        kv_indptr = cache["kv_indptr"][: bs + 1]
+        kv_indices = cache["kv_indices"]
+        temp_p = cache["temp_p"]
+
+        kv_indptr[0] = 0
+        torch.cumsum(
+            metadata.cache_seqlens_int32,
+            dim=0,
+            dtype=torch.int32,
+            out=kv_indptr[1:],
+        )
+        from sglang.srt.layers.attention.triton_ops.kv_indices import (
+            create_flashinfer_kv_indices_triton,
+        )
+
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            metadata.cache_seqlens_int32,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+        result = (kv_indptr, kv_indices, temp_p, graph_max_seq)
+        try:
+            metadata._eager_kv_inputs = result
+        except Exception:
+            pass
+        return result
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Pre-allocate stable device buffers for XPU graph capture/replay."""
         max_num_pages = (self.max_context_len + self.page_size - 1) // self.page_size
@@ -1293,17 +1395,22 @@ class XPUAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             elif (
-                self._graph_state.get("temp_p") is not None
-                and not use_cascade_attn
+                not use_cascade_attn
                 and _sglang_decode_attn_fn is not None
-                and getattr(metadata, "kv_indices", None) is not None
                 and layer.head_dim == 256
                 and layer.tp_q_head_num % layer.tp_k_head_num == 0
                 and os.environ.get("SGL_XPU_DECODE_SGLANG_ATTN", "1") == "1"
             ):
                 # Proven-correct flat-NHD token-granular decode kernel. The paged
                 # eagle_page_attn_decode is numerically wrong for GQA ratio=8 /
-                # single-KV-head on this stack, so route graph decode here.
+                # single-KV-head on this stack, so route decode here instead.
+                # Prefer the graph-captured stable buffers when XPU device graphs
+                # are on (SGL_XPU_ENABLE_GRAPH=1); otherwise build the same
+                # flat-NHD kv_indptr/kv_indices/temp_p inputs on the fly for
+                # eager decode (they were previously only ever built inside
+                # init_forward_metadata_capture, which made this branch
+                # unreachable without graphs and silently pushed decode into the
+                # numerically-wrong kernel below).
                 B = forward_batch.batch_size
                 k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1314,16 +1421,32 @@ class XPUAttentionBackend(AttentionBackend):
                     k_buf = k_buf.to(torch.float16)
                     v_buf = v_buf.to(torch.float16)
                 o_fp16 = torch.empty_like(q_fp16)
+                if self._graph_state.get("temp_p") is not None and getattr(
+                    metadata, "kv_indices", None
+                ) is not None:
+                    kv_indptr = metadata.kv_indptr
+                    kv_indices = metadata.kv_indices
+                    temp_p = self._graph_state["sglang_temp_p"]
+                    graph_max_seq = self._sglang_decode_graph_max_seq
+                else:
+                    (
+                        kv_indptr,
+                        kv_indices,
+                        temp_p,
+                        graph_max_seq,
+                    ) = self._build_sglang_decode_attn_inputs_eager(
+                        forward_batch, metadata, layer.tp_q_head_num, layer.head_dim
+                    )
                 _sglang_decode_attn_fn(
                     q_fp16,
                     k_buf,
                     v_buf,
-                    metadata.kv_indptr,
-                    metadata.kv_indices,
+                    kv_indptr,
+                    kv_indices,
                     o_fp16,
                     float(layer.scaling),
-                    self._graph_state["sglang_temp_p"],
-                    self._sglang_decode_graph_max_seq,
+                    temp_p,
+                    graph_max_seq,
                 )
                 o = o_fp16.view(-1, layer.tp_q_head_num, layer.head_dim)
             elif self._graph_state.get("temp_p") is not None and not use_cascade_attn:
