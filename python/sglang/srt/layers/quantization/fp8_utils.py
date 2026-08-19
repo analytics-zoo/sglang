@@ -81,13 +81,14 @@ if _is_xpu:
 
 # opt#2 (W8A16): XPU prefill keeps the activation in fp16 (NO activation quant) and runs
 # a mixed f16 x f8 oneDNN matmul (fp8_gemm_w8a16, ported from analytics-zoo/vllm-xpu-kernels
-# and built standalone as mini_fp8_C). This drops the ENTIRE activation quant + dequant chain
+# and shipped in custom_esimd_kernels_sglang as onednn_fp8_gemm_w8a16; a standalone
+# mini_fp8_C.so build is still accepted as a fallback). This drops the ENTIRE activation quant + dequant chain
 # (vs opt#1's per-tensor quant + fused _scaled_mm epilogue) AND dispatches to a faster oneDNN
 # GEMM primitive (in-server 1.87x faster GEMM than torch._scaled_mm). Server A/B: gsm8k 0.975
 # (neutral), TTFT -32..37% vs opt#1, HITS the 4k=1500 / 8k=3500 targets. Decode (M<=64) still
 # early-returns via the ESIMD fast path (weight-only fp8, unaffected). This SUPERSEDES opt#1 and
 # is the DEFAULT XPU prefill path; it takes priority over opt#1 when both are on (checked first
-# in apply_fp8_linear). Falls back gracefully to opt#1 if mini_fp8_C.so is missing. Set
+# in apply_fp8_linear). Falls back gracefully to opt#1 if neither build is available. Set
 # SGLANG_XPU_FP8_W8A16_PREFILL=0 to disable and revert to opt#1.
 _XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
     "SGLANG_XPU_FP8_W8A16_PREFILL", "true"
@@ -95,20 +96,34 @@ _XPU_FP8_W8A16_PREFILL = _is_xpu and get_bool_env_var(
 _fp8_gemm_w8a16 = None
 if _is_xpu and _XPU_FP8_W8A16_PREFILL:
     try:
-        import glob as _glob
-
-        _cands = _glob.glob(
-            "/llm/workspace/sgl_gemma/fp8gemm_bench/mini_fp8_C*.so"
+        # Preferred: the op shipped inside custom_esimd_kernels_sglang
+        # (llm-scaler sglang/custom-esimd-kernels/csrc/xpu/onednn_w8a16).
+        from custom_esimd_kernels_sglang import (
+            onednn_fp8_gemm_w8a16 as _fp8_gemm_w8a16,
         )
-        if _cands:
-            torch.ops.load_library(_cands[0])
-            _fp8_gemm_w8a16 = torch.ops.mini_fp8.fp8_gemm_w8a16
-            logger.info("[opt#2] XPU FP8 W8A16 prefill = ON (mini_fp8_C loaded)")
-        else:
-            logger.warning("[opt#2] W8A16 requested but mini_fp8_C.so not found")
-    except Exception as _e:
-        logger.warning("[opt#2] W8A16 load failed, falling back to opt#1: %s", _e)
-        _fp8_gemm_w8a16 = None
+
+        logger.info(
+            "[opt#2] XPU FP8 W8A16 prefill = ON (custom_esimd_kernels_sglang)"
+        )
+    except Exception as _e_pkg:
+        # Fallback: standalone mini_fp8_C.so from the dev workspace.
+        try:
+            import glob as _glob
+
+            _cands = _glob.glob("/llm/workspace/sgl_gemma/fp8gemm_bench/mini_fp8_C*.so")
+            if _cands:
+                torch.ops.load_library(_cands[0])
+                _fp8_gemm_w8a16 = torch.ops.mini_fp8.fp8_gemm_w8a16
+                logger.info("[opt#2] XPU FP8 W8A16 prefill = ON (mini_fp8_C loaded)")
+            else:
+                logger.warning(
+                    "[opt#2] W8A16 requested but neither custom_esimd_kernels_sglang "
+                    "(%s) nor mini_fp8_C.so is available",
+                    _e_pkg,
+                )
+        except Exception as _e:
+            logger.warning("[opt#2] W8A16 load failed, falling back to opt#1: %s", _e)
+            _fp8_gemm_w8a16 = None
 
 # Lazy-loaded handle to the merged custom_esimd_kernels_sglang
 # esimd_gemm_fp8_pert kernel wrapper.

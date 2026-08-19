@@ -81,6 +81,13 @@ try:
 except ImportError:
     pass
 
+# Diagnostic kill switch: the three fused-norm fast paths above have no
+# individual env gate, so this disables all of them at once for A/B isolation.
+if os.environ.get("SGLANG_GEMMA4_DISABLE_ESIMD_NORM", "0") == "1":
+    _esimd_fused_add_rms_norm = None
+    _esimd_rmsnorm_residual_scalar = None
+    _esimd_norm_add_norm = None
+
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
 # SGLang assumes exclusive
@@ -454,6 +461,9 @@ class Gemma4Attention(nn.Module):
             and qkv.dtype == torch.float16
             and not is_kv_shared
             and qkv.is_contiguous()
+            # The kernel's fused V branch is a weight-free RMSNorm, so it only
+            # matches Gemma4's canonical v_norm (with_scale=False).
+            and not self.v_norm.with_scale
             and os.environ.get("SGLANG_DISABLE_ESIMD_QKV", "0") != "1"
         )
         if _use_esimd_qkv:
@@ -485,6 +495,10 @@ class Gemma4Attention(nn.Module):
                 False,  # attn_output_gate
                 rotary_dim,
                 cs_cache,
+                True,  # normalize_v — MUST be passed explicitly: the op defaults
+                       # to False (Qwen3 compatibility), and Gemma4 requires the
+                       # weight-free V RMSNorm that the non-ESIMD path applies
+                       # via gemma_qkv_rmsnorm(q, k, v, ...).
             )
             # V norm is now fused into the ESIMD kernel (V branch does RMSNorm,
             # with_scale=False → pure norm, no weight multiply). No separate call.
