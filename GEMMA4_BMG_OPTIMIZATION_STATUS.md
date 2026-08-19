@@ -259,6 +259,54 @@ BODY is the trigger. These ESIMD kernels sit at the GRF ceiling (see VL512 note:
 comparisons perturb module splitting past what the AOT flow accepts (per_kernel
 split is already on). Host-side windowing sidesteps this entirely.
 
+## ✅ FIXED (2026-08-20): DPAS prefill 忽略 Gemma4 sliding-window 下界
+
+**引入点不是 merge 本身，而是新启动配置。** PR #1 基线已经包含 opt-in
+`SGL_XPU_PREFILL_DPAS` 分支，但 2026-07-06 的 shippable 启动块没有开启它。
+`llm-scaler` commit `c08a2d0` 照抄 Qwen3.6 启动脚本，首次在 Gemma4 上强制
+`SGL_XPU_PREFILL_DPAS=1`，于是 50/60 个 `head_dim=256` sliding 层改走该 op。
+
+这条 DPAS kernel 只实现 full causal attention：
+
+- op 参数只有 `q/key_cache/value_cache/cu_seqlens_q/seq_lens/is_causal/scale/block_table`，
+  没有 `window_left`；
+- kernel 的 mask 只有 `kv_pos <= causal_bound` 上界，没有
+  `kv_pos >= q_pos - sliding_window` 下界；
+- Python 路径仍传完整 `cache_seqlens`。超过 1024 token 后，它会访问窗外位置，
+  而 SWA pool 中这些位置的 full→SWA 映射已经回收/复用。
+
+独立 2k kernel UT（FP16、HD256、Q=128、KV=2048、window=1023）：
+windowed flash 对 PyTorch SWA 参考 cosine=`0.99999994`；DPAS 对同一参考只有
+`0.70322025`。这不是模型采样波动，而是 attention 语义不一致。
+
+**修复**：`xpu_backend.py` 的 DPAS gate 增加 `not is_hybrid_swa`。DPAS 仍可用于
+非滑窗 HD256 模型；Gemma4 sliding 层回到能接收 `window_size` 的
+`flash_attn_with_kvcache`。同时从两个 Gemma4 启动脚本删除误加的 DPAS env。
+W8A16 prefill、ESIMD QKV `normalize_v=True` 和后面的 SWA decode 修复均保持不变。
+
+**端到端验证（故意保留 `SGL_XPU_PREFILL_DPAS=1`，证明 Python guard 生效）：**
+
+- 原始 2373-token doc-QA 在修复前把 `March 14th` 答成 `March 4th`；修复后同一
+  prompt、chat template 和 greedy 参数精确返回 `March 14th` 与
+  `checksum errors`。
+- 原始 2782-token passphrase case 在修复前返回 `violet-passphrase7`；修复后
+  精确返回 `violet-harbor-77`。
+- BFCL v4 `multi_turn_base` 官方全量 generate + evaluate：
+  **146/200 = 73.0%**（验收线 60%，历史基线 145/200 = 72.5%）。正式配置为
+  radix on、`swa_full_tokens_ratio=0.2`、8 并发；全程 0 retract、0 NaN/assert。
+- 正确路径的 bsz=1 runtime bench（radix off、ratio=0.05、max-running=1，
+  warmup=2、trials=3、out=256）：
+
+| input | TTFT (ms) | TPOT (ms) | decode tok/s | E2E (s) |
+|---:|---:|---:|---:|---:|
+| 1024 | 349.7 | 40.39 | 24.8 | 10.65 |
+| 2048 | 684.1 | 40.60 | 24.6 | 11.04 |
+| 4096 | 1382.9 | 40.99 | 24.4 | 11.84 |
+| 8192 | 2906.9 | 41.78 | 23.9 | 13.56 |
+
+固定后的 TPOT 仍在本文已记录的 eager 约 39–43ms band；因历史 DPAS 数字来自
+错误输出路径，不用它计算性能 delta。
+
 ## ✅ FIXED (2026-08-19): 同一个 SWA 窗口 bug 还存在于**真正在跑的那条 decode 路径**（sglang_decode_attn）
 
 上面 2026-07-06 那节修的是 `page_attn_decode`（paged 路径）。但**当前 stack 根本不走那条路**：

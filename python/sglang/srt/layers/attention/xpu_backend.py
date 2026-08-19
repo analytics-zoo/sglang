@@ -103,11 +103,10 @@ except ImportError:
     pass
 
 # PTL-proven fp16 prefill SDPA DPAS kernel (custom_esimd_kernels_sglang, HD=256).
-# Replaces the cutlass-sycl flash fp16 prefill (which NaNs on Xe / produces
-# garbage prefill logits) for head_dim==256 fp16. Lazily resolved; gated by
-# SGL_XPU_PREFILL_DPAS=1. Op namespace is custom_esimd_kernels_vllm (unchanged
-# from the ported kernel). Falls through to flash_attn_with_kvcache when the op
-# is unavailable / ineligible.
+# It implements full causal attention only, so hybrid-SWA layers must stay on
+# flash_attn_with_kvcache until the DPAS op accepts a sliding-window bound.
+# Lazily resolved; gated by SGL_XPU_PREFILL_DPAS=1. Op namespace is
+# custom_esimd_kernels_vllm (unchanged from the ported kernel).
 _prefill_dpas_op = None
 _prefill_dpas_tried = False
 
@@ -1126,11 +1125,10 @@ class XPUAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            # 腿C (#69): for fp16 HD=256 prefill, prefer the PTL-proven DPAS SDPA
-            # kernel over the cutlass-sycl flash fp16 path (which NaNs / produces
-            # garbage prefill logits on this Xe stack). Gated by
-            # SGL_XPU_PREFILL_DPAS=1; falls through to flash_attn_with_kvcache when
-            # off / ineligible / op missing.
+            # For full-attention fp16 HD=256 prefill, optionally prefer the
+            # PTL-proven DPAS SDPA kernel. The op has no sliding-window argument:
+            # routing an SWA layer through it attends [0, q_pos] instead of
+            # [q_pos-window, q_pos] and can read evicted SWA mappings.
             _dpas = (
                 _get_prefill_dpas_op()
                 if (
@@ -1139,6 +1137,7 @@ class XPUAttentionBackend(AttentionBackend):
                     and layer.head_dim == 256
                     and not layer.is_cross_attention
                     and not use_cascade_attn
+                    and not is_hybrid_swa
                 )
                 else None
             )
