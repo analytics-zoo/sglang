@@ -259,6 +259,30 @@ BODY is the trigger. These ESIMD kernels sit at the GRF ceiling (see VL512 note:
 comparisons perturb module splitting past what the AOT flow accepts (per_kernel
 split is already on). Host-side windowing sidesteps this entirely.
 
+## ✅ FIXED (2026-08-19): 同一个 SWA 窗口 bug 还存在于**真正在跑的那条 decode 路径**（sglang_decode_attn）
+
+上面 2026-07-06 那节修的是 `page_attn_decode`（paged 路径）。但**当前 stack 根本不走那条路**：
+
+- `SGL_XPU_DECODE_SGLANG_ATTN` 默认 `1`，gate 是 `layer.head_dim == 256`，即**所有 50 个 sliding 层**的 decode 都走 `_sglang_decode_attn_fn`。
+- 而且本镜像的 ESIMD wheel **没有 `page_attn_decode` 这个 op**（实测 `custom_esimd_kernels_sglang` 89 个 op 中不含），所以 `_use_esimd_pa` 恒为 False —— paged 分支和它那段窗口修复都是**死代码**。
+
+`_build_sglang_decode_attn_inputs_eager` 的 `kv_indptr/kv_indices` 用**全池** `req_to_token` + 完整 `cache_seqlens` 构建，然后拿去索引 **SWA 池**的 k/v buffer，两个缺陷叠加：
+
+1. **没有窗口裁剪**：sliding 层遍历全部 `[0, seq_len)`，而只有末尾 `window` 个 token 还驻留；
+2. **索引空间错误**：`req_to_token` 存的是 full-pool 槽位号，未经 `translate_loc_from_full_to_swa` 转换。槽位号一旦超过 SWA 池大小（本配置 18240）就**越界读**。
+
+**症状**：某个 sliding 层（实测稳定是 layer 4）的 `core_attn_out` 突然全 NaN → 整条请求 logits 全 NaN。
+- **贪心解码时静默**：argmax 对 NaN 不报错，只是输出垃圾（BFCL 表现为 "Empty response from the model"，结果长度 13–31）。
+- **温度采样时炸**：`torch.multinomial` 的异步断言触发（`TensorCompareKernels.cpp:180: Assertion input_[0] != 0`），server 死，且**把 XPU context 弄成 wedged**——下次启动会卡在 `torch.xpu.empty_cache()` / `_move_module_tensors_to_device`，**容器要重启两次**才恢复。
+
+**定位过程中被实测排除的因素**（都不是原因）：`swa_full_tokens_ratio`(0.2 vs 0.4)、并发(threads 1 vs 4)、radix cache(SWARadixCache vs SWAChunkCache)、全部 ESIMD fast path（QKV / decode / page attn / fused norm 全关仍复现）、KV cache 内容本身（实测 layer4 整个 KV buffer `nonfinite=0`，`|k|<=0.91`、`|v|<=16`）。**长上下文本身也不是充分条件**：单条 4k/8k/14k/22k 合成 prompt 贪心解码 logprob 全有限——因为那时分配到的槽位号还没超过 SWA 池大小。
+
+**修复**（`xpu_backend.py`，commit `a8d3bae93e`）：sliding 层单独构建 kv 输入——按 `min(seq_len, window)` 裁长度、用 triton builder 的 `kv_start_idx` 从 `seq_len - len` 起始、再经 `translate_loc_from_full_to_swa` 转换槽位；full-attention 层不变，两者分开 memoize。同时把已有的 window view 也接到 split-K fallback（它同样接受 head_dim 256）。
+
+**验证**：BFCL smoke 5/5 OK（修复前 5/5 connection error）；gsm8k_chat_eval n=100 = **0.980**；bench 同配置背靠背 **TPOT 8192×256 47.15 → 41.78ms（-11.4%）**、4096 42.07 → 41.00ms，TTFT 不变（改动只影响 decode）。BFCL 生成速率 0.25 条/分 → **10.5 条/分**。
+
+**教训**：`page_attn_decode` 缺失是静默的（`is not None` 判空后直接换路径），所以"给 paged 路径修了 SWA 窗口"这件事对交付配置**零效果**。改 attention 相关代码前，先确认**哪条分支真的在跑**（读 gate + 确认 op 是否存在于 wheel）。
+
 ## ✅ BFCL v4 multi_turn_base FORMAL BENCHMARK (2026-07-06): FULL 200 = 72.50% (radix on)
 
 Ran the official BFCL kit pipeline (`bfcl generate` → tool execution → `bfcl
