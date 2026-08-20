@@ -3765,6 +3765,7 @@ class ServerArgs:
         2) Storage <-> layout compatibility (may rewrite layout).
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
+        5) Reject combinations this accelerator cannot execute (XPU).
         """
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
@@ -3785,6 +3786,83 @@ class ServerArgs:
         # Step 4: Re-normalize layout after io backend changes.
         if io_changed:
             self._resolve_layout_io_compatibility()
+
+        # Step 5: reject what XPU cannot execute. This runs LAST, on the fully resolved
+        # values, because steps 1-4 rewrite both knobs: page_first_direct silently
+        # selects io_backend="direct", so a user who never typed "direct" can still land
+        # on the unimplemented path.
+        self._reject_unsupported_xpu_hicache()
+
+    def _reject_unsupported_xpu_hicache(self):
+        """Fail fast on HiCache layouts / IO backends not yet validated on XPU.
+
+        On the 'direct' family, correcting an earlier claim in this file: those ops are
+        NOT missing on XPU. sgl-kernel-xpu implements transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf and transfer_kv_all_layer_direct_lf_pf as
+        Group B Python fallbacks built on page-by-page torch.Tensor.copy_(
+        non_blocking=True) -- see sgl_kernel/kvcacheio.py:322 _transfer_page_direct --
+        because XPU has no equivalent of cudaMemcpyBatchAsync. Verified against the
+        installed package: transfer_kv_direct contains no torch.ops.sgl_kernel call, so
+        the AttributeError this guard used to predict cannot occur.
+
+        They are therefore blocked for being *unvalidated on XPU*, not unimplemented, and
+        the expectation is 'works but slower' (one copy_ per page instead of one batched
+        submission). Measuring that is a TODO. Set SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1
+        to downgrade this to a warning so the path can be evaluated without editing code;
+        results from that configuration are not supported.
+        """
+        if not is_xpu():
+            return
+
+        # XPU currently validates only these two layouts. The others are not blocked
+        # because they are known-broken -- they are simply unverified, and two of them
+        # route to kernels that do not exist:
+        #   page_first_direct  -> silently selects io_backend="direct" (step 1)
+        #   page_first_kv_split, page_head -> untested on XPU
+        _XPU_SUPPORTED_LAYOUTS = ("layer_first", "page_first")
+
+        # Report the RESOLVED pair, and say so. Because this guard deliberately runs last,
+        # the values it sees may not be the ones the user typed: `--hicache-io-backend
+        # direct` is rewritten by _resolve_layout_io_compatibility() into
+        # hicache_mem_layout="page_first_direct". Naming only the layout in that case tells
+        # a user who never mentioned a layout that their layout is wrong.
+        resolved = (
+            f"(resolved: --hicache-mem-layout {self.hicache_mem_layout} "
+            f"--hicache-io-backend {self.hicache_io_backend}; note that these two flags "
+            f"rewrite each other, so this pair may differ from what you passed)"
+        )
+        # An escape hatch, so "unvalidated" does not become "unmeasurable". A hard error
+        # on an unvalidated-but-working path would force the next person to patch this
+        # file to evaluate it, and patched-source results are not comparable.
+        allow_unvalidated = (
+            os.environ.get("SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE", "0") == "1"
+        )
+
+        def _reject(msg: str):
+            if allow_unvalidated:
+                logger.warning(
+                    "SGLANG_XPU_ALLOW_UNVALIDATED_HICACHE=1, proceeding anyway: %s", msg
+                )
+                return
+            raise ValueError(msg)
+
+        if self.hicache_mem_layout not in _XPU_SUPPORTED_LAYOUTS:
+            _reject(
+                f"--hicache-mem-layout '{self.hicache_mem_layout}' is not validated "
+                f"on XPU yet. Validated: {', '.join(_XPU_SUPPORTED_LAYOUTS)}. "
+                "Note 'page_first_direct' also switches the IO backend to 'direct'. "
+                + resolved
+            )
+        if self.hicache_io_backend == "direct":
+            _reject(
+                "--hicache-io-backend 'direct' is not validated on XPU. It is "
+                "implemented -- sgl-kernel-xpu provides the direct-family ops as "
+                "page-by-page torch copy_ fallbacks, since XPU has no "
+                "cudaMemcpyBatchAsync equivalent -- but it is untested here and expected "
+                "to be slower than the batched path. Use --hicache-io-backend kernel "
+                "(the default), which is validated across all three cache tiers. "
+                + resolved
+            )
 
     def _resolve_layout_io_compatibility(self):
         if (

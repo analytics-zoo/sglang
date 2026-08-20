@@ -34,6 +34,16 @@ class HiCacheStorageConfig:
     model_name: Optional[str]
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
+    # An L3 entry is only readable by a server with identical KV geometry. Without these
+    # two, a server running --kv-cache-dtype fp8_e5m2 and one running bf16 -- same model,
+    # same TP -- derive IDENTICAL keys for differently-encoded KV, and the second reads
+    # the first's bytes under the wrong interpretation. That produces fluent, wrong
+    # output rather than an error. page_size has the same problem: it changes how many
+    # tokens a page holds, so the payload length differs for the same key.
+    # Optional with None defaults so third-party HiCacheStorage backends that construct
+    # this dataclass positionally keep working.
+    kv_cache_dtype: Optional[str] = None
+    page_size: Optional[int] = None
     extra_config: Optional[dict] = None
 
 
@@ -336,6 +346,17 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_{tp_rank}_{tp_size}"
         if enable_pp:
             self.config_suffix += f"_{pp_size}_{pp_rank}"
+
+        # KV geometry: see the note on HiCacheStorageConfig. Appended only when known, so
+        # a caller that cannot report the geometry keys on the fields it does know rather
+        # than on the literal string "None". Note that once a caller DOES report them the
+        # keys change, so an L3 directory written before this lands is not readable by a
+        # server after it -- that is a one-off cold cache, not a corrupted read.
+        if storage_config.kv_cache_dtype is not None:
+            self.config_suffix += f"_dt{storage_config.kv_cache_dtype}"
+        if storage_config.page_size is not None:
+            self.config_suffix += f"_ps{storage_config.page_size}"
+
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")

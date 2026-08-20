@@ -46,7 +46,17 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if _is_cuda or _is_hip:
+# XPU: sgl-kernel-xpu (PR #261, 2026-07-29) implements the kvcacheio transfer ops for
+# torch::kXPU using the SAME names and signatures, so the io_backend=="kernel" dispatch
+# below works unmodified -- no separate xpu branch is needed (unlike Ascend, whose kernel
+# signature genuinely differs).
+# NOTE: 3 of the 13 ops (the "direct" family) are Python bindings with NO SYCL
+# implementation. Importing them is safe; CALLING them raises AttributeError. ServerArgs
+# rejects --hicache-io-backend direct on XPU so they are never reached.
+# NOTE: this is the fallback path on XPU in a second sense too -- the fork's fused
+# sglang.jit_kernel.hicache kernels are gated on `_is_cuda` (see can_use_jit below), so
+# XPU always takes the kvcacheio route these imports provide.
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
@@ -222,8 +232,30 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
+        # XPU: torch.empty(..., pin_memory=True) works and reports is_pinned()==True.
+        # Without this entry the defaultdict falls through to alloc_with_host_register,
+        # which calls torch.cuda.cudart() and raises on an XPU box -- so HiCache cannot
+        # start at all.
+        "xpu": alloc_with_pin_memory,
     },
 )
+
+
+def get_alloc_func(device):
+    """Host-buffer allocator for a device, keyed by device TYPE.
+
+    ALLOC_MEMORY_FUNCS is keyed by bare type ("npu", "musa", "xpu"), but callers pass
+    `device_pool.device`, which carries an index whenever the pool was built with an
+    explicit ordinal:
+
+        device="xpu"    -> "xpu"    -> hits the table
+        device="xpu:0"  -> "xpu:0"  -> MISSES, falls through to the CUDA default and
+                                       raises "Torch not compiled with CUDA enabled"
+
+    That silently affects npu and musa exactly the same way. Normalise here so every
+    non-CUDA backend gets its intended allocator regardless of how `device` was spelled.
+    """
+    return ALLOC_MEMORY_FUNCS[torch.device(device).type]
 
 
 class HostKVCache(abc.ABC):
@@ -463,7 +495,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_func(self.device_pool.device)
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -991,7 +1023,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.page_size,
                 1,
             )
-            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            alloc_func = get_alloc_func(self.device_pool.device)
             self.k_buffer = alloc_func(
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
@@ -1023,7 +1055,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self.token_stride_size = self.kv_cache_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_func(self.device_pool.device)
         buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -1388,7 +1420,7 @@ class MambaPoolHost(HostKVCache):
         self.clear()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_func(self.device_pool.device)
 
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
@@ -1920,7 +1952,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = get_alloc_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -2270,7 +2302,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 f"{available_bytes / 1e9:.2f} GB free."
             )
 
-        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        alloc_func = get_alloc_func(self.gpu_device)
         self.data_refs = []
         if self.layout == "layer_first":
             self.kv_buffer = [
@@ -2789,7 +2821,7 @@ class DSAIndexerPoolHost(HostKVCache):
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = get_alloc_func(self.device_pool.device)
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_pool.index_k_with_scale_buffer],
             dtype=torch.uint64,
