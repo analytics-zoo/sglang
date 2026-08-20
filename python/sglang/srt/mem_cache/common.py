@@ -74,7 +74,10 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
-    if support_triton(get_global_server_args().attention_backend):
+    if (
+        support_triton(get_global_server_args().attention_backend)
+        and torch.device(req_to_token_pool.device).type != "xpu"
+    ):
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,

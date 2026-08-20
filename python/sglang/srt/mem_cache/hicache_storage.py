@@ -42,9 +42,9 @@ class HiCacheStorageConfig:
     # tokens a page holds, so the payload length differs for the same key.
     # Optional with None defaults so third-party HiCacheStorage backends that construct
     # this dataclass positionally keep working.
+    extra_config: Optional[dict] = None
     kv_cache_dtype: Optional[str] = None
     page_size: Optional[int] = None
-    extra_config: Optional[dict] = None
 
 
 @dataclass

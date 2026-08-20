@@ -1,5 +1,153 @@
 # Gemma4-31B FP16 FP8 Decode Optimization Status (BMG TP=2)
 
+## UPDATE (2026-08-20): Gemma4-26B-A4B TP=2 online FP8
+
+Work is based on the post-merge `analytics-zoo/sglang:dev-bmg`,
+`analytics-zoo/sgl-kernel-xpu:dev-bmg`, and `intel/llm-scaler:main` branches.
+The model has 30 decoder layers, hidden size 2816, 128 experts, top-k 8, and
+MoE intermediate size 704 (352 per TP=2 rank).
+
+### Implemented path
+
+- Online-FP8 routed GELU-tanh MoE supports both E4M3 and E5M2.
+- Decode consumes raw router logits and fuses top-k, route scaling, eight expert
+  up/GELU/down paths, accumulation, and the TP allreduce handoff.
+- Prefill uses the M-tiled DPAS expert kernels plus the production ESIMD top-k.
+- Decode-only ESIMD fusion covers input RMSNorm+QKV GEMV, post-attention
+  norm+residual+pre-FF norm+dense gate/up/GELU, and router norm+GEMV+MoE-input
+  norm.
+- Batched ESIMD dual RMSNorm covers both prefill and decode; the final XPU
+  request trace has no Gemma or infrastructure Triton kernel.
+- The Gemma fused fast path requires one FP32 scalar scale per expert;
+  block-quant checkpoints retain the existing block-aware fallback. The
+  supported checkpoint dynamically quantizes BF16 fused expert weights to the
+  scalar-scale format.
+
+The first E4M3 end-to-end run emitted only `<pad>`. Layer probes located the
+first non-finite value at layer-0 `moe_out`: a finite gate value of 23.8125
+entered `(exp(2*z)-1)/(exp(2*z)+1)`, producing `inf/inf`. Clamping `2*z` to
+`[-30, 30]`, matching the root-cause fix in `intel/llm-scaler#574`, fixes
+E4M3/E5M2 decode and prefill.
+
+### Kernel and model correctness
+
+- The final kernel suite has 21 tests covering E4M3/E5M2, direct and prefill
+  MoE, overflow gates, raw-logits decode, fused dense/router/QKV/dual-norm
+  kernels, production top-k, and int32/int64 KV request indices.
+- The reviewed sgl-kernel wheel also passes all 229 KVCacheIO tests, including
+  rejection of CPU/non-contiguous metadata and unaligned page-head layouts.
+- E4M3 answers the arithmetic sanity prompt correctly and recalls
+  `XPU-MOE-FINAL-E4` from a real 7705-token chat prompt.
+- E5M2 answers the arithmetic sanity prompt correctly and recalls
+  `XPU-MOE-FINAL-E5` from the same long-context test.
+- BFCL v4 `multi_turn_base` formal results are **128/200 = 64.00%** for both
+  E4M3 and E5M2, above the required 60%. Both runs completed with zero
+  inference errors and left the server healthy. The checkpoint emits native
+  `call:name(...)` syntax, so the vendored Gemma handler normalizes it to
+  BFCL's `[name(...)]` form before execution.
+
+### Long-run BFCL non-finite root cause
+
+The first E4M3 full run exited after a delayed prefill non-finite value. The
+failure was not resolved by synchronizing large or all collectives, cloning
+allreduce buffers, disabling W8A16 prefill, or synchronizing the M-tiled MoE
+kernel. Forcing direct MoE changed the trigger, but was not a production fix.
+
+The 0818 base image actually loaded pip-provided oneCCL **2021.17.2** through
+`libtorch_xpu.so`'s RPATH. The llm-scaler Dockerfile requires **2021.15.9** and
+links the torch-visible `libccl.so.1` to
+`/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0`. After restoring that runtime:
+
+- dynamic TP=2 allreduce passed 1000 iterations;
+- production M-tiled MoE prefill followed by XCCL passed 3000 iterations;
+- the original cases 94-168 completed in one server process (75/75, zero
+  inference errors, zero non-finite probes);
+- E4M3 and E5M2 each completed the formal 200-case BFCL run with zero
+  inference errors.
+
+The ineffective sync/clone/direct-MoE diagnostic switches were removed. Derived
+images must preserve the Dockerfile's oneCCL 2021.15.9 link; installing a
+package that restores 2021.17.2 invalidates this configuration.
+
+### Canonical performance
+
+Radix-off, `max-running-requests=1`, bsz=1, two warmups, three trials, median:
+
+| input | baseline TPOT | final TTFT | final TPOT | decode tok/s |
+|---:|---:|---:|---:|---:|
+| 1024 | 37.18 ms | 121.6 ms | **17.37 ms** | 57.6 |
+| 2048 | 37.24 ms | 242.4 ms | **17.54 ms** | 57.0 |
+| 4096 | 37.12 ms | 491.6 ms | **17.60 ms** | 56.8 |
+| 8192 | — | 1024.0 ms | **17.47 ms** | 57.2 |
+
+These final numbers use the shippable oneCCL 2021.15.9 runtime after removing
+all diagnostic synchronization. The path is about **2.11-2.14x** faster than
+the original 37.2 ms path and clears the requested `<20 ms` target at every
+canonical context length. E5M2 is likewise flat at **17.16/17.21/17.27/17.34
+ms** for 1K/2K/4K/8K.
+
+These numbers were revalidated from the reviewed final image. Both FP8 formats
+returned `42` for chat sanity, and the live TP0 scheduler mapped
+`/opt/intel/oneapi/ccl/2021.15/lib/libccl.so.1.0`.
+
+The initial profiler-based claim that allreduce was the primary remaining
+bottleneck was wrong. An exact TP=2 `[1,2816]` microbenchmark measures one
+allreduce at about 57 us; 90 launches cost about 5.1 ms per step. The original
+MoE kernel costs about 3 ms/step and the four projection GEMVs about 4 ms/step.
+The recoverable gap was primarily hundreds of eager launches and Python
+dispatch around norm/router/MLP chains, not collective self-time.
+
+The optimization sequence was approximately 37.2 -> 30.0 -> 25.3 -> 23.1 ->
+21.0 -> 20.5 -> 17.5 ms as router, full-MoE, dense, QKV, MoE-down accumulation,
+and final norm chains were fused. Replacing the remaining KV-index Triton
+kernel with native SYCL gives the final 17.1-17.2 ms result.
+
+### Triton audit
+
+Trace
+`gemma26-triton-free-v2-profile/1787211431.66563-TP-0.trace.json.gz`
+contains one prefill plus 64 decode forwards and 38,892 kernel events:
+
+- `DualRmsNormResidualScalarKernel`: 1950
+- `MoE_TopK_V2_Kernel`: 1950
+- `MoeUpDecodeGeluTanh`: 1920
+- `MoeDownAccumulateDecode`: 1920
+- `XpuCreateKvIndicesKernel`: 64
+- names containing `triton` or the old `_gemma*` fallbacks: **0**
+
+Batched dual RMSNorm microbenchmarks are 8.3 us vs 22.2 us at M=32 and
+14.4 us vs 37.4 us at M=1024 (ESIMD vs Triton). The native KV-index builder is
+5.55 us vs 15.66 us at bs=1, length=1024, and 5.60 us vs 14.88 us at length
+4096.
+
+### 8K prefill observation
+
+An earlier synthetic 8K request stalled after four 1024-token chunks. That was
+recorded as an observation rather than attributed to a kernel because a 7.7K
+real-text recall request already worked. The final path no longer reproduces
+the stall: the canonical 8192-input, 256-output benchmark completes with
+1024.0 ms median TTFT and 17.47 ms TPOT.
+The original one-off stall remains unassigned; it is not evidence that 8K or
+the M-tiled MoE path is unsupported.
+
+### Workload-specific launch profiles
+
+The launch configuration is now persisted as separate scripts in llm-scaler:
+
+- `run_gemma4_26b_moe_canonical.sh`: radix off, max-running=1; use only for
+  fixed-length bsz=1 latency.
+- `run_gemma4_26b_moe_bfcl.sh`: radix on, SWA full-token ratio 0.2,
+  max-running=1; use for BFCL cumulative multi-turn prompts.
+- `run_gemma4_26b_moe.sh`: radix-on serving default with an explicit
+  `GEMMA4_WORKLOAD_PROFILE` banner.
+
+Switching profiles requires a full container restart. A BFCL full run was
+mistakenly started on the canonical radix-off server: each case made 5-14
+generations with cumulative 6.6K-11.5K-token prompts, causing the entire history
+to be re-prefilled every step. The first 92 completed rows remain valid for
+accuracy and are resumed on the radix-on profile; their latency must not be used
+as BFCL performance data.
+
 ## ✅ UPDATE (2026-07-08): Gemma4 MTP 在 BMG/XPU 已打通（GAP AUDIT 中的阻塞项已解决）
 
 **结果（同一 build、背靠背、同一 harness，rule-2 合规 A/B）：**
@@ -92,19 +240,19 @@ python3 -m sglang.launch_server \
 1. **workload-specific accept_len 塌**（跟 bs 无关）：BFCL bs=1 accept_len 已经只有 1.0–2.4，bs=2/4 也是 1.00–1.25。gsm8k bs=1/2/4 全部 3+。差异在 workload 本身：BFCL 输出高度结构化 tool_call（`[cd(folder='document'), ...]`），具体参数值不可预测；gemma-4 chat template 里 tool_call 前后有特殊 marker，assistant/target 对这些位置的分布分歧大。**这不是 XPU 或 spec 实现的 bug，是 draft 与 target 对 tool-call 语言的一致性差。**
 
    **实测证据（2026-07-08，`analyze_mtp_dump.py`，MTP bs=1 各跑 1 条 gsm8k 和 1 条 BFCL multi_turn_base_0）：**
-   
+
    | workload | steps | avg accept_len | accept_rate | pos0 拒率 | pos1 拒率 | pos2 拒率 |
    |---|---|---|---|---|---|---|
    | gsm8k | 204 | 2.108 | 0.369 | 0.490 | 0.667 | 0.735 |
    | BFCL | 584 | **1.120** | **0.040** | **0.901** | **0.990** | **0.990** |
-   
+
    BFCL 上 draft 的第一个 token 就有 90% 概率被拒，第 2/3 位几乎不可能命中。看被拒 target token 的分布（top-20 出现频次）：
    - **具体参数 payload**：`'pdf'`(64), `'report'`(62), `'final'`(54), `'analysis'`(40), `'temp'`(30), `'budget'`(30), `'content'`(26) —— 每例独有的文件名/字段值，assistant 4 层小模型无法从上下文预测；
    - **tool_call 语法 delimiter**：`'_'`(84), `"='"`(80), `" '"`(66), `"'"`(54), `'('`(44), `"',"`(22), `"')]"`(22) —— tool_call 结构符号序列；
    - **chat template 结构 marker**：`'<turn|>'`(38) —— gemma-4 template 的 turn boundary，每次 tool_call 结束都要正确 emit，draft 判断能力弱。
-   
+
    对比 gsm8k 被拒 top-20 包含 `' day'`, `' used'`, `' remaining'`, `' the'`, `' of'`, `' to'` 等自然语言高频词，assistant 至少能猜对相当比例（accept_rate 37%）。
-   
+
    BFCL 单条请求共生成 654 tokens、88 个 unique token，top 30 里几乎全是 `_ = ' ( 'pdf' 'report' 'final' Year` 之类 payload/语法，**结构上就是"低 self-consistency"的高熵序列**——每个 token 都在 encoding 独有信息，assistant 猜不到不是 bug，是 draft 模型自身能力上限（`num_hidden_layers=4`, `hidden=1024`）+ workload 特性。
 
 2. **bs=8 + BFCL hang（bs≤4 相同 workload 不 hang；同 bs=8 但 gsm8k workload 不 hang）**：BFCL bs=4 accept 也塌到 1.00，但没 hang（93s 跑完 10 例）；后续用 gsm8k n=200 parallel=8 复测，**同 server config 但换 gsm8k workload 也不 hang**（299.9s 顺跑，见下 §gsm8k bs=8 A/B）。所以 hang **同时需要 bs=8 + BFCL 长累积 context**（每 turn 追加 tool_call 结果，10 turn 后单请求 context 数千 tok，8 并发就是数万活跃 KV），不是纯 bs=8 或纯 spec 逻辑问题。
@@ -153,51 +301,51 @@ python3 -m sglang.launch_server \
 
 ### 2) 阻塞本项目交付的核心 gap
 
-1. **intel_xpu attention backend 对 speculative 仍硬阻断**  
+1. **intel_xpu attention backend 对 speculative 仍硬阻断**
    `python/sglang/srt/layers/attention/xpu_backend.py` 在 decode 分支中，当
    `forward_batch.spec_info is not None` 时直接 `assert False`，报错
-   “XPUAttentionBackend doesn't support speculative decoding yet...”。  
+   “XPUAttentionBackend doesn't support speculative decoding yet...”。
    这意味着只要走 `intel_xpu` backend，就无法跑 MTP/Frozen-KV。
 
-2. **与本项目 shippable 启动块冲突**  
+2. **与本项目 shippable 启动块冲突**
    本文 “Launch Configuration” 的已交付命令固定使用
-   `--attention-backend intel_xpu`（TP=2 eager 路径）。  
+   `--attention-backend intel_xpu`（TP=2 eager 路径）。
    因为上面第 1 条，该交付路径与 Gemma4 MTP 当前不可兼容。
 
-3. **Frozen-KV MTP 在调度能力上仍是 spec-v1 语义**  
+3. **Frozen-KV MTP 在调度能力上仍是 spec-v1 语义**
    `speculative_hook.py::_handle_frozen_kv_mtp` 与
-   `spec_info.py` 明确：  
-   - 不支持 spec v2 overlap（会强制 `disable_overlap_schedule=True`）；  
-   - 会关闭 mixed chunk；  
-   - 采用独立的 FrozenKVMTPWorker 路径。  
+   `spec_info.py` 明确：
+   - 不支持 spec v2 overlap（会强制 `disable_overlap_schedule=True`）；
+   - 会关闭 mixed chunk；
+   - 采用独立的 FrozenKVMTPWorker 路径。
    这与我们当前对 overlap/chunk 的性能调优路线存在结构性差异，后续需单独评估。
 
-4. **Frozen-KV MTP 的图捕获仅支持 CUDA，不支持 XPU graph**  
+4. **Frozen-KV MTP 的图捕获仅支持 CUDA，不支持 XPU graph**
    `speculative/frozen_kv_mtp_worker.py::init_cuda_graphs` 明确仅在
-   `target_worker.device == "cuda"` 时启用 draft CUDA graph；在 XPU 只走 eager draft loop。  
+   `target_worker.device == "cuda"` 时启用 draft CUDA graph；在 XPU 只走 eager draft loop。
    即便功能打通，XPU 侧仍缺少 draft/verify 图化收益。
 
-5. **文档与本项目现实能力存在“可用性口径差”**  
-   - `docs_new/cookbook/autoregressive/Google/Gemma4.mdx` 给出 Gemma4 + NEXTN 命令；  
+5. **文档与本项目现实能力存在“可用性口径差”**
+   - `docs_new/cookbook/autoregressive/Google/Gemma4.mdx` 给出 Gemma4 + NEXTN 命令；
    - 交互部署片段 `docs_new/src/snippets/autoregressive/gemma4-deployment.jsx`
-     也提供 MTP 开关（仅对 MI300X 隐藏），但没有 Intel XPU/BMG 专项限制说明。  
+     也提供 MTP 开关（仅对 MI300X 隐藏），但没有 Intel XPU/BMG 专项限制说明。
    对本项目而言，这会造成“文档看似可开 MTP，但 intel_xpu 路径实不可用”的认知偏差。
 
 ### 3) 尚未完成的验证 gap（必须补测）
 
-- **未有本机 BMG 上 “intel_xpu + ESIMD 路径 + Gemma4 assistant + NEXTN(FROZEN_KV_MTP)” 的正确性门禁结果**  
+- **未有本机 BMG 上 “intel_xpu + ESIMD 路径 + Gemma4 assistant + NEXTN(FROZEN_KV_MTP)” 的正确性门禁结果**
   （至少应有 chat harness 正确性 gate；不以 Triton 作为目标实现）。
-- **未有同口径性能数据**：  
+- **未有同口径性能数据**：
   目前没有 “MTP(intel_xpu+ESIMD 路径) vs 非 MTP(intel_xpu shippable 路径)” 的对齐 A/B。
-- **未形成 XPU 迁移方案的代码级拆解任务**：  
+- **未形成 XPU 迁移方案的代码级拆解任务**：
   例如：`xpu_backend` speculative metadata/verify/draft 扩展、与 SWA/full pool 的一致性、
   topk/page_size 组合约束、以及是否借鉴 ptl 分支的 XPU speculative kernel 资产。
 
 ### 4) 建议的收敛顺序（后续执行项）
 
-1. 先做 **intel_xpu 后端 speculative 打通**：移除当前 assert 路障，补齐 metadata/verify/draft 路径，目标实现为 ESIMD 内核方案（不引入 Triton 目标依赖）。  
-2. 做 **功能可用性最小闭环**：在 BMG 上跑通 `intel_xpu + NEXTN + gemma4-31B-assistant`，拿到正确性 gate。  
-3. 再做 **同口径性能 A/B**：与当前 `intel_xpu` 非 MTP shippable 路径做对齐对比。  
+1. 先做 **intel_xpu 后端 speculative 打通**：移除当前 assert 路障，补齐 metadata/verify/draft 路径，目标实现为 ESIMD 内核方案（不引入 Triton 目标依赖）。
+2. 做 **功能可用性最小闭环**：在 BMG 上跑通 `intel_xpu + NEXTN + gemma4-31B-assistant`，拿到正确性 gate。
+3. 再做 **同口径性能 A/B**：与当前 `intel_xpu` 非 MTP shippable 路径做对齐对比。
 4. 最后补文档：明确“Gemma4 MTP 在 Intel XPU（ESIMD 路径）的已验证组合与限制”。
 
 ## ✅ FIXED (2026-07-06): SWA seq>1024 decode garble — host-side page-aligned windowing

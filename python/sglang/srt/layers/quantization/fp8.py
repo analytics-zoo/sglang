@@ -255,6 +255,178 @@ def _maybe_esimd_moe_silu_routed(
     return out
 
 
+def _apply_xpu_gemma4_fp8_moe(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_runner_config: MoeRunnerConfig,
+    *,
+    block_quant: bool,
+) -> torch.Tensor:
+    if block_quant:
+        raise RuntimeError(
+            "Gemma4 XPU FP8 MoE requires per-expert scalar weight scales; "
+            "block-quantized expert weights are not supported."
+        )
+    if x.device.type != "xpu":
+        raise RuntimeError("Gemma4 XPU FP8 MoE received a non-XPU input.")
+    if moe_runner_config.activation != "gelu":
+        raise RuntimeError(
+            f"Gemma4 XPU FP8 MoE requires GELU-tanh, got "
+            f"{moe_runner_config.activation!r}."
+        )
+    if (
+        moe_runner_config.gemm1_alpha is not None
+        or moe_runner_config.gemm1_clamp_limit is not None
+        or moe_runner_config.swiglu_limit is not None
+    ):
+        raise RuntimeError("Gemma4 XPU FP8 MoE does not support gated clamps.")
+    if (
+        getattr(layer, "w13_weight_bias", None) is not None
+        or getattr(layer, "w2_weight_bias", None) is not None
+    ):
+        raise RuntimeError("Gemma4 XPU FP8 MoE does not support expert bias.")
+
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if w13.dtype not in fp8_dtypes or w2.dtype != w13.dtype:
+        raise RuntimeError(
+            "Gemma4 XPU FP8 MoE requires matching E4M3 or E5M2 expert weights; "
+            f"got w13={w13.dtype}, w2={w2.dtype}."
+        )
+    if w13.dim() != 3 or w2.dim() != 3:
+        raise RuntimeError("Gemma4 XPU FP8 MoE expert weights must be 3D.")
+    num_experts, two_intermediate, hidden_size = w13.shape
+    if two_intermediate % 2 != 0:
+        raise RuntimeError("Gemma4 w13 output dimension must be even.")
+    intermediate_size = two_intermediate // 2
+    if w2.shape != (num_experts, hidden_size, intermediate_size):
+        raise RuntimeError(
+            "Gemma4 XPU FP8 MoE expects w13=[E,2I,H] and w2=[E,H,I], "
+            f"got w13={tuple(w13.shape)}, w2={tuple(w2.shape)}."
+        )
+    if x.dim() != 2 or x.shape[1] != hidden_size:
+        raise RuntimeError(
+            f"Gemma4 XPU FP8 MoE input must be [T,{hidden_size}], "
+            f"got {tuple(x.shape)}."
+        )
+    if hidden_size % 32 != 0 or intermediate_size % 16 != 0:
+        raise RuntimeError(
+            "Gemma4 XPU FP8 MoE requires H divisible by 32 and I by 16."
+        )
+
+    w13_scale = layer.w13_weight_scale
+    w2_scale = layer.w2_weight_scale
+    if w13_scale is None or w2_scale is None:
+        raise RuntimeError("Gemma4 XPU FP8 MoE weight scales are missing.")
+
+    def _scalar_scale(scale: torch.Tensor, name: str) -> torch.Tensor:
+        values = scale.reshape(num_experts, -1)
+        if values.shape[1] != 1:
+            raise RuntimeError(
+                f"Gemma4 XPU FP8 MoE {name} must have one scale per expert, "
+                f"got {tuple(scale.shape)}."
+            )
+        return values[:, 0].to(torch.float32).contiguous()
+
+    s13 = _scalar_scale(w13_scale, "w13 scale")
+    s2 = _scalar_scale(w2_scale, "w2 scale")
+    topk_weights = topk_weights.to(torch.float16).contiguous()
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    x_fp16 = x.to(torch.float16).contiguous()
+    top_k = topk_ids.shape[-1]
+
+    if x.shape[0] <= 8:
+        from custom_esimd_kernels_sglang import (
+            moe_forward_full_gelu_tanh_routed,
+        )
+
+        output = moe_forward_full_gelu_tanh_routed(
+            x_fp16,
+            topk_weights,
+            topk_ids,
+            w13,
+            s13,
+            w2,
+            s2,
+            top_k,
+            num_experts,
+        )
+    else:
+        from custom_esimd_kernels_sglang import (
+            moe_prefill_full_fp8_gelu_tanh,
+        )
+
+        s13_gate_up = (
+            s13[:, None].expand(num_experts, 2).contiguous()
+        )
+        output = moe_prefill_full_fp8_gelu_tanh(
+            x_fp16,
+            topk_weights,
+            topk_ids,
+            w13,
+            s13_gate_up,
+            w2,
+            s2,
+            top_k,
+            num_experts,
+        )
+    return output if output.dtype == x.dtype else output.to(x.dtype)
+
+
+def apply_xpu_gemma4_fp8_moe_from_logits(
+    x: torch.Tensor,
+    layer: torch.nn.Module,
+    router_logits: torch.Tensor,
+    per_expert_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Run the Gemma4-26B TP=2 decode MoE from raw router logits."""
+    w13 = layer.w13_weight
+    w2 = layer.w2_weight
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if (
+        x.device.type != "xpu"
+        or x.dtype != torch.float16
+        or x.shape != (1, 2816)
+        or router_logits.shape != (1, 128)
+        or router_logits.dtype != torch.float16
+        or w13.shape != (128, 704, 2816)
+        or w2.shape != (128, 2816, 352)
+        or w13.dtype not in fp8_dtypes
+        or w2.dtype != w13.dtype
+    ):
+        raise RuntimeError(
+            "Fused Gemma4-26B decode requires FP16 [1,2816] input, "
+            "FP16 [1,128] logits, and matching E4M3/E5M2 TP=2 weights."
+        )
+
+    def _expert_scale(scale: torch.Tensor, name: str) -> torch.Tensor:
+        values = scale.reshape(128, -1)
+        if values.shape[1] != 1:
+            raise RuntimeError(
+                f"Fused Gemma4-26B decode requires one {name} per expert."
+            )
+        return values[:, 0].to(torch.float32).contiguous()
+
+    from custom_esimd_kernels_sglang import (
+        moe_forward_full_gelu_tanh_decode,
+    )
+
+    return moe_forward_full_gelu_tanh_decode(
+        x.contiguous(),
+        router_logits.contiguous(),
+        w13,
+        _expert_scale(layer.w13_weight_scale, "w13 scale"),
+        w2,
+        _expert_scale(layer.w2_weight_scale, "w2 scale"),
+        _expert_scale(per_expert_scale, "output scale"),
+        8,
+        128,
+    )
+
+
 def _require_fp4_dtype():
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
     if fp4_dtype is None:
@@ -1686,13 +1858,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        import sys as _sys
-        _sys.stderr.write(
-            f"[fp8-moe-pwfl] block_quant={self.block_quant} "
-            f"is_ckpt_fp8={self.quant_config.is_checkpoint_fp8_serialized} "
-            f"w13.dtype={layer.w13_weight.dtype}\n"
-        )
-        _sys.stderr.flush()
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
@@ -2010,8 +2175,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if use_intel_xpu_backend():
             # sgl-kernel-xpu path
-            from sgl_kernel import fused_experts
-
             topk_weights, topk_ids, _ = dispatch_output.topk_output
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype in (
@@ -2020,6 +2183,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
+
+            is_gemma4_26b_tp2 = (
+                x.dim() == 2
+                and x.shape[1] == 2816
+                and tuple(layer.w13_weight.shape) == (128, 704, 2816)
+                and tuple(layer.w2_weight.shape) == (128, 2816, 352)
+                and topk_ids.dim() == 2
+                and topk_ids.shape[1] == 8
+            )
+            if (
+                use_fp8_w8a8
+                and not self.block_quant
+                and moe_runner_config.activation == "gelu"
+                and is_gemma4_26b_tp2
+            ):
+                output = _apply_xpu_gemma4_fp8_moe(
+                    x,
+                    layer,
+                    topk_weights,
+                    topk_ids,
+                    moe_runner_config,
+                    block_quant=self.block_quant,
+                )
+                return StandardCombineInput(hidden_states=output)
+
+            from sgl_kernel import fused_experts
 
             output = fused_experts(
                 x,

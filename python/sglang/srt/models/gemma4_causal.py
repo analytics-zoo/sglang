@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
     gemma4_fused_routing,
@@ -71,102 +72,34 @@ _esimd_qkv_split_norm_rope = None
 _esimd_fused_add_rms_norm = None
 _esimd_rmsnorm_residual_scalar = None
 _esimd_norm_add_norm = None
+_esimd_norm_add_norm_gemv_gelu_fp8 = None
+_esimd_norm_gemv_norm_fp16 = None
+_esimd_rmsnorm_gemv_fp8 = None
+_esimd_dual_rmsnorm_residual_scalar = None
 try:
     from custom_esimd_kernels_sglang import (
         esimd_qkv_split_norm_rope as _esimd_qkv_split_norm_rope,
         esimd_fused_add_rms_norm as _esimd_fused_add_rms_norm,
-        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
         esimd_norm_add_norm as _esimd_norm_add_norm,
+        esimd_norm_add_norm_gemv_gelu_fp8 as _esimd_norm_add_norm_gemv_gelu_fp8,
+        esimd_norm_gemv_norm_fp16 as _esimd_norm_gemv_norm_fp16,
+        esimd_rmsnorm_gemv_fp8 as _esimd_rmsnorm_gemv_fp8,
+        esimd_dual_rmsnorm_residual_scalar as _esimd_dual_rmsnorm_residual_scalar,
+        esimd_rmsnorm_residual_scalar as _esimd_rmsnorm_residual_scalar,
     )
 except ImportError:
     pass
 
-# Diagnostic kill switch: the three fused-norm fast paths above have no
+# Diagnostic kill switch: the fused-norm fast paths above have no
 # individual env gate, so this disables all of them at once for A/B isolation.
 if os.environ.get("SGLANG_GEMMA4_DISABLE_ESIMD_NORM", "0") == "1":
     _esimd_fused_add_rms_norm = None
     _esimd_rmsnorm_residual_scalar = None
     _esimd_norm_add_norm = None
-
-
-# Diagnostic: locate the first decoder layer whose output turns non-finite.
-# Forces a device sync per layer, so it is off by default.
-_DEBUG_LAYER_NAN = os.environ.get("SGLANG_GEMMA4_DEBUG_LAYER_NAN", "0") == "1"
-_layer_nan_reports = 0
-
-
-_kv_pool_reports = 0
-
-
-def _debug_probe_kv_pool(attn, attn_output, forward_batch):
-    """When core attention emits non-finite output, decide whether the KV cache
-    itself already holds non-finite values (garbage written earlier) or whether
-    the attention math produced them (fp16 overflow)."""
-    global _kv_pool_reports
-    if _kv_pool_reports >= 4 or attn_output is None:
-        return
-    if not bool((~torch.isfinite(attn_output)).any().item()):
-        return
-    pool = getattr(forward_batch, "token_to_kv_pool", None)
-    if pool is None:
-        try:
-            from sglang.srt.model_executor.forward_context import get_attn_backend
-
-            pool = getattr(get_attn_backend(), "token_to_kv_pool", None)
-        except Exception:
-            pool = None
-    if pool is None:
-        _kv_pool_reports += 1
-        logger.error("[kv-probe] no token_to_kv_pool reachable")
-        return
-    try:
-        kbuf = pool.get_key_buffer(attn.layer_id)
-        vbuf = pool.get_value_buffer(attn.layer_id)
-    except Exception as exc:  # pragma: no cover - diagnostic only
-        logger.error("[kv-probe] cannot read pool: %r", exc)
-        _kv_pool_reports += 1
-        return
-    _kv_pool_reports += 1
-    k_bad = int((~torch.isfinite(kbuf)).sum().item())
-    v_bad = int((~torch.isfinite(vbuf)).sum().item())
-    logger.error(
-        "[kv-probe] layer=%d kbuf%s dtype=%s nonfinite_k=%d absmax_k=%.6g "
-        "| vbuf nonfinite_v=%d absmax_v=%.6g",
-        attn.layer_id,
-        tuple(kbuf.shape),
-        kbuf.dtype,
-        k_bad,
-        float(kbuf[torch.isfinite(kbuf)].abs().amax().item()) if k_bad < kbuf.numel() else float("nan"),
-        v_bad,
-        float(vbuf[torch.isfinite(vbuf)].abs().amax().item()) if v_bad < vbuf.numel() else float("nan"),
-    )
-
-
-def _debug_layer_nan_check(layer_idx, hidden_states, forward_batch, tag="layer_out"):
-    """Log the first tensor that turns non-finite, plus enough batch context to
-    tell prefill from decode."""
-    global _layer_nan_reports
-    if _layer_nan_reports >= 12 or hidden_states is None:
-        return
-    bad = ~torch.isfinite(hidden_states)
-    if not bool(bad.any().item()):
-        return
-    _layer_nan_reports += 1
-    rows = bad.reshape(bad.shape[0], -1).any(dim=-1).nonzero().flatten().tolist()
-    logger.error(
-        "[layer-nan] non-finite at layer=%d tag=%s mode=%s shape=%s "
-        "bad_rows=%s seq_lens=%s",
-        layer_idx,
-        tag,
-        getattr(forward_batch.forward_mode, "name", "?"),
-        tuple(hidden_states.shape),
-        rows[:8],
-        (
-            forward_batch.seq_lens.tolist()[:8]
-            if forward_batch.seq_lens is not None
-            else None
-        ),
-    )
+    _esimd_norm_add_norm_gemv_gelu_fp8 = None
+    _esimd_norm_gemv_norm_fp16 = None
+    _esimd_rmsnorm_gemv_fp8 = None
+    _esimd_dual_rmsnorm_residual_scalar = None
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -338,6 +271,27 @@ class Gemma4MoE(nn.Module):
             ):
                 return gemma4_fused_routing(gating_output, per_expert_scale, topk)
 
+            if (
+                gating_output.is_xpu
+                and gating_output.dim() == 2
+                and gating_output.dtype == torch.float16
+                and gating_output.shape[1] == 128
+                and topk == 8
+                and os.environ.get(
+                    "SGLANG_GEMMA4_DISABLE_ESIMD_TOPK", "0"
+                )
+                != "1"
+            ):
+                from custom_esimd_kernels_sglang import moe_batch_topk
+
+                topk_ids, topk_weights = moe_batch_topk(
+                    gating_output.contiguous(), topk, True
+                )
+                topk_weights *= per_expert_scale[
+                    topk_ids.to(torch.long)
+                ].to(torch.float16)
+                return topk_weights, topk_ids
+
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
 
             # Fused: softmax + per_expert_scale gather + mul + casts in one kernel
@@ -375,6 +329,41 @@ class Gemma4MoE(nn.Module):
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        expert_layer = self.experts
+        w13 = getattr(expert_layer, "w13_weight", None)
+        w2 = getattr(expert_layer, "w2_weight", None)
+        if (
+            os.environ.get("SGLANG_GEMMA4_DISABLE_FUSED_MOE", "0") != "1"
+            and num_tokens == 1
+            and hidden_states.is_xpu
+            and hidden_states.dtype == torch.float16
+            and router_logits.dtype == torch.float16
+            and w13 is not None
+            and w2 is not None
+            and not getattr(
+                getattr(expert_layer, "quant_method", None), "block_quant", False
+            )
+            and tuple(w13.shape) == (128, 704, 2816)
+            and tuple(w2.shape) == (128, 2816, 352)
+            and w13.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and w2.dtype == w13.dtype
+        ):
+            from sglang.srt.layers.quantization.fp8 import (
+                apply_xpu_gemma4_fp8_moe_from_logits,
+            )
+
+            hidden_states = apply_xpu_gemma4_fp8_moe_from_logits(
+                hidden_states,
+                expert_layer,
+                router_logits,
+                self.per_expert_scale,
+            )
+            if self.tp_size > 1:
+                hidden_states = tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
+            return hidden_states.view(num_tokens, hidden_dim)
+
         topk_output = self.topk(hidden_states, router_logits)
         hidden_states = self.experts(hidden_states, topk_output)
         return hidden_states.view(num_tokens, hidden_dim)
@@ -398,7 +387,9 @@ class Gemma4Attention(nn.Module):
 
         layer_type = config.layer_types[layer_id]
         self.sliding_window = (
-            config.sliding_window if layer_type == "sliding_attention" else None
+            get_attention_sliding_window_size(config)
+            if layer_type == "sliding_attention"
+            else None
         )
 
         self.total_num_heads = config.num_attention_heads
@@ -521,14 +512,61 @@ class Gemma4Attention(nn.Module):
         self._esimd_qkv_cache = cache
         return cache
 
+    def fused_input_norm_qkv(
+        self, hidden_states: torch.Tensor, input_norm: RMSNorm
+    ) -> Optional[torch.Tensor]:
+        weight = self.qkv_proj.weight
+        if (
+            _esimd_rmsnorm_gemv_fp8 is None
+            or os.environ.get(
+                "SGLANG_GEMMA4_DISABLE_FUSED_QKV_PROJ", "0"
+            )
+            == "1"
+            or hidden_states.shape != (1, 2816)
+            or hidden_states.dtype != torch.float16
+            or input_norm.weight.dtype != torch.float16
+            or weight.dtype
+            not in (torch.float8_e4m3fn, torch.float8_e5m2)
+            or weight.dim() != 2
+            or weight.shape[0] != 2816
+            or self.qkv_proj.weight_scale.numel() != 1
+        ):
+            return None
+        if not hasattr(self.qkv_proj, "_gemma4_weight_nk"):
+            self.qkv_proj._gemma4_weight_nk = weight.t().contiguous()
+            self.qkv_proj._gemma4_scale = (
+                self.qkv_proj.weight_scale.to(torch.float32)
+                .reshape(-1)[:1]
+                .contiguous()
+            )
+            self.qkv_proj._gemma4_output = torch.empty(
+                1,
+                weight.shape[1],
+                dtype=torch.float16,
+                device=hidden_states.device,
+            )
+        _esimd_rmsnorm_gemv_fp8(
+            hidden_states,
+            input_norm.weight.data,
+            self.qkv_proj._gemma4_weight_nk,
+            self.qkv_proj._gemma4_scale,
+            self.qkv_proj._gemma4_output,
+            input_norm.variance_epsilon,
+        )
+        return self.qkv_proj._gemma4_output
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        qkv_override: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
+        if qkv_override is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv = qkv_override
 
         # ESIMD fast path: fused QKV split + Q/K RMSNorm + RoPE in one kernel.
         # Eligible when: head_dim==256, fp16, non-kv-shared, decode (M small).
@@ -590,16 +628,10 @@ class Gemma4Attention(nn.Module):
             attn_output = self.attn(
                 q, k, v, forward_batch=forward_batch, save_kv_cache=True,
             )
-            if _DEBUG_LAYER_NAN:
-                _debug_layer_nan_check(self.layer_id, q, forward_batch, tag="esimd_q")
-                _debug_layer_nan_check(self.layer_id, k, forward_batch, tag="esimd_k")
-                _debug_layer_nan_check(self.layer_id, v, forward_batch, tag="esimd_v")
-                _debug_layer_nan_check(
-                    self.layer_id, attn_output, forward_batch, tag="core_attn_out"
-                )
-                _debug_probe_kv_pool(self.attn, attn_output, forward_batch)
             if attn_output.dim() == 3:
                 attn_output = attn_output.flatten(-2, -1)
+            if attn_output.dtype != qkv.dtype:
+                attn_output = attn_output.to(qkv.dtype)
             output, _ = self.o_proj(attn_output)
             return output
 
@@ -700,8 +732,9 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
+        if attn_output.dtype != qkv.dtype:
+            attn_output = attn_output.to(qkv.dtype)
         output, _ = self.o_proj(attn_output)
-
         return output
 
 
@@ -852,35 +885,146 @@ class Gemma4DecoderLayer(nn.Module):
         residual = hidden_states
 
         # Apply input layernorm
-        hidden_states = self.input_layernorm(hidden_states)
+        qkv_override = self.self_attn.fused_input_norm_qkv(
+            hidden_states, self.input_layernorm
+        )
+        if qkv_override is None:
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            qkv_override=qkv_override,
         )
-        if _DEBUG_LAYER_NAN:
-            _debug_layer_nan_check(
-                self.layer_id, hidden_states, forward_batch, tag="attn_out"
-            )
-
         if self.enable_moe_block:
-            # MoE path keeps the standalone post-attention norm.
-            hidden_states = self.post_attention_layernorm(hidden_states)
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            # Also need raw (unfused) residual for router and pre_ff_norm_2
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
+            dense_activation = None
+            gate_up_proj = self.mlp.gate_up_proj
+            if (
+                _esimd_norm_add_norm_gemv_gelu_fp8 is not None
+                and os.environ.get(
+                    "SGLANG_GEMMA4_DISABLE_FUSED_DENSE", "0"
+                )
+                != "1"
+                and hidden_states.shape == (1, 2816)
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+                and gate_up_proj.weight.dtype
+                in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and tuple(gate_up_proj.weight.shape) == (2816, 2112)
+                and gate_up_proj.weight_scale.numel() == 1
+            ):
+                if not hasattr(gate_up_proj, "_gemma4_weight_nk"):
+                    gate_up_proj._gemma4_weight_nk = (
+                        gate_up_proj.weight.t().contiguous()
+                    )
+                    gate_up_proj._gemma4_scale = (
+                        gate_up_proj.weight_scale.to(torch.float32)
+                        .reshape(-1)[:1]
+                        .contiguous()
+                    )
+                    self._fused_dense_residual = torch.empty_like(residual)
+                    self._fused_dense_activation = torch.empty(
+                        1,
+                        1056,
+                        dtype=torch.float16,
+                        device=hidden_states.device,
+                    )
+                _esimd_norm_add_norm_gemv_gelu_fp8(
+                    hidden_states,
+                    residual,
+                    self.post_attention_layernorm.weight.data,
+                    self.pre_feedforward_layernorm.weight.data,
+                    gate_up_proj._gemma4_weight_nk,
+                    gate_up_proj._gemma4_scale,
+                    self._fused_dense_residual,
+                    self._fused_dense_activation,
+                    self.post_attention_layernorm.variance_epsilon,
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+                residual = self._fused_dense_residual
+                dense_activation = self._fused_dense_activation
+            elif (
+                _esimd_norm_add_norm is not None
+                and hidden_states.shape[0] == 1
+                and hidden_states.dtype == torch.float16
+                and hidden_states.is_contiguous()
+                and residual.is_contiguous()
+            ):
+                if not hasattr(self, "_nan_w1"):
+                    self._nan_w1 = (
+                        self.post_attention_layernorm.weight.data.to(
+                            torch.float16
+                        ).contiguous()
+                    )
+                    self._nan_w2 = (
+                        self.pre_feedforward_layernorm.weight.data.to(
+                            torch.float16
+                        ).contiguous()
+                    )
+                _esimd_norm_add_norm(
+                    hidden_states,
+                    residual,
+                    self._nan_w1,
+                    self._nan_w2,
+                    hidden_states,
+                    self.post_attention_layernorm.variance_epsilon,
+                    self.pre_feedforward_layernorm.variance_epsilon,
+                )
+            else:
+                hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
             # For MoE: router and pre_ff_norm_2 need the unfused residual
             # (which is now updated to post_attn_out + old_residual)
             moe_input = residual
 
             # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
-
-            # MoE branch: router sees residual (= post_attn_out + old_residual)
-            router_logits = self.router(moe_input)
-            hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
+            if dense_activation is not None:
+                hidden_states_1, _ = self.mlp.down_proj(dense_activation)
+            else:
+                hidden_states_1 = self.mlp(hidden_states)
+            router = self.router
+            if (
+                _esimd_norm_gemv_norm_fp16 is not None
+                and os.environ.get(
+                    "SGLANG_GEMMA4_DISABLE_FUSED_ROUTER", "0"
+                )
+                != "1"
+                and moe_input.shape[0] == 1
+                and moe_input.dtype == torch.float16
+                and moe_input.is_contiguous()
+                and router.proj.weight.dtype == torch.float16
+                and router.proj.weight.is_contiguous()
+                and self.pre_feedforward_layernorm_2.weight.dtype
+                == torch.float16
+            ):
+                if not hasattr(router, "_fused_scale_with_root"):
+                    router._fused_scale_with_root = (
+                        router.scale.data * router.root_size
+                    ).to(torch.float16).contiguous()
+                    router._fused_logits = torch.empty(
+                        1,
+                        router.proj.weight.shape[0],
+                        dtype=torch.float16,
+                        device=moe_input.device,
+                    )
+                    self._fused_moe_input = torch.empty_like(moe_input)
+                _esimd_norm_gemv_norm_fp16(
+                    moe_input,
+                    router._fused_scale_with_root,
+                    router.proj.weight,
+                    self.pre_feedforward_layernorm_2.weight.data,
+                    router._fused_logits,
+                    self._fused_moe_input,
+                    self.pre_feedforward_layernorm_2.variance_epsilon,
+                )
+                router_logits = router._fused_logits
+                hidden_states_2 = self._fused_moe_input
+            else:
+                router_logits = router(moe_input)
+                hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
 
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
@@ -892,18 +1036,62 @@ class Gemma4DecoderLayer(nn.Module):
                 norm1 = self.post_feedforward_layernorm_1
                 norm2 = self.post_feedforward_layernorm_2
                 norm3 = self.post_feedforward_layernorm
-                hidden_states = gemma_dual_rmsnorm_residual_scalar(
-                    hidden_states_1,
-                    norm1.weight.data,
-                    hidden_states_2,
-                    norm2.weight.data,
-                    norm3.weight.data,
-                    residual,
-                    self.layer_scalar,
-                    norm1.variance_epsilon,
-                    norm2.variance_epsilon,
-                    norm3.variance_epsilon,
-                )
+                if (
+                    _esimd_dual_rmsnorm_residual_scalar is not None
+                    and os.environ.get(
+                        "SGLANG_GEMMA4_DISABLE_FUSED_DUAL_NORM", "0"
+                    )
+                    != "1"
+                    and hidden_states_1.dim() == 2
+                    and hidden_states_1.shape[1] == 2816
+                    and hidden_states_1.dtype == torch.float16
+                    and hidden_states_1.is_contiguous()
+                    and hidden_states_2.is_contiguous()
+                    and residual.is_contiguous()
+                ):
+                    if not hasattr(self, "_dual_norm_scalar"):
+                        self._dual_norm_scalar = float(
+                            self.layer_scalar.item()
+                        )
+                    output_attr = (
+                        "_dual_norm_decode_output"
+                        if hidden_states_1.shape[0] == 1
+                        else "_dual_norm_prefill_output"
+                    )
+                    dual_norm_output = getattr(self, output_attr, None)
+                    if (
+                        dual_norm_output is None
+                        or dual_norm_output.shape != hidden_states_1.shape
+                    ):
+                        dual_norm_output = torch.empty_like(hidden_states_1)
+                        setattr(self, output_attr, dual_norm_output)
+                    _esimd_dual_rmsnorm_residual_scalar(
+                        hidden_states_1,
+                        norm1.weight.data,
+                        hidden_states_2,
+                        norm2.weight.data,
+                        norm3.weight.data,
+                        residual,
+                        dual_norm_output,
+                        norm1.variance_epsilon,
+                        norm2.variance_epsilon,
+                        norm3.variance_epsilon,
+                        self._dual_norm_scalar,
+                    )
+                    hidden_states = dual_norm_output
+                else:
+                    hidden_states = gemma_dual_rmsnorm_residual_scalar(
+                        hidden_states_1,
+                        norm1.weight.data,
+                        hidden_states_2,
+                        norm2.weight.data,
+                        norm3.weight.data,
+                        residual,
+                        self.layer_scalar,
+                        norm1.variance_epsilon,
+                        norm2.variance_epsilon,
+                        norm3.variance_epsilon,
+                    )
                 return hidden_states, None
 
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
@@ -1250,8 +1438,6 @@ class Gemma4TextModel(PreTrainedModel):
                 **kwargs,
             )
             hidden_states = layer_outputs[0]
-            if _DEBUG_LAYER_NAN:
-                _debug_layer_nan_check(layer_idx, hidden_states, forward_batch)
             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
             # the residual is fused inside the layer, so nothing to thread.
 

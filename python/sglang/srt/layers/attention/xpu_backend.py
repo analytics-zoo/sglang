@@ -88,10 +88,15 @@ from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_sta
 # head, so the XPU graph decode path routes here instead. Gated by
 # SGL_XPU_DECODE_SGLANG_ATTN (default on); falls back to eagle when unavailable.
 _sglang_decode_attn_fn = None
+_xpu_create_kv_indices_fn = None
 try:
     from custom_esimd_kernels_sglang import sglang_decode_attn as _sglang_decode_attn_fn
+    from custom_esimd_kernels_sglang import (
+        xpu_create_kv_indices as _xpu_create_kv_indices_fn,
+    )
 except Exception:
     _sglang_decode_attn_fn = None
+    _xpu_create_kv_indices_fn = None
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
 _esimd_page_attn_decode = None
@@ -270,8 +275,8 @@ class XPUAttentionBackend(AttentionBackend):
         CPU-GPU pipeline on every full-attention layer) is removed:
         kv_indices is sized to the upper bound ``bs * max_seq_len_k`` (a CPU
         int already available on ``metadata``, no device readback needed).
-        create_flashinfer_kv_indices_triton only writes into the ranges
-        indexed by kv_indptr, so an over-sized buffer is safe, and
+        xpu_create_kv_indices only writes into the ranges indexed by
+        kv_indptr, so an over-sized buffer is safe, and
         sglang_decode_attn only reads the kv_indptr-delimited ranges."""
         bs = forward_batch.batch_size
         # kv_indptr/kv_indices/temp_p depend only on this step's cache_seqlens
@@ -368,18 +373,14 @@ class XPUAttentionBackend(AttentionBackend):
             dtype=torch.int32,
             out=kv_indptr[1:],
         )
-        from sglang.srt.layers.attention.triton_ops.kv_indices import (
-            create_flashinfer_kv_indices_triton,
-        )
-
-        create_flashinfer_kv_indices_triton[(bs,)](
+        _xpu_create_kv_indices_fn(
             self.req_to_token,
             forward_batch.req_pool_indices,
             seqlens,
             kv_indptr,
             kv_start_idx,
             kv_indices,
-            self.req_to_token.stride(0),
+            window_tokens if is_swa else max_seq_len_k,
         )
         if translate_swa:
             # req_to_token holds FULL-pool slot ids; the sliding layers read the
@@ -517,18 +518,14 @@ class XPUAttentionBackend(AttentionBackend):
                 out=kv_indptr[1:],
             )
             kv_indices = state["kv_indices"]
-            from sglang.srt.layers.attention.triton_ops.kv_indices import (
-                create_flashinfer_kv_indices_triton,
-            )
-
-            create_flashinfer_kv_indices_triton[(bs,)](
+            _xpu_create_kv_indices_fn(
                 self.req_to_token,
                 req_pool_indices,
                 metadata.cache_seqlens_int32,
                 kv_indptr,
                 None,
                 kv_indices,
-                self.req_to_token.stride(0),
+                self.max_context_len,
             )
             metadata.kv_indptr = kv_indptr
             metadata.kv_indices = kv_indices
