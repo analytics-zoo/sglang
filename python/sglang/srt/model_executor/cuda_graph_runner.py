@@ -118,6 +118,9 @@ def _xpu_patch_cuda_graph_apis() -> None:
             return self._ctx.__exit__(exc_type, exc, tb)
 
     torch.cuda.graph = _XpuGraphCtx  # type: ignore[assignment]
+    torch.cuda.stream = torch.xpu.stream  # type: ignore[assignment]
+    torch.cuda.current_stream = torch.xpu.current_stream  # type: ignore[assignment]
+    torch.cuda.synchronize = torch.xpu.synchronize  # type: ignore[assignment]
     torch.cuda._sglang_xpu_patched = True
 
 
@@ -139,6 +142,12 @@ if not _is_hip:
         BreakableCUDAGraphCapture,
         eager_on_graph,
     )
+
+# XPU breakable graph (no cuda-python dep); safe to import on any platform.
+from sglang.srt.model_executor.breakable_cuda_graph.xpu_breakable_graph import (
+    XpuBreakableGraph,
+    XpuBreakableGraphCapture,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -848,7 +857,9 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
+            graph_ctx = XpuBreakableGraphCapture
+        elif envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if memory_saver_adapter.enabled:
                 raise NotImplementedError(
                     "Breakable CUDA graph is not compatible with memory saver mode"
@@ -871,10 +882,17 @@ class CudaGraphRunner:
             captured_fn = run_once_fn
 
         with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-            out = captured_fn()
+            try:
+                out = captured_fn()
+            except RuntimeError as e:
+                import traceback
+                traceback.print_exc()
+                raise
         return out
 
     def _create_device_graph(self):
+        if is_xpu() and envs.SGLANG_XPU_BREAKABLE_GRAPH.get():
+            return XpuBreakableGraph()
         if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")

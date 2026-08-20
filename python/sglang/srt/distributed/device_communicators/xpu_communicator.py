@@ -9,6 +9,14 @@ from torch.distributed import ProcessGroup
 from sglang.srt.utils import is_xpu
 
 
+def _xpu_all_reduce_inplace(x: torch.Tensor, group) -> torch.Tensor:
+    """In-place all-reduce returning the same buffer. Used as the eager break
+    function under XPU breakable-graph capture (the returned buffer's stable
+    storage is what the next captured segment reads)."""
+    dist.all_reduce(x, group=group)
+    return x
+
+
 class XpuCommunicator:
 
     def __init__(self, group: ProcessGroup):
@@ -20,6 +28,17 @@ class XpuCommunicator:
         self.world_size = dist.get_world_size(self.group)
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        # oneCCL collectives cannot be captured into an XPUGraph (they replay
+        # stale on the 2nd+ replay -> garbled TP>1 decode). When an XPU breakable
+        # graph is capturing, run the collective EAGER as a break point between
+        # captured compute segments; otherwise call it directly.
+        from sglang.srt.model_executor.breakable_cuda_graph.xpu_breakable_graph import (
+            is_xpu_breakable_capturing,
+            run_eager_between_segments,
+        )
+
+        if is_xpu_breakable_capturing():
+            return run_eager_between_segments(_xpu_all_reduce_inplace, x, self.group)
         dist.all_reduce(x, group=self.group)
         return x
 

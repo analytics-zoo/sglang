@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
@@ -86,6 +87,17 @@ _is_fp8_fnuz = is_fp8_fnuz()
 # the SHUFFLE 5D pool layout has no consumer kernels, so the env var is
 # silently ignored and the legacy NHD layout is used.
 _use_aiter = bool(envs.SGLANG_USE_AITER.get()) and _is_hip
+_is_xpu = is_xpu()
+
+# Optional fused KV-cache scatter (single ESIMD launch replaces the 2 advanced-
+# index scatters in the XPU naive fallback). Import is best-effort; absence just
+# keeps the naive path.
+_esimd_kv_scatter = None
+if _is_xpu:
+    try:
+        from custom_esimd_kernels_sglang import esimd_kv_scatter as _esimd_kv_scatter
+    except ImportError:
+        pass
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -128,6 +140,28 @@ def _set_kv_buffer_impl(
             indices,
             row_dim,
         )
+
+    # XPU: fuse the two advanced-index scatters into one ESIMD launch. Pure
+    # copy (no scale/cast on this path since cache dtype == model dtype), so the
+    # write is bit-identical to k_cache[indices]=k; v_cache[indices]=v. Falls
+    # back to the naive path if the kernel is unavailable or the shape is unfit.
+    if (
+        _is_xpu
+        and same_kv_dim
+        and _esimd_kv_scatter is not None
+        and store_dtype.itemsize == 2
+        and row_dim % 32 == 0
+        and k.numel() > 0
+    ):
+        idx = indices if indices.dtype == torch.int64 else indices.to(torch.int64)
+        _esimd_kv_scatter(
+            k.reshape(-1, row_dim),
+            v.reshape(-1, row_dim),
+            k_cache.view(-1, row_dim),
+            v_cache.view(-1, row_dim),
+            idx,
+        )
+        return
 
     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
@@ -1541,7 +1542,9 @@ class RowParallelLinear(LinearBase):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            if self.use_dp_attention_reduce:
+            if os.environ.get("SGLANG_SKIP_ALLREDUCE") == "1" and input_.shape[0] == 1:
+                output = output_parallel
+            elif self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
                 quantize_communications = (

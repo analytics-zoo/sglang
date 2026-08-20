@@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+_esimd_gemv_fp16 = None
+try:
+    from custom_esimd_kernels_sglang import esimd_gemv_fp16 as _esimd_gemv_fp16
+except ImportError:
+    pass
+
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -901,6 +907,18 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif (
+                _esimd_gemv_fp16 is not None
+                and hidden_states.is_xpu
+                and hidden_states.shape[0] == 1
+                # oneDNN picks a slow kernel variant ({32,2,8}) at N=131072 in steady-state decode
+            ):
+                if not hasattr(lm_head, "_esimd_fp16_weight"):
+                    lm_head._esimd_fp16_weight = lm_head.weight.to(torch.float16).contiguous()
+                w = lm_head._esimd_fp16_weight
+                inp = hidden_states.to(torch.float16).contiguous()
+                out = torch.empty(1, w.shape[0], dtype=torch.float16, device=hidden_states.device)
+                logits = _esimd_gemv_fp16(inp, w, out)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

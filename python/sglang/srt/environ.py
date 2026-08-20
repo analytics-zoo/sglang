@@ -656,6 +656,11 @@ class Envs:
     # Breakable CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
 
+    # XPU breakable graph: capture the decode forward as XPUGraph segments split
+    # at each TP all-reduce, running the (non-capturable) oneCCL collective eager
+    # between segments. Fixes the TP>1 XPU-graph decode garble.
+    SGLANG_XPU_BREAKABLE_GRAPH = EnvBool(False)
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 

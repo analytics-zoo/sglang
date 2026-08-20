@@ -60,8 +60,51 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+# Diagnostic: report logits/probs stats around temperature scaling. Costs a
+# device->host sync per decode step, so it is off by default.
+SGLANG_SAMPLER_DEBUG_NAN = get_bool_env_var("SGLANG_SAMPLER_DEBUG_NAN")
+_sampler_debug_reports = 0
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+
+def _debug_report_sampling_inputs(
+    logits: torch.Tensor, sampling_info: SamplingBatchInfo
+) -> None:
+    """Report whether non-finite values exist before vs. after temperature
+    scaling. Distinguishes a model-side NaN from an overflow introduced by the
+    division itself (e.g. fp16 logits with a tiny temperature)."""
+    global _sampler_debug_reports
+    if _sampler_debug_reports >= 20:
+        return
+
+    pre_bad = int((~torch.isfinite(logits)).sum().item())
+    pre_absmax = float(logits.abs().amax().item()) if logits.numel() else 0.0
+    temps = sampling_info.temperatures
+    tmin = float(temps.min().item())
+    scaled = logits.to(torch.float32) / temps.to(torch.float32)
+    post_bad = int((~torch.isfinite(scaled)).sum().item())
+
+    if pre_bad or post_bad:
+        _sampler_debug_reports += 1
+        logger.error(
+            "[sampler-debug] non-finite logits: dtype=%s shape=%s temp_min=%.6g "
+            "pre_absmax=%.6g pre_nonfinite=%d post_nonfinite=%d",
+            logits.dtype,
+            tuple(logits.shape),
+            tmin,
+            pre_absmax,
+            pre_bad,
+            post_bad,
+        )
+    elif _sampler_debug_reports < 3:
+        _sampler_debug_reports += 1
+        logger.info(
+            "[sampler-debug] clean step: dtype=%s temp_min=%.6g pre_absmax=%.6g",
+            logits.dtype,
+            tmin,
+            pre_absmax,
+        )
 
 
 class Sampler(nn.Module):
@@ -175,6 +218,9 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
+                if SGLANG_SAMPLER_DEBUG_NAN:
+                    _debug_report_sampling_inputs(logits, sampling_info)
+
                 logits.div_(sampling_info.temperatures)
 
                 # In-place op to save memory
