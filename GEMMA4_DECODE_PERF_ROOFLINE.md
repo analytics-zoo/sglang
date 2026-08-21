@@ -158,7 +158,6 @@ trace 归因（vs opt#1 同 prefill 窗口）：激活量化链 `PerTensorQuant`
 4576ms→2449ms（1.87×，`torch._scaled_mm` tile{128;4;1} → `fp8_gemm_w8a16` tile{64;8;1}）；prefill self −28.7%。
 ⚠️ follow-up：in-server W8A16 GEMM 144 TF/s vs standalone microbench 69 TF/s（2× gap），
 TTFT 大胜同时来自去量化 **和** 更快的 GEMM dispatch，归因待厘清。
-（详见 `GEMMA4_BMG_OPTIMIZATION_STATUS.md` 的 opt#2 节。）
 
 **TPOT 43 vs 旧 39ms —— 已实测定因，非本优化引入**：同 server 运行时 A/B（无 unitrace，warmup2/trials3）
 W8A16 ON = 43.3/42.5ms（1k/4k）、OFF(opt#1) = 43.4/44.3ms → **W8A16 对 TPOT 中性**（ON≈OFF，OFF 略高）。
@@ -313,8 +312,7 @@ lm_head weight already fp16, `.to(fp16).contiguous()` is no-op).
 > ⚠️ **2026-07-03 已被推翻——VL256 现为默认。** 本节的 "VL256 回退 +2-3%" 系 **rebuild-confound
 > + 节点争用噪声**（旧 A/B 两侧是不同 binary、非同时刻）。用 **同一 binary + env-gate**（`SGLANG_GEMV_VL_CAP`）
 > 复测后 VL256 实为中性偏优（−0.06ms），并经 unitrace 逐 shape 坐实（down_proj in-server 91→93%）。
-> **现默认 VL256**（`SGLANG_GEMV_VL_CAP` 默认 256）。详见 `GEMMA4_BMG_OPTIMIZATION_STATUS.md`
-> "GEMV tile 复调优：VL512→256（采纳）"。以下原文保留作记录。
+> **现默认 VL256**（`SGLANG_GEMV_VL_CAP` 默认 256）。以下原文保留作记录。
 
 **正确的 decode 内核位置**（此前一度找错到 `custom-esimd-kernels-sglang` 的 `fp8_GEMV_v2.h`，那是 decode 死代码）：
 - 包：`/workspace/custom-esimd-kernels/`（`python_v2`），op `torch.ops.custom_esimd_kernels.esimd_gemm_fp8_pert`。

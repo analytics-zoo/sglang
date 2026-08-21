@@ -133,8 +133,7 @@ interleave deadlocks) or (b) make the collective graph-capturable.
 
 ## Related
 
-- Split-K TPOT-grows-with-ctx (separate, graph-only) analysis: see
-  `GEMMA4_BMG_OPTIMIZATION_STATUS.md` "Known Issue" — moot for eager (eager uses all
-  4 splits; chunk ≈ ctx/4).
+- Split-K TPOT growth with context is graph-only and does not affect eager
+  mode, which uses all four splits with chunk size approximately `ctx/4`.
 - Commits (local only, unpushed): `2e811f49d3` (garble root-cause + eager verified),
   `6eaf848187` (SWA order fix + breakable-graph WIP).
