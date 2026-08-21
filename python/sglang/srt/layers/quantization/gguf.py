@@ -1503,6 +1503,9 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
             scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
         return ("q8_0", qs, scale)
     if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
+        # _xpu_repack_q4_k_chunked has no col_perm support; fail loudly rather
+        # than silently dropping the permute and producing wrong weights.
+        assert col_perm is None, "q4_k GDN out_proj col-perm unsupported"
         ql, scale, minv = _xpu_repack_q4_k_chunked(qweight)
         return ("q4_k", ql, scale, minv)
     _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"

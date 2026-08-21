@@ -732,15 +732,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("out_proj", prefix),
         )
-        # NOTE (Qwen3.6 ratio=2 GGUF): out_proj's input (value-head) columns are
+        # NOTE (Qwen3.6 GGUF): out_proj's input (value-head) columns are
         # stored by GGUF in [ratio, num_k] order but HF/core_attn_out expects
-        # [num_k, ratio]. This is an INPUT-dim (column) permute. It CANNOT be done
-        # per-rank in the XPU method (the older `_gguf_gdn_col_perm` path): under
-        # TP the value-head grouping crosses the RowParallel input-shard boundary
-        # (rank0's HF heads map to GGUF cols in BOTH ratio halves), so a per-rank
-        # reshape is impossible. Instead it is applied to the GLOBAL pre-shard
-        # weight in `_gguf_gdn_transform` (raw-byte, head_v_dim-granular; safe on
-        # Q8_0 whose block=32 divides head_v_dim). At ratio=1 the layouts coincide.
+        # [num_k, ratio]. This is an INPUT-dim (column) permute, and under TP the
+        # value-head grouping crosses the RowParallel input-shard boundary
+        # (rank0's HF heads map to GGUF cols in BOTH ratio halves), so it cannot
+        # be done entirely per-rank. It is applied to the GLOBAL pre-shard weight
+        # in `_gguf_gdn_transform`: as a single raw-byte per-head permute when
+        # head_v_dim is a multiple of the quant block (the 35B's Q8_0, block=32),
+        # or otherwise split into a coarse pre-shard group permute plus a
+        # per-rank element-order permute carried by `_gguf_gdn_col_perm` (the
+        # 27B's Q5_K, whose 256-elem super-block is twice head_v_dim).
+        # At ratio=1 the layouts coincide.
 
     def rebind_device_views(self):
         """Re-derive tensors that alias conv1d.weight's storage.
@@ -3454,11 +3457,41 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+
+        # GGUF load-path detection. A GGUF checkpoint stores weights in
+        # llama.cpp conventions that differ from the HF safetensors this model
+        # code expects; the fixups below mirror the MoE class one-for-one,
+        # minus shared_expert_gate (no MoE layers in the dense arch):
+        #   * GemmaRMSNorm weights are stored standard (~1.0), but GemmaRMSNorm
+        #     computes x*(1+w) so the param must be (standard-1) -> subtract 1.
+        #   * GDN linear_attn.* needs the value-head permute / A_log / dt_bias
+        #     transform (_gguf_gdn_transform).
+        #   * conv1d is stored 2-D [ch, kernel] but the param is 3-D.
+        _is_gguf = (
+            getattr(self, "quant_config", None) is not None
+            and getattr(self.quant_config, "get_name", lambda: "")() == "gguf"
+        )
+        # The GDN linear_attn.norm uses plain RMSNormGated (no offset) -- exclude.
+        _gemma_norm_suffixes = (
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_norm.weight",
+            "self_attn.k_norm.weight",
+        )
+
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
                 continue
+            if _is_gguf and (
+                name.endswith(_gemma_norm_suffixes)
+                or name == "model.language_model.norm.weight"
+                or name == "model.norm.weight"
+            ):
+                loaded_weight = loaded_weight - 1.0
+            if _is_gguf and ".linear_attn." in name:
+                loaded_weight = self._gguf_gdn_transform(name, loaded_weight)
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -3490,6 +3523,22 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                # GGUF F32 GDN gate shards (ssm_beta/ssm_alpha -> in_proj_b/a)
+                # are yielded as `.weight`: the gguf iterator only renames
+                # non-F32 tensors to `.qweight`. But the fused `in_proj_ba` is a
+                # GGUF quantized module whose merged param is `.qweight`, so the
+                # F32 `...in_proj_ba.weight` target is absent from params_dict
+                # and the shard would otherwise fall through to the non-stacked
+                # branch, losing its shard_id (-> shard_id=[None, None] and an
+                # unsortable merge in GGUFLinearXPUMethod). Redirect here,
+                # inside the stacked loop, so the shard_id is preserved.
+                if (
+                    _is_gguf
+                    and name.endswith(".weight")
+                    and name not in params_dict
+                    and (name[: -len(".weight")] + ".qweight") in params_dict
+                ):
+                    name = name[: -len(".weight")] + ".qweight"
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -3516,6 +3565,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     logger.warning(f"Parameter {name} not found in params_dict")
                     continue
                 param = params_dict[name]
+
+                # GGUF stores conv1d 2-D [ch, kernel] but the param is
+                # 3-D [ch, 1, kernel]; insert the singleton middle dim.
+                if (
+                    _is_gguf
+                    and "conv1d.weight" in name
+                    and loaded_weight.dim() == 2
+                    and param.dim() == 3
+                ):
+                    loaded_weight = loaded_weight.unsqueeze(1)
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
@@ -3608,9 +3667,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         Permuting whole *rows* (dim 0) is bit-identical on quantized bytes since
         GGUF packs each output row contiguously (verified: dequant∘rowperm ==
         rowperm∘dequant, max diff 0). Therefore every transform here is a dim-0
-        row permutation only. ``out_proj`` needs an INPUT-dim (column) permute
-        that would break q-blocks, so it is handled post-dequant in the XPU
-        method (see GGUFLinearXPUMethod), not here. The key-head q/k slices of
+        row permutation only, EXCEPT ``out_proj``, which needs an INPUT-dim
+        (column) permute; see that branch for how it avoids splitting q-blocks.
+        The key-head q/k slices of
         in_proj_qkv / conv1d are NOT permuted. (notes §3.6.)
         """
         # The weight iterator also yields per-tensor ``qweight_type`` scalars
@@ -3644,15 +3703,62 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # contiguous span of the last axis (block_bytes // nv bytes, or head_v_dim
         # elems). Reordering whole per-head spans is bit-identical to a
         # post-dequant column permute (verified vs HF golden, maxdiff = quant
-        # error) because head_v_dim (128) is a multiple of the Q8_0 block (32),
-        # so no packed block is split. Verified: dequant(colperm(raw)) == HF.
+        # error) ONLY IF head_v_dim is a multiple of the quant block, so that no
+        # packed block is split. That holds for the 35B (Q8_0 block=32 divides
+        # head_v_dim=128) but NOT for k-quants whose super-block is 256 elems
+        # (the 27B's ssm_out is Q5_K: head_v_dim=128 is HALF a super-block, and
+        # a super-block's shared d/dmin/scales header plus its de-interleaved
+        # qh/qs payload means no byte range maps to a contiguous element range
+        # at all). See the two-level path below for that case.
         if ".linear_attn.out_proj." in name:
-            span = w.shape[1] // nv  # bytes-per-head (raw) or head_v_dim (F32)
             assert w.shape[1] % nv == 0, (
                 f"out_proj last dim {w.shape[1]} not divisible by nv={nv}"
             )
+            span = w.shape[1] // nv  # bytes-per-head (raw) or head_v_dim (F32)
+            hvd = tc.linear_value_head_dim
+            block_elems = self._gguf_block_elems(w.shape[1], nv * hvd)
+            if hvd % block_elems == 0:
+                # Block-safe: whole per-head spans are whole quant blocks.
+                return (
+                    w.reshape(w.shape[0], ratio, nk, span)
+                    .transpose(1, 2)
+                    .reshape(w.shape)
+                    .contiguous()
+                )
+            # Not block-safe (k-quant with head_v_dim < super-block). Split the
+            # permute into two levels so neither one ever cuts a packed block:
+            #   (1) HERE, on the GLOBAL pre-shard weight, permute at the
+            #       coarser (nk // tp)-head GROUP granularity. That is all the
+            #       cross-rank regrouping there is: it just moves each rank's
+            #       columns into its own contiguous RowParallel slice, and a
+            #       group spans (nk // tp) * head_v_dim elems, a whole number of
+            #       super-blocks. After it, each rank's slice holds exactly its
+            #       columns in [ratio, nk_loc] order.
+            #   (2) PER-RANK, in element order, via layer._gguf_gdn_col_perm:
+            #       _xpu_repack_* unpacks -> permutes -> repacks, turning
+            #       [ratio, nk_loc] into HF's [nk_loc, ratio]. Never splits a
+            #       block because it works on unpacked elements.
+            # The two compose to exactly the full [ratio, nk] -> [nk, ratio]
+            # value-head permute.
+            mod = self._resolve_gdn_out_proj(name)
+            tp = int(getattr(mod, "tp_size", 1) or 1)
+            if nk % tp != 0:
+                raise ValueError(
+                    f"GGUF GDN out_proj col-permute: linear_num_key_heads={nk} "
+                    f"is not divisible by out_proj tp_size={tp}."
+                )
+            nk_loc = nk // tp
+            if (nk_loc * hvd) % block_elems != 0:
+                raise ValueError(
+                    f"GGUF GDN out_proj col-permute: (nk/tp)*head_v_dim = "
+                    f"{nk_loc}*{hvd} = {nk_loc * hvd} is not a multiple of the "
+                    f"quant block ({block_elems} elems) for {name}; the "
+                    f"pre-shard group permute would split a packed block. "
+                    f"Use a smaller tp_size."
+                )
+            mod._gguf_gdn_col_perm = (ratio, nk_loc, hvd)
             return (
-                w.reshape(w.shape[0], ratio, nk, span)
+                w.reshape(w.shape[0], ratio, tp, nk_loc * span)
                 .transpose(1, 2)
                 .reshape(w.shape)
                 .contiguous()
@@ -3684,6 +3790,49 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 [q, k, self._perm_value_rows(v, ratio, nk)], dim=0
             ).contiguous()
         return w
+
+    @staticmethod
+    def _gguf_block_elems(nbytes_last: int, n_elems: int) -> int:
+        """Recover the GGUF quant block size, in ELEMENTS, of a raw-byte last
+        axis of ``nbytes_last`` bytes that encodes ``n_elems`` values.
+
+        Returns 1 when the tensor carries real (unquantized) values, i.e. the
+        weight iterator already dequantized it, so any element-granular permute
+        is exact. Used to decide whether a raw-byte column permute would split
+        a packed block.
+        """
+        if nbytes_last == n_elems:
+            return 1
+        import gguf as _gguf
+
+        cands = [
+            be
+            for be, ts in _gguf.GGML_QUANT_SIZES.values()
+            if be and n_elems % be == 0 and (n_elems // be) * ts == nbytes_last
+        ]
+        if not cands:
+            raise ValueError(
+                f"cannot infer GGUF block size: last axis of {nbytes_last} "
+                f"bytes encoding {n_elems} elements matches no GGML quant type"
+            )
+        # Ambiguity is only possible between types with identical bytes/elem;
+        # take the largest block, which is the conservative choice (it can only
+        # push us onto the safe two-level path, never off it).
+        return max(cands)
+
+    def _resolve_gdn_out_proj(self, name: str) -> torch.nn.Module:
+        """Resolve the ``linear_attn.out_proj`` module that a GGUF weight named
+        ``name`` belongs to, so its per-rank column permute can be recorded."""
+        marker = ".linear_attn.out_proj."
+        path = name.replace("model.language_model.", "model.")
+        path = path[: path.index(marker)] + ".linear_attn.out_proj"
+        try:
+            return self.get_submodule(path)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"GGUF GDN out_proj col-permute: cannot resolve module "
+                f"'{path}' for weight '{name}'"
+            ) from exc
 
     @staticmethod
     def _perm_value_rows(t: torch.Tensor, ratio: int, nk: int) -> torch.Tensor:
@@ -4090,5 +4239,22 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
+
+# The GGUF GDN layout transform is arch-independent (it only reads
+# linear_num_{key,value}_heads / linear_{key,value}_head_dim), so the dense
+# class reuses the MoE implementation rather than duplicating it. Bound here
+# because Qwen3_5MoeForConditionalGeneration is defined after the dense class.
+Qwen3_5ForConditionalGeneration._gguf_gdn_transform = (
+    Qwen3_5MoeForConditionalGeneration._gguf_gdn_transform
+)
+Qwen3_5ForConditionalGeneration._perm_value_rows = staticmethod(
+    Qwen3_5MoeForConditionalGeneration._perm_value_rows
+)
+Qwen3_5ForConditionalGeneration._gguf_block_elems = staticmethod(
+    Qwen3_5MoeForConditionalGeneration._gguf_block_elems
+)
+Qwen3_5ForConditionalGeneration._resolve_gdn_out_proj = (
+    Qwen3_5MoeForConditionalGeneration._resolve_gdn_out_proj
+)
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
