@@ -2184,6 +2184,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8
             assert self.is_fp4_expert == use_mxfp4_w4a16
 
+            # TODO: Replace this hard-coded Gemma4-26B TP=2 shape gate with
+            # model/quant-config-driven kernel capability matching.
             is_gemma4_26b_tp2 = (
                 x.dim() == 2
                 and x.shape[1] == 2816
