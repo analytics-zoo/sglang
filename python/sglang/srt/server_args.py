@@ -1233,7 +1233,16 @@ class ServerArgs:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
         if self.speculative_draft_model_quantization is None:
-            self.speculative_draft_model_quantization = self.quantization
+            quantization = self.quantization
+            if quantization is None and self.load_format in ("auto", "gguf"):
+                # GGUF is auto-detected from the file, but that only happens
+                # later in _handle_load_format(); without this the draft would
+                # inherit `None` and be built unquantized, which silently
+                # dequantizes the whole draft model to dense fp16.
+                draft_path = self.speculative_draft_model_path or self.model_path
+                if draft_path is not None and check_gguf_file(draft_path):
+                    quantization = "gguf"
+            self.speculative_draft_model_quantization = quantization
         elif self.speculative_draft_model_quantization == "unquant":
             self.speculative_draft_model_quantization = None
 

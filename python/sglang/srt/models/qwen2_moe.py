@@ -304,6 +304,16 @@ def _esimd_router_logits(gate, hidden_states: torch.Tensor):
 _ESIMD_MOE_FULL = os.environ.get("SGL_XPU_ESIMD_MOE_FULL", "0") == "1"
 _ESIMD_MOE_FULL_OP = "unset"
 _MOE_FULL_DEBUG = os.environ.get("SGL_XPU_MOE_FULL_DEBUG", "0") == "1"
+# Largest token count still routed to the single-dispatch fused MoE ops
+# (moe_forward_full_rtfused / moe_forward_full). Historically both were gated to
+# exactly one token because they were written for BSZ=1 decode, but every kernel
+# inside them is parameterised by n_tokens (the router+topk kernel is one
+# work-group per token), so the limit was a policy, not a constraint. It matters
+# for speculative decoding: the MTP verify step runs M = num_draft_tokens and
+# was therefore falling back to moe_forward_full_v2 *plus* a separate router
+# dispatch on all 40 layers. Kept as an env knob so the old behaviour is one
+# variable away.
+_MOE_FUSED_MAX_M = int(os.environ.get("SGL_XPU_MOE_FUSED_MAX_M", "1"))
 _MOE_FULL_DEBUG_N = 0
 
 
@@ -366,6 +376,19 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
     shared expert weights/scales, the gate module, and routing dims, or None to
     fall back. Layout/dtype checks here guarantee a bad tensor never reaches the
     kernel."""
+    # Everything below is derived purely from `block`'s (static, post-load)
+    # weights -- `x` is only used for debug messages -- yet this ran once per
+    # MoE layer per forward: 40 calls/forward of ~40 getattr+validate steps plus
+    # four _pt_scale_1d() allocations each (160 small tensors/forward). Profiling
+    # the MTP verify step put that at ~1.5 ms/forward of pure python. Memoise the
+    # resolved dict on the block. It holds references to already-resident
+    # weights; the only new memory is the four collapsed fp32 [E] scale vectors
+    # per layer (~4 KB/layer, ~160 KB for a 40-layer model), which the old code
+    # allocated and threw away every forward anyway.
+    cached = getattr(block, "_esimd_moe_full_W", None)
+    if cached is not None:
+        return cached
+
     experts = getattr(block, "experts", None)
     shared = getattr(block, "shared_expert", None)
     sgate = getattr(block, "shared_expert_gate", None)
@@ -446,7 +469,7 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
         return None
     sgw16 = (sgw if sgw.dtype == torch.float16 else sgw.to(torch.float16)).contiguous()
 
-    return {
+    W = {
         "gate": gate,
         "top_k": int(top_k),
         "n_routed": int(w13.shape[0]),
@@ -457,6 +480,8 @@ def _gather_moe_full_weights(block, x: torch.Tensor):
         "shared_down": shared_down, "ss2": ss2,
         "sgw16": sgw16,
     }
+    block._esimd_moe_full_W = W
+    return W
 
 
 _GGUF_INTROSPECT_DONE = set()
@@ -845,7 +870,7 @@ def _maybe_esimd_moe_full(block, hidden_states: torch.Tensor):
     # Fall back to moe_forward_full (fused down_finalize, separate router+topk)
     # when the quant isn't available, and to moe_forward_full_v2 for multi-token.
     rt = ops.get("rtfused")
-    if x.shape[0] == 1 and rt is not None:
+    if x.shape[0] <= _MOE_FUSED_MAX_M and rt is not None:
         wqsc = _esimd_router_wq_scale(gate, x)
         if wqsc is not None:
             wq, sc = wqsc
@@ -876,7 +901,11 @@ def _maybe_esimd_moe_full(block, hidden_states: torch.Tensor):
 
     # BSZ=1 decode -> moe_forward_full (fused down_finalize, 5 internal kernels).
     # Multi-token or missing op -> moe_forward_full_v2 (7 internal kernels).
-    op = ops.get("full") if (x.shape[0] == 1 and ops.get("full") is not None) else ops["v2"]
+    op = (
+        ops.get("full")
+        if (x.shape[0] <= _MOE_FUSED_MAX_M and ops.get("full") is not None)
+        else ops["v2"]
+    )
     try:
         out = op(
             x_in, logits,
@@ -917,7 +946,9 @@ def _maybe_esimd_moe_full_norm(block, hidden_states, residual, norm_weight_folde
     if rtn is None:
         return None
     x = hidden_states
-    if x.device.type != "xpu" or x.dim() != 2 or x.shape[0] != 1:
+    if x.device.type != "xpu" or x.dim() != 2 or not (
+        1 <= x.shape[0] <= _MOE_FUSED_MAX_M
+    ):
         return None
     if residual is None or residual.dim() != 2 or residual.shape != x.shape:
         return None
@@ -952,7 +983,7 @@ def _maybe_esimd_moe_full_norm(block, hidden_states, residual, norm_weight_folde
     if not isinstance(out, (list, tuple)) or len(out) != 2:
         return None
     if _MOE_FULL_DEBUG:
-        _moe_full_dbg("SUCCESS", T=1, E=W["n_routed"], top_k=W["top_k"],
+        _moe_full_dbg("SUCCESS", T=x.shape[0], E=W["n_routed"], top_k=W["top_k"],
                       out=tuple(out[0].shape), path="rtfused_norm")
     return out[0], out[1]
 
@@ -1452,13 +1483,24 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if not (
             hidden_states.device.type == "xpu"
             and forward_batch is not None
-            and forward_batch.forward_mode.is_decode()
+            and (
+                forward_batch.forward_mode.is_decode()
+                # The MTP verify step lands here too. Everything this fusion
+                # reproduces (the attention all-reduce, the post-attention
+                # GemmaRMSNorm, the post-experts all-reduce) is mode-independent
+                # once the plain-TP guards below hold, and the norm-fused MoE
+                # kernel is one-work-group-per-token, so M>1 is fine. Leaving
+                # verify out was what forced it onto the unfused
+                # gemma_fused_add_rmsnorm + standalone router path (80 extra
+                # norm dispatches per verify forward).
+                or forward_batch.forward_mode.is_target_verify()
+            )
         ):
-            return _skip("not xpu decode")
-        # M>1 is only serviceable by the GGUF norm-fused op; the fp8 twin
-        # (_maybe_esimd_moe_full_norm) is still single-token. Without GGUF we
-        # keep the original M==1 gate so fp8-only setups are untouched.
-        max_m = _GGUF_MOE_FUSE_MAX_M if have_gguf else 1
+            return _skip("not xpu decode/verify")
+        # M>1 is serviceable by the GGUF norm-fused op and, since the router
+        # kernel is per-token, by the fp8 twin as well (_MOE_FUSED_MAX_M, the
+        # same knob that gates moe_forward_full_rtfused).
+        max_m = _GGUF_MOE_FUSE_MAX_M if have_gguf else _MOE_FUSED_MAX_M
         if hidden_states.dim() != 2 or not (1 <= hidden_states.shape[0] <= max_m):
             return _skip("shape %s" % (tuple(hidden_states.shape),))
         if residual is None or residual.shape != hidden_states.shape:

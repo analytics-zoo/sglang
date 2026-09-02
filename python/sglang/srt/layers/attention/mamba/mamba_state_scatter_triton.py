@@ -115,6 +115,29 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"dst and src must be on the same device. {dst.device=} {src.device=}"
         )
+    if dst.device.type == "xpu":
+        # ESIMD SYCL kernel from custom_esimd_kernels_sglang mirrors this
+        # function exactly: same [L, cache, *state] / [L, spec, draft, *state]
+        # layout and the same raw-index masking (step < 0 -> skip, dst index
+        # bounds-checked), so it is a drop-in replacement for the Triton path.
+        # It requires int32 indices and contiguous state buffers.
+        # Importing the extension registers the torch.ops.eagle_ops namespace;
+        # do it lazily so non-XPU platforms never touch it.
+        import custom_esimd_kernels_sglang  # noqa: F401
+
+        if not dst.is_contiguous():
+            # dst is written in place; .contiguous() would silently redirect the
+            # kernel's writes into a discarded temporary.
+            raise ValueError(
+                "fused_mamba_state_scatter_with_mask on XPU requires a "
+                "contiguous dst; got a non-contiguous state buffer."
+            )
+        return torch.ops.eagle_ops.mamba_state_scatter(
+            dst,
+            src.contiguous(),
+            dst_indices_raw.to(torch.int32),
+            step_indices_raw.to(torch.int32),
+        )
     if not dst.is_cuda or not src.is_cuda:
         raise ValueError(
             "fused_mamba_state_scatter_with_mask only supports CUDA tensors."

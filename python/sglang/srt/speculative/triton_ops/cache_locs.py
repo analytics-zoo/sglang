@@ -4,12 +4,13 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_xpu = is_xpu()
 
 
 @triton.jit
@@ -403,3 +404,23 @@ def assign_extend_cache_locs_func(
         )
 
         return out_cache_loc
+
+    elif _is_xpu:
+        # Pure-torch gather: every request contributes exactly draft_token_num
+        # slots here (end_offset == start_offset + draft_token_num), so the
+        # Triton kernel's running prefix-sum degenerates to pid * draft_token_num
+        # and the whole op reduces to one gather of batch_size * draft_token_num
+        # elements. Matches the CUDA branch's int64 output dtype.
+        rows = req_to_token[req_pool_indices.long()]
+        col_idx = start_offset.long().view(-1, 1) + torch.arange(
+            draft_token_num, device=device, dtype=torch.int64
+        ).view(1, -1)
+        return (
+            torch.gather(rows, 1, col_idx).reshape(-1).contiguous().to(torch.int64)
+        )
+
+    raise RuntimeError(
+        "assign_extend_cache_locs_func has no implementation for the current "
+        "platform; it must never fall through and return None (callers assign "
+        "the result straight to batch.out_cache_loc)."
+    )
