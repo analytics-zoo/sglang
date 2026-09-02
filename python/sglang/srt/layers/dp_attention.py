@@ -310,6 +310,14 @@ def initialize_dp_attention(
         device=torch.device(server_args.device),
     )
 
+    # sglang.srt.layers.moe.utils memoises predicates that read the DP-attention
+    # globals set above, and initialize_moe_config() runs *before* this function
+    # (scheduler init vs. model-runner init), so drop those cached values here
+    # too. Imported locally: moe.utils imports from this module.
+    from sglang.srt.layers.moe.utils import _invalidate_moe_predicate_cache
+
+    _invalidate_moe_predicate_cache()
+
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG

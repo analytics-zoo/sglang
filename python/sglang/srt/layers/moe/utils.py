@@ -258,6 +258,19 @@ DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
 
+# Memoised results of the should_use_* predicates below. Every one of their
+# inputs is a process-global fixed by initialize_moe_config(), so they are
+# constant for the life of the process; recomputing them per MoE layer per
+# forward is measurable python overhead in decode.
+_FLASHINFER_CUTLASS_FP4_ALLGATHER: Optional[bool] = None
+_DP_REDUCE_SCATTERV: Optional[bool] = None
+
+
+def _invalidate_moe_predicate_cache() -> None:
+    global _FLASHINFER_CUTLASS_FP4_ALLGATHER, _DP_REDUCE_SCATTERV
+    _FLASHINFER_CUTLASS_FP4_ALLGATHER = None
+    _DP_REDUCE_SCATTERV = None
+
 
 def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
@@ -298,6 +311,7 @@ def initialize_moe_config(server_args: ServerArgs):
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
     MOE_QUANTIZATION = server_args.quantization
+    _invalidate_moe_predicate_cache()
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -403,14 +417,22 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
     """
-    return (
-        not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
-        and get_moe_a2a_backend().is_none()
-        and get_moe_runner_backend().is_flashinfer_cutlass()
-        and is_dp_attention_enabled()
-        and MOE_QUANTIZATION == "modelopt_fp4"
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
-    )
+    # Memoised: every input is a process-global set once by
+    # initialize_moe_config(), but this was re-evaluated (with its 4 nested
+    # helper calls) twice per MoE layer per forward -- 80 calls/forward on a
+    # 40-layer model, and it shows up in decode profiles as pure python
+    # overhead. _invalidate_moe_predicate_cache() clears it on reconfigure.
+    global _FLASHINFER_CUTLASS_FP4_ALLGATHER
+    if _FLASHINFER_CUTLASS_FP4_ALLGATHER is None:
+        _FLASHINFER_CUTLASS_FP4_ALLGATHER = (
+            not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+            and get_moe_a2a_backend().is_none()
+            and get_moe_runner_backend().is_flashinfer_cutlass()
+            and is_dp_attention_enabled()
+            and MOE_QUANTIZATION == "modelopt_fp4"
+            and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        )
+    return _FLASHINFER_CUTLASS_FP4_ALLGATHER
 
 
 def should_use_dp_reduce_scatterv():
@@ -419,13 +441,16 @@ def should_use_dp_reduce_scatterv():
     with EP, replacing the default all-reduce + dp_scatter path.
     Only changes the combine (post-kernel) communication; dispatch is unchanged.
     """
-    return (
-        not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        and get_moe_a2a_backend().is_none()
-        and is_dp_attention_enabled()
-        and get_attention_dp_size() > 1
-        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
-    )
+    global _DP_REDUCE_SCATTERV
+    if _DP_REDUCE_SCATTERV is None:
+        _DP_REDUCE_SCATTERV = (
+            not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and get_moe_a2a_backend().is_none()
+            and is_dp_attention_enabled()
+            and get_attention_dp_size() > 1
+            and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+        )
+    return _DP_REDUCE_SCATTERV
 
 
 def should_skip_post_experts_all_reduce(
