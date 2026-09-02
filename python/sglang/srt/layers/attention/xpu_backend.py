@@ -397,7 +397,15 @@ class XPUAttentionBackend(AttentionBackend):
                     torch.int32
                 )
             )
-        result = (kv_indptr, kv_indices, temp_p, graph_max_seq)
+        # Pass the REAL max sequence length, not the constant graph_max_seq.
+        # graph_max_seq is only the scratch-shape bound (SPLIT_TILE*MAX_N_SPLITS);
+        # feeding it as max_seq_len made the kernel size its split grid for
+        # 16384 tokens regardless of the actual length, so every token past
+        # 16384 was silently dropped (and the kernel-side n_splits assert could
+        # never fire). The kernel now grows its per-work-item tile instead, so
+        # n_splits still stays <= MAX_N_SPLITS and temp_p sizing is unchanged.
+        attn_max_seq = min(max_seq_len_k, window_tokens) if is_swa else max_seq_len_k
+        result = (kv_indptr, kv_indices, temp_p, int(max(attn_max_seq, 1)))
         try:
             setattr(metadata, cache_attr, result)
         except Exception:
@@ -646,9 +654,6 @@ class XPUAttentionBackend(AttentionBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             # Draft Decode
             if forward_batch.spec_info is not None:
-                assert (
-                    False
-                ), "XPUAttentionBackend doesn't support speculative decoding yet, please use --attention-backend triton instead."
                 if self.topk <= 1:
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
@@ -862,7 +867,9 @@ class XPUAttentionBackend(AttentionBackend):
                         metadata, metadata_expand
                     )
 
-        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        elif forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
@@ -874,7 +881,7 @@ class XPUAttentionBackend(AttentionBackend):
 
             if (
                 any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
             ):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
@@ -1517,7 +1524,12 @@ class XPUAttentionBackend(AttentionBackend):
                     kv_indptr = metadata.kv_indptr
                     kv_indices = metadata.kv_indices
                     temp_p = self._graph_state["sglang_temp_p"]
-                    graph_max_seq = self._sglang_decode_graph_max_seq
+                    # Real length, not the scratch-shape constant -- see
+                    # _build_sglang_decode_attn_inputs_eager for why.
+                    _msk = getattr(metadata, "max_seq_len_k", None)
+                    if not isinstance(_msk, int) or _msk <= 0:
+                        _msk = self._sglang_decode_graph_max_seq
+                    graph_max_seq = int(_msk)
                 else:
                     (
                         kv_indptr,
@@ -1665,6 +1677,16 @@ class XPUAttentionBackend(AttentionBackend):
                 # the kernel via the `window` param (see the SWA branch below):
                 # positions outside the last `window` tokens are masked to -inf,
                 # matching FA3's window_size semantics.
+                # The kernel's GQA tiling requires q_heads/kv_heads to be a
+                # multiple of 4 (it raises "gqaRatio must be a multiple of 4"
+                # otherwise, which used to crash the scheduler at decode time
+                # instead of falling back -- e.g. Qwen3.6-27B has ratio 6).
+                _pa_kv_heads = getattr(layer, "tp_k_head_num", 0) or 0
+                _pa_gqa_ok = (
+                    _pa_kv_heads > 0
+                    and layer.tp_q_head_num % _pa_kv_heads == 0
+                    and (layer.tp_q_head_num // _pa_kv_heads) % 4 == 0
+                )
                 _use_esimd_pa = (
                     not _DISABLE_ESIMD_DECODE
                     and not _DISABLE_PAGE_ATTN
@@ -1674,6 +1696,7 @@ class XPUAttentionBackend(AttentionBackend):
                     and not use_cascade_attn
                     and layer.logit_cap == 0.0
                     and q_reshaped.dtype == torch.float16
+                    and _pa_gqa_ok
                 )
                 if _use_esimd_pa:
                     bs = forward_batch.batch_size
@@ -1977,3 +2000,78 @@ class XPUAttentionBackend(AttentionBackend):
             metadata_swa.cu_seqlens_k.copy_(cu_seqlens_k)
 
         metadata.swa_spec_metadata = metadata_swa
+
+
+class XPUMultiStepDraftBackend:
+    """Multi-step EAGLE draft-decode wrapper around XPUAttentionBackend.
+
+    Mirrors FlashAttentionMultiStepBackend: one XPUAttentionBackend per draft
+    step, each pinned to its own speculative_step_id so the per-step metadata
+    (cache_seqlens = seq_lens + step_id + 1) is built correctly.
+
+    Only topk == 1 is supported: the underlying ESIMD page_attn_decode kernel
+    hard-asserts max_query_len == 1, and the topk > 1 cascade path additionally
+    needs the two-pass expand metadata that XPU has not been validated for.
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        if topk > 1:
+            raise ValueError(
+                "intel_xpu draft attention backend only supports "
+                f"--speculative-eagle-topk 1, got {topk}."
+            )
+        self.model_runner = model_runner
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.attn_backends = []
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends.append(
+                XPUAttentionBackend(
+                    model_runner,
+                    skip_prefill=True,
+                    speculative_step_id=i,
+                    topk=self.topk,
+                    speculative_num_steps=self.speculative_num_steps,
+                )
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+            encoder_lens=forward_batch.encoder_lens,
+        )
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_out_graph(
+                inner_fb, in_capture=in_capture
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_in_graph(forward_batch)
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return self.attn_backends[0].get_cuda_graph_seq_len_fill_value()
