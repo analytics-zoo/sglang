@@ -2228,6 +2228,8 @@ class GGUFModelLoader(BaseModelLoader):
             model_type = "qwen35"
         elif model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
             model_type = "qwen35moe"
+        elif model_type in ("gemma4", "gemma4_text"):
+            model_type = "gemma4"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:
@@ -2242,6 +2244,13 @@ class GGUFModelLoader(BaseModelLoader):
             if "Qwen3_5ForCausalLMMTP" in archs:
                 return self._get_gguf_weights_map_xpu_qwen35_mtp(config, gguf, arch)
             return self._get_gguf_weights_map_xpu_qwen35(config, gguf, arch)
+
+        # XPU/gemma4 GGUF: same bypass rationale as qwen35 above. The HF config
+        # is the multimodal Gemma4Config, so transformers' meta model would
+        # enumerate `model.language_model.*` names that gguf's GEMMA4
+        # TensorNameMap (keyed on the text-level `model.layers.*`) can't match.
+        if _is_xpu and model_type == "gemma4":
+            return self._get_gguf_weights_map_xpu_gemma4(config, gguf, arch)
 
         if arch is None:
             raise RuntimeError(f"Unknown gguf model_type: {model_type}")
@@ -2371,6 +2380,109 @@ class GGUFModelLoader(BaseModelLoader):
                 if gguf_name is None:
                     continue
                 gguf_full = f"{gguf_name}.{suffix}"
+            gguf_to_hf_name_map[gguf_full] = mm_name
+        return gguf_to_hf_name_map
+
+    def _get_gguf_weights_map_xpu_gemma4(self, config, gguf, arch):
+        """XPU/gemma4 GGUF name-map bypass (text tower only).
+
+        Mirrors ``_get_gguf_weights_map_xpu_qwen35``: HF param names are read
+        from the sibling checkpoint's ``model.safetensors.index.json`` (the
+        ground truth of the namespace ``Gemma4ForCausalLM.load_weights``
+        consumes) and mapped FORWARD through gguf's ``TensorNameMap(GEMMA4)``.
+
+        gemma4 specifics:
+
+        * The GGUF files ship the TEXT tower only (no vision / audio tensors),
+          so the ``model.vision_tower.*`` / ``model.audio_tower.*`` entries of
+          the index are dropped here and the runtime arch is switched to
+          ``Gemma4ForCausalLM`` (see ``get_config``).
+        * Several params carry no ``.weight`` suffix (``layer_scalar``,
+          ``experts.gate_up_proj``, ``experts.down_proj``); the rpartition
+          below would mis-base them, so we retry with the full name and append
+          ``.weight`` to match the GGUF side.
+        * The two router scale tensors are not in gguf's map at all and are
+          patched explicitly.
+        * ``blk.N.attn_v.weight`` is absent for the ``full_attention`` layers
+          (``attention_k_eq_v``); nothing special is needed here because the
+          index has no ``v_proj`` entry for those layers either, and
+          ``load_weights`` duplicates ``k_proj`` into the V shard.
+        * ``rope_freqs.weight`` has no sglang counterpart and is intentionally
+          left unmapped (the GGUF iterator skips unmapped tensors).
+        """
+        import glob
+        import json
+
+        mm_prefix = "model.language_model."
+        text_config = getattr(config, "text_config", config)
+        num_layers = text_config.num_hidden_layers
+        name_map = gguf.get_tensor_name_map(arch, num_layers)
+
+        hf_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if not hf_dir:
+            raise RuntimeError(
+                "XPU gemma4 GGUF requires SGLANG_GGUF_HF_CONFIG_DIR to point at "
+                "the sibling HF checkpoint dir (for config + safetensors index)."
+            )
+
+        index_path = os.path.join(hf_dir, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                hf_names = list(json.load(f)["weight_map"].keys())
+        else:
+            from safetensors import safe_open
+
+            st_files = glob.glob(os.path.join(hf_dir, "*.safetensors"))
+            if not st_files:
+                raise RuntimeError(
+                    f"No safetensors index or shard found in {hf_dir} to derive "
+                    "GGUF HF param names from."
+                )
+            hf_names = []
+            for sf in st_files:
+                with safe_open(sf, framework="pt") as fh:
+                    hf_names.extend(fh.keys())
+
+        # Text tower only; gemma4 ties the embeddings so there is no lm_head.
+        hf_names = [n for n in hf_names if n.startswith(mm_prefix)]
+
+        def router_patch(text_name):
+            # gguf's GEMMA4 TensorNameMap has no entry for either router scale.
+            #   router.scale            [hidden]  -> blk.N.ffn_gate_inp.scale
+            #   router.per_expert_scale [experts] -> blk.N.ffn_down_exps.scale
+            mobj = re.match(
+                r"model\.layers\.(\d+)\.router\.(scale|per_expert_scale)$", text_name
+            )
+            if not mobj:
+                return None
+            bid, which = mobj.group(1), mobj.group(2)
+            if which == "scale":
+                return f"blk.{bid}.ffn_gate_inp.scale"
+            return f"blk.{bid}.ffn_down_exps.scale"
+
+        gguf_to_hf_name_map = {}
+        for mm_name in hf_names:
+            if mm_name.endswith((".weight_scale", ".weight_scale_inv", ".input_scale")):
+                continue
+            if mm_name.endswith(".qweight"):
+                mm_name = mm_name[: -len(".qweight")] + ".weight"
+            # Strip the multimodal 'language_model.' segment to query the
+            # text-level TensorNameMap, but keep mm_name as the load target.
+            text_name = "model." + mm_name[len(mm_prefix) :]
+
+            gguf_full = router_patch(text_name)
+            if gguf_full is None:
+                base, _, suffix = text_name.rpartition(".")
+                gguf_name = name_map.get_name(base)
+                if gguf_name is not None:
+                    gguf_full = f"{gguf_name}.{suffix}"
+                else:
+                    # Suffix-less param (layer_scalar / experts.*_proj): the
+                    # whole name is the base and GGUF stores it as `.weight`.
+                    gguf_name = name_map.get_name(text_name)
+                    if gguf_name is None:
+                        continue
+                    gguf_full = f"{gguf_name}.weight"
             gguf_to_hf_name_map[gguf_full] = mm_name
         return gguf_to_hf_name_map
 

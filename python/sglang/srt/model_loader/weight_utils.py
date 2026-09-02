@@ -1201,41 +1201,68 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
-    # MoE expert weight name patterns
+    # MoE expert weight name patterns. A tuple value means the GGUF tensor packs
+    # several projections along dim 1 and must be split in order (gemma-4 ships a
+    # single ffn_gate_up_exps [E, 2*I, H] with gate first, up second).
     MOE_WEIGHT_PATTERNS = {
+        "ffn_gate_up_exps": ("gate_proj", "up_proj"),
         "ffn_gate_exps": "gate_proj",  # gate projection
         "ffn_up_exps": "up_proj",  # up projection
         "ffn_down_exps": "down_proj",  # down projection
     }
+
+    def _moe_match(tensor_name):
+        """(layer_id, [hf_proj_names], expert_prefix) for a packed MoE tensor.
+
+        Returns None for anything that is not a per-expert weight, notably the
+        `.scale` companions of ffn_*_exps: a plain substring test treats those as
+        MoE tensors, and the old code then dropped them on the floor because the
+        regex demands a `.weight` suffix. Falling through to the normal map
+        lookup keeps them.
+        """
+        m = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight$", tensor_name)
+        if not m:
+            return None
+        hf = MOE_WEIGHT_PATTERNS.get(m.group(2))
+        if hf is None:
+            return None
+        names = list(hf) if isinstance(hf, tuple) else [hf]
+        layer_id = int(m.group(1))
+        # Derive the expert parameter prefix from the name map when it carries
+        # one, so models that do not live under `model.layers.` still work.
+        mapped = gguf_to_hf_name_map.get(tensor_name)
+        prefix = None
+        if mapped:
+            head = mapped.split(".experts.")[0]
+            if head != mapped:
+                prefix = head + ".experts"
+        if prefix is None:
+            prefix = f"model.layers.{layer_id}.mlp.experts"
+        return layer_id, names, prefix
+
+    def _moe_slices(weight, n_parts):
+        """Split the packed [E, n_parts*rows, ...] dim-1 into n_parts views."""
+        if n_parts == 1:
+            return [weight]
+        rows = weight.shape[1] // n_parts
+        return [weight[:, i * rows : (i + 1) * rows] for i in range(n_parts)]
 
     # First pass: yield weight types
     for tensor in reader.tensors:
         weight_type = tensor.tensor_type
         tensor_name = tensor.name
 
-        # Check if this is a MoE expert weight (packed format)
-        is_moe_weight = any(
-            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
-        )
-
-        if is_moe_weight:
-            # MoE weights need special handling - extract layer_id and weight type
-            # Format: blk.{layer_id}.ffn_gate_exps.weight
-            import re
-
-            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
-            if match:
-                layer_id = int(match.group(1))
-                weight_pattern = match.group(2)
-                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
-
-                if hf_weight_name and weight_type.name != "F32":
-                    # Yield weight type for each expert
-                    weight = tensor.data
-                    num_experts = weight.shape[0]
+        moe = _moe_match(tensor_name)
+        if moe is not None:
+            layer_id, hf_names, prefix = moe
+            if weight_type.name != "F32":
+                num_experts = tensor.data.shape[0]
+                for hf_weight_name in hf_names:
                     for expert_id in range(num_experts):
-                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
-                        yield hf_name, torch.tensor(weight_type)
+                        yield (
+                            f"{prefix}.{expert_id}.{hf_weight_name}.qweight_type",
+                            torch.tensor(weight_type),
+                        )
         elif tensor_name in gguf_to_hf_name_map:
             # Normal weight handling
             name = gguf_to_hf_name_map[tensor_name]

@@ -872,22 +872,20 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
                 out = out + bias
             return out.reshape(*x.shape[:-1], out.shape[-1])
 
-        # Small-M (e.g. MTP verify, M = draft_token_num <= 16): the dense fallback
-        # below dequantizes Q6_K -> a 2.5x-bigger fp16 vocab table (~1GB) + a
-        # generic GEMM (reads 1017MB/call). The M-tiled GEMV reads the 413MB Q6_K
-        # ONCE (weights-resident, M accumulators) — measured 2.35x faster at M=4
-        # (tools/q6k_mgemv_check.py, cos=1.0) AND avoids materializing the 1GB
-        # fp16 table. q6_k only (lm_head is Q6_K; that's where the bytes win is).
+        # Small-M (prefill last-token logits at batch>1, or MTP verify where
+        # M = draft_token_num <= 16): the dense fallback below dequantizes the
+        # vocab table to fp16 and keeps it RESIDENT, which is ~1GB for a Q6_K
+        # 35B lm_head and 2.8GB for gemma-4's Q4_K [262144, 5376] table -- the
+        # latter OOMs at batch 4. _xpu_shard_matmul has M-tiled ESIMD GEMV
+        # variants for q4_k/q5_k/q6_k that read the packed rep once (measured
+        # 2.35x faster than the dense path at M=4 for q6_k) and never
+        # materialize an fp16 table.
         if (
             rep is not None
-            and rep[0] == "q6_k"
             and 2 <= M <= 16
-            and esimd_gemv_q6_k_m is not None
+            and rep[0] in ("q4_k", "q5_k", "q6_k")
         ):
-            xf = _as_fp16c(x2)
-            N = rep[1].shape[0]
-            out = torch.empty(M, N, dtype=torch.float16, device=xf.device)
-            esimd_gemv_q6_k_m(xf, rep[1], rep[2], rep[3], out)
+            out = _xpu_shard_matmul(_as_fp16c(x2), rep)
             if out.dtype != x.dtype:
                 out = out.to(x.dtype)
             if bias is not None:
@@ -1510,13 +1508,19 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
         return ("q4_k", ql, scale, minv)
     _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
     _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
+    # The q5_K/q6_K ESIMD reps pre-shuffle qh into per-tile chunks matching the
+    # kernel's vector length, so K must be a whole number of tiles. The kernels
+    # are instantiated at VL=512 and VL=256 and select on K % 512, so K only has
+    # to be a multiple of 256 -- the GGUF K-quant super-block. gemma-4's
+    # hidden_size 5376 (= 21 * 256) is served by the VL=256 instantiation.
+    _k_tiles_ok = _xpu_kquant_k_tiles_ok(qweight, qweight_type)
     if (qweight_type == _Q5_K_TYPE and esimd_gemv_q5_k is not None
-            and not _force_dq and not _no_q5):
+            and not _force_dq and not _no_q5 and _k_tiles_ok):
         ql, qh, scale, minv = _xpu_repack_rows_chunked(
             _xpu_repack_q5_k, qweight, col_perm=col_perm)
         return ("q5_k", ql, qh, scale, minv)
     if (qweight_type == _Q6_K_TYPE and esimd_gemv_q6_k is not None
-            and not _force_dq and not _no_q6):
+            and not _force_dq and not _no_q6 and _k_tiles_ok):
         ql, qh, scale = _xpu_repack_rows_chunked(
             _xpu_repack_q6_k, qweight, col_perm=col_perm)
         return ("q6_k", ql, qh, scale)
@@ -2182,10 +2186,28 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         # routed pairs, vs the old per-expert Python GEMV loop). Q4_K gate/up;
         # Q5_K/Q6_K down. Both packed -> zero extra resident memory.
         self._w13_type, self._w2_type = w13_type, w2_type
-        assert w13_type == _Q4_K_TYPE, (
-            f"GGUFMoEXPUMethod fused path expects Q4_K gate/up, got {w13_type}")
-        assert w2_type in (_Q5_K_TYPE, _Q6_K_TYPE), (
-            f"GGUFMoEXPUMethod fused path expects Q5_K/Q6_K down, got {w2_type}")
+        # The fused ESIMD path covers Q4_K gate/up with a Q5_K/Q6_K/Q5_1 down and
+        # either SiLU (Qwen) or GeLU-tanh (gemma-4) -- the activation is a kernel
+        # template parameter and q5_1 is repacked into the Q5_K down layout. Probe
+        # rather than assert so any other type pair still degrades to the generic
+        # XPU path (correct for everything, but per-route and slow).
+        act = getattr(getattr(self, "moe_runner_config", None),
+                      "activation", "silu")
+        self._fused_ok = (
+            w13_type == _Q4_K_TYPE
+            and w2_type in (_Q5_K_TYPE, _Q6_K_TYPE, _Q5_1_TYPE, _Q8_0_TYPE)
+            and act in ("silu", "gelu")
+            and os.environ.get("SGL_XPU_GGUF_MOE_FORCE_GENERIC") != "1"
+        )
+        self._act_code = 1 if act == "gelu" else 0
+        if not self._fused_ok:
+            logger.info(
+                "GGUFMoEXPUMethod: fused ESIMD path unavailable (w13=%s, w2=%s, "
+                "act=%s); using the generic XPU MoE path.",
+                w13_type, w2_type, act,
+            )
+            self._build_generic_xpu(layer, w13, w2, w13_type, w2_type, E, half)
+            return
         # LOAD SPEED (notes #137f): this per-expert repack loop is the 35B weight-load
         # bottleneck — ~100s = 92% of process_weights (40 layers x 256 experts x ~5
         # CPU repacks). The _xpu_repack_* helpers are pure tensor ops tagged
@@ -2243,7 +2265,13 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
             self.down_mn = torch.zeros(1, dtype=torch.float16, device=dev)
             del ql, sc
         else:
-            ql, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
+            if w2_type == _Q5_1_TYPE:
+                # Legacy q5_1 (gemma-4) repacks into the SAME layout as q5_K;
+                # only the offset sign differs, which _down_add_min selects.
+                ql, qh_plain, sc, mn = _xpu_repack_rows_chunked(
+                    _xpu_repack_q5_1, down_b)
+            else:
+                ql, sc, mn, qh_plain = _xpu_repack_q5_k_down_combined(down_b)
             self.down_qh_plain = qh_plain.reshape(E, Nd, -1).contiguous()
             del qh_plain
             self.down_ql = ql.reshape(E, Nd, -1).contiguous(); self.down_sc = sc.reshape(E, Nd, -1).contiguous(); self.down_mn = mn.reshape(E, Nd, -1).contiguous()
@@ -2260,11 +2288,95 @@ class GGUFMoEXPUMethod(FusedMoEMethodBase):
         if dev.type == "xpu":
             torch.xpu.empty_cache()
 
+    def _build_generic_xpu(self, layer, w13, w2, w13_type, w2_type, E, half):
+        """Resident reps for the generic XPU MoE path (any type pair, any act).
+
+        gate/up and down are each repacked with _xpu_prepare_shard, which keeps
+        every supported quant packed at its on-disk footprint (q5_1 included),
+        so this costs no extra resident memory over the raw GGUF bytes it
+        replaces. Types without an XPU rep degrade to a dense fp16 shard, which
+        is correct but memory-hungry -- gemma-4 (Q4_K gate/up, Q5_1 down) stays
+        fully packed.
+        """
+        if (os.environ.get("SGLANG_GGUF_XPU_MOE_REPACK_ON_DEVICE", "1") == "1"
+                and w13.device.type == "cpu"):
+            w13 = w13.to("xpu")
+            w2 = w2.to("xpu")
+        dev = w13.device
+
+        def _rep(qw, qtype):
+            if qtype == _Q5_1_TYPE:
+                return ("q5_1",) + _xpu_repack_q5_1(qw)
+            return _xpu_prepare_shard(qw, qtype, self.params_dtype)
+
+        gate = _rep(w13[:, :half].reshape(E * half, -1), w13_type)
+        up = _rep(w13[:, half:].reshape(E * half, -1), w13_type)
+        rows2 = w2.shape[1]
+        down = _rep(w2.reshape(E * rows2, -1), w2_type)
+        # Reshape every packed buffer back to a leading expert dim so apply can
+        # slice one expert without a copy.
+        def _split(rep, rows):
+            return (rep[0],) + tuple(
+                t.reshape(E, rows, *t.shape[1:]) if torch.is_tensor(t) else t
+                for t in rep[1:]
+            )
+
+        self._g_rep = _split(gate, half)
+        self._u_rep = _split(up, half)
+        self._d_rep = _split(down, rows2)
+        self.E = E
+        self.intermediate = half
+        self.hidden = rows2
+        self._generic_act = getattr(
+            getattr(self, "moe_runner_config", None), "activation", "silu")
+        layer._xpu_moe_ready = True
+        del layer.w13_qweight
+        del layer.w2_qweight
+        if dev.type == "xpu":
+            torch.xpu.empty_cache()
+
+    def _generic_forward(self, x2: torch.Tensor, topk_ids, topk_weights):
+        """Per-token, per-route GEMV/GEMM over the packed generic reps."""
+        M = x2.shape[0]
+        top_k = topk_ids.shape[1]
+        xf = _as_fp16c(x2)
+        ids = topk_ids.to(torch.int64).view(M, top_k)
+        tw = topk_weights.to(torch.float16).view(M, top_k)
+        # gemma-4 uses hidden_activation "gelu_pytorch_tanh"; the sgl_kernel
+        # fused act helpers are not built for XPU, so use the torch natives
+        # (identical to activation.py's forward_native).
+        gelu_tanh = self._generic_act == "gelu"
+        out = torch.zeros(M, self.hidden, dtype=torch.float16, device=x2.device)
+        for tok in range(M):
+            row = xf[tok:tok + 1]
+            for kk in range(top_k):
+                e = int(ids[tok, kk])
+                g = _xpu_rep_gemv(row, _expert_rep(self._g_rep, e))
+                u = _xpu_rep_gemv(row, _expert_rep(self._u_rep, e))
+                if gelu_tanh:
+                    h = torch.nn.functional.gelu(g, approximate="tanh") * u
+                else:
+                    h = torch.nn.functional.silu(g) * u
+                dw = _xpu_dequant_rep(_expert_rep(self._d_rep, e), torch.float16)
+                out[tok] += torch.mm(h, dw.t()).view(-1) * tw[tok, kk]
+        return out
+
     def apply(self, layer: torch.nn.Module, dispatch_output) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", \
-            "GGUFMoEXPUMethod only supports SiLU activation."
+        if not getattr(self, "_fused_ok", True):
+            # Generic path: handles any GGUF type pair and both activations.
+            x = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
+            out = self._generic_forward(x2, topk_ids, topk_weights)
+            if out.dtype != x2.dtype:
+                out = out.to(x2.dtype)
+            return StandardCombineInput(
+                hidden_states=out if x.dim() == 2 else out.reshape_as(x))
+
+        assert self.moe_runner_config.activation in ("silu", "gelu"), \
+            "GGUFMoEXPUMethod only supports SiLU/GeLU activations."
         x = dispatch_output.hidden_states
         topk_weights, topk_ids, _ = dispatch_output.topk_output
 
