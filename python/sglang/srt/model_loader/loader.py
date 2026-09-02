@@ -100,6 +100,7 @@ from sglang.srt.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
     get_quant_config,
+    gguf_mtp_weights_iterator,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -2217,6 +2218,11 @@ class GGUFModelLoader(BaseModelLoader):
                 "Please install gguf via `pip install gguf` to use gguf quantizer."
             ) from err
 
+        # Reset per-call: the same loader instance can map both the target and
+        # the MTP draft model.
+        self._gguf_mtp_src_layer = None
+        self._gguf_mtp_dense_names = None
+
         config = model_config.hf_config
         model_type = config.model_type
         # hack: ggufs have a different name than transformers
@@ -2497,9 +2503,10 @@ class GGUFModelLoader(BaseModelLoader):
         ``mtp.model.layers.0.self_attn``->``model.layers.0`` ...). So we map the
         GGUF ``blk.<L>.*`` tensors FORWARD into exactly those ``mtp.``-prefixed
         HF names — the model class is unchanged. Routed-expert tensors
-        (``blk.<L>.ffn_{gate,up,down}_exps``) are handled by the weight iterator
-        (it regexes the gguf name); we pass the MTP rebase there separately, so
-        they are intentionally NOT in this map. See notes/qwen35_gguf_mtp_gap.md.
+        (``blk.<L>.ffn_{gate,up,down}_exps``) are packed ``[num_experts, ...]``
+        blobs that must be split and rebased onto layer 0, so they are handled
+        by :func:`gguf_mtp_weights_iterator` and are intentionally NOT in this
+        map.
 
         Returns the gguf->hf map for the NON-expert MTP tensors only.
         """
@@ -2507,6 +2514,9 @@ class GGUFModelLoader(BaseModelLoader):
         # At map-build time the draft config still carries the FULL layer count
         # (qwen3_5_mtp.py forces num_hidden_layers=1 only later, in __init__).
         mtp_src_layer = text_config.num_hidden_layers  # e.g. 40
+        # Consumed by _get_weights_iterator to pick the MTP iterator (which
+        # splits the routed experts and rebases them onto layer 0).
+        self._gguf_mtp_src_layer = mtp_src_layer
         # name_map range must include the MTP layer index.
         name_map = gguf.get_tensor_name_map(arch, mtp_src_layer + 1)
 
@@ -2524,19 +2534,19 @@ class GGUFModelLoader(BaseModelLoader):
         # NOTE: `mtp.layers.0` (NOT `mtp.model.layers.0`) — the `mtp.`->`model.`
         # transform supplies the `model.` prefix; a double `model.` misses.
         #
-        # 4 MTP-specific tensors gguf's TensorNameMap has no entry for. eh_proj is
-        # Q8_0 in the GGUF but `self.fc` is a BARE nn.Linear (no qweight param), so
-        # it must arrive as a dequantized `mtp.fc.weight` — the iterator dequants
-        # it (see gguf_quant_weights_iterator mtp_dequant_fc). The map records the
-        # target name; dequant happens in the iterator.
+        # 4 MTP-specific tensors gguf's TensorNameMap has no entry for.
+        # `mtp.fc` is a bare nn.Linear (never quantized, whatever the quant
+        # config), so its GGUF Q8_0 blocks must be dequantized on the way in;
+        # `_gguf_mtp_dense_names` below tells the iterator to do that. The three
+        # norms are F32 in the checkpoint and pass through as-is.
         explicit = {
             f"{src}nextn.eh_proj.weight": "mtp.fc.weight",
             f"{src}nextn.enorm.weight": "mtp.pre_fc_norm_embedding.weight",
             f"{src}nextn.hnorm.weight": "mtp.pre_fc_norm_hidden.weight",
             f"{src}nextn.shared_head_norm.weight": "mtp.norm.weight",
         }
+        self._gguf_mtp_dense_names = {"mtp.fc.weight"}
         gguf_to_hf_name_map = dict(explicit)
-
         # Non-expert layer tensors: query gguf's forward map with the MTP layer's
         # HF names (layer index = mtp_src_layer), then retarget to the rebased
         # `mtp.layers.0.*` namespace. The MTP layer is an ATTENTION layer
@@ -2550,11 +2560,16 @@ class GGUFModelLoader(BaseModelLoader):
             "self_attn.o_proj.weight",
             "self_attn.q_norm.weight",
             "self_attn.k_norm.weight",
+            # MoE MLP (35B-A3B); absent from a dense GGUF, skipped silently.
             "mlp.gate.weight",
             "mlp.shared_expert.gate_proj.weight",
             "mlp.shared_expert.up_proj.weight",
             "mlp.shared_expert.down_proj.weight",
             "mlp.shared_expert_gate.weight",
+            # Dense MLP (27B); absent from a MoE GGUF, skipped silently.
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
         ]
         for leaf in hf_layer_names:
             # query name = the MTP layer's HF name at the real source index
@@ -2568,11 +2583,27 @@ class GGUFModelLoader(BaseModelLoader):
             # load target = rebased to layer 0 under the mtp. namespace (the
             # load_weights `mtp.`->`model.` transform adds the `model.` prefix).
             gguf_to_hf_name_map[gguf_full] = f"mtp.layers.0.{leaf}"
+        # The MoE router and the shared-expert gate are built without a quant
+        # config (they stay BF16 even in the target), so they need real values.
+        self._gguf_mtp_dense_names.update(
+            {
+                "mtp.layers.0.mlp.gate.weight",
+                "mtp.layers.0.mlp.shared_expert_gate.weight",
+            }
+        )
         return gguf_to_hf_name_map
 
     def _get_weights_iterator(
         self, model_name_or_path: str, gguf_to_hf_name_map: Dict[str, str]
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        mtp_src_layer = getattr(self, "_gguf_mtp_src_layer", None)
+        if mtp_src_layer is not None:
+            return gguf_mtp_weights_iterator(
+                model_name_or_path,
+                gguf_to_hf_name_map,
+                mtp_src_layer,
+                dense_hf_names=getattr(self, "_gguf_mtp_dense_names", None),
+            )
         return gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
 
     def download_model(self, model_config: ModelConfig) -> None:
