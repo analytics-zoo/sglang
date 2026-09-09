@@ -290,19 +290,19 @@ _XPU_GGUF_RESADD_NORM_VERIFY = (
 # an fp16 mm for in_proj_ba. `esimd_resadd_norm_gemv_kq` folds all of them into
 # one launch. Independent of SGL_XPU_GGUF_MOE_FULL because 27B is dense.
 _XPU_GGUF_RESADD_NORM_KQ = (
-    os.environ.get("SGL_XPU_GGUF_RESADD_NORM_KQ", "1") == "1"
+    os.environ.get("SGL_XPU_GGUF_RESADD_NORM_KQ", "0") == "1"
 )
 
 # Phase 5e (GGUF k-quant dense MLP): folds post_attention_layernorm, the merged
 # gate_up q4_K GEMV and silu_and_mul into `esimd_resadd_norm_gemv_q4k_silu`,
 # i.e. three dispatches per layer down to one.
-_XPU_GGUF_MLP_SILU = os.environ.get("SGL_XPU_GGUF_MLP_SILU", "1") == "1"
+_XPU_GGUF_MLP_SILU = os.environ.get("SGL_XPU_GGUF_MLP_SILU", "0") == "1"
 
 # Phase 5f (GGUF k-quant GDN out_proj): folds the standalone
 # gdn_rms_norm_gated into the q5_K out_proj GEMV. The q8_0 twin
 # (`_gguf_norm_out_proj`) only matches a Q8_0 build.
 _XPU_GGUF_NORM_OUT_Q5K = (
-    os.environ.get("SGL_XPU_GGUF_NORM_OUT_Q5K", "1") == "1"
+    os.environ.get("SGL_XPU_GGUF_NORM_OUT_Q5K", "0") == "1"
 )
 
 
