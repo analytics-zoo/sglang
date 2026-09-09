@@ -1494,9 +1494,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 # gemma_fused_add_rmsnorm + standalone router path (80 extra
                 # norm dispatches per verify forward).
                 or forward_batch.forward_mode.is_target_verify()
+                # The MTP draft-extend forward (one draft layer over the full
+                # tree width per request) satisfies every guard below as well,
+                # and it is the same MoE block as the draft decode step. While
+                # it was excluded it fell back to the standalone router +
+                # python grouped-GEMM bookkeeping (argsort/scatter_add/cumsum/
+                # stack/index), which is host-bound and dominates this stage.
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
-            return _skip("not xpu decode/verify")
+            return _skip("not xpu decode/verify/draft-extend")
         # M>1 is serviceable by the GGUF norm-fused op and, since the router
         # kernel is per-token, by the fp8 twin as well (_MOE_FUSED_MAX_M, the
         # same knob that gates moe_forward_full_rtfused).
