@@ -2,6 +2,7 @@
 # Adapted from: https://github.com/vllm-project/vllm/blob/ab3e80042eac24dd362408e6d63ad98768046359/vllm/model_executor/layers/quantization/gguf.py
 from __future__ import annotations
 
+import json
 import logging
 import os
 import warnings
@@ -156,6 +157,129 @@ else:
         warnings.warn(f"Only CUDA, MUSA and NPU support GGUF quantization currently.")
 
 logger = logging.getLogger(__name__)
+
+
+def _xpu_residency_log_enabled() -> bool:
+    """Whether to emit load-time GGUF XPU storage metadata for this process."""
+    return os.environ.get("SGLANG_GGUF_XPU_LOG_RESIDENCY") == "1"
+
+
+def _xpu_residency_source_descriptor(
+    qweight_type: int | WeightType, shard_id: object, rep, source: torch.Tensor
+) -> dict:
+    """Capture scalar source/final-kind facts without retaining ``source``."""
+    original_type = WeightType(int(qweight_type))
+    result_kind = str(rep[0])
+    if original_type in UNQUANTIZED_TYPES:
+        classification = "unquantized"
+    elif result_kind == "fp16":
+        classification = "fallback"
+    else:
+        classification = "native"
+    return {
+        "source_type": original_type.name,
+        "shard_id": str(shard_id),
+        "result_kind": result_kind,
+        "classification": classification,
+        "logical_tensor_bytes": int(source.numel() * source.element_size()),
+        "canonical_logical_bytes": sum(
+            int(tensor.numel() * tensor.element_size())
+            for tensor in rep[1:]
+            if torch.is_tensor(tensor)
+        ),
+    }
+
+
+def _xpu_residency_payload(prefix: object, source_descriptors: list[dict], reps: dict,
+                           merged=None, groups=None) -> dict:
+    """Build scalar-only physical-residency metadata for one dense XPU layer.
+
+    The source descriptors intentionally describe the original logical GGUF
+    payload. They are not attributed to final resident kinds because canonical
+    formats such as IQ4_NL/IQ4_XS merge into ``iq4`` with a different layout.
+    ``storage_keys`` makes cross-layer offline de-duplication possible. MoE
+    reps are intentionally unsupported by this dense-linear/embedding hook.
+    """
+    final_rep_kinds = {
+        "reps": {str(key): str(rep[0]) for key, rep in reps.items()},
+        "merged": None if merged is None else str(merged[0][0]),
+        "groups": [] if groups is None else [str(rep[0]) for rep, _ in groups],
+    }
+    rep_views = [("reps", key, rep) for key, rep in reps.items()]
+    if merged is not None:
+        rep_views.append(("merged", "_merged", merged[0]))
+    if groups is not None:
+        rep_views.extend(("groups", index, rep) for index, (rep, _) in enumerate(groups))
+
+    storage_records = {}
+    kind_keys = {}
+    for owner, name, rep in rep_views:
+        kind = str(rep[0])
+        for tensor_index, tensor in enumerate(rep[1:], start=1):
+            if not torch.is_tensor(tensor):
+                continue
+            storage = tensor.untyped_storage()
+            device = str(tensor.device)
+            data_ptr = int(storage.data_ptr())
+            nbytes = int(storage.nbytes())
+            key = (device, data_ptr, nbytes)
+            record = storage_records.setdefault(
+                key,
+                {
+                    "storage_key": {
+                        "device": device,
+                        "data_ptr": data_ptr,
+                        "nbytes": nbytes,
+                    },
+                    "kinds": [],
+                    "references": [],
+                },
+            )
+            if kind not in record["kinds"]:
+                record["kinds"].append(kind)
+            record["references"].append(
+                {"owner": owner, "name": str(name), "kind": kind,
+                 "tensor_index": tensor_index}
+            )
+            kind_keys.setdefault(kind, set()).add(key)
+
+    storage_keys = list(storage_records.values())
+    storage_keys.sort(
+        key=lambda record: (
+            record["storage_key"]["device"],
+            record["storage_key"]["data_ptr"],
+            record["storage_key"]["nbytes"],
+        )
+    )
+    per_kind = {
+        kind: sum(storage_records[key]["storage_key"]["nbytes"] for key in keys)
+        for kind, keys in sorted(kind_keys.items())
+    }
+    return {
+        "schema": "gguf_xpu_residency_v1",
+        "prefix": str(prefix),
+        "source_descriptors": source_descriptors,
+        "final_rep_kinds": final_rep_kinds,
+        "unique_storage_bytes": sum(
+            record["storage_key"]["nbytes"] for record in storage_keys
+        ),
+        "per_kind_unique_storage_bytes": per_kind,
+        "storage_keys": storage_keys,
+        "scope": "dense linear and embedding only; MoE residency is not accounted",
+    }
+
+
+def _xpu_log_residency(prefix: object, source_descriptors: list[dict], reps: dict,
+                       merged=None, groups=None) -> None:
+    """Emit one JSON record after a dense layer's final rep topology is known."""
+    logger.info(
+        "[gguf-xpu residency] %s",
+        json.dumps(
+            _xpu_residency_payload(prefix, source_descriptors, reps, merged, groups),
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
 
 
 class GGUFConfig(QuantizationConfig):
@@ -669,8 +793,17 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         qweight_type = layer.qweight_type.weight_type
+        log_residency = _xpu_residency_log_enabled()
         if qweight_type in UNQUANTIZED_TYPES:
             layer._xpu_emb_rep = ("fp16", layer.qweight.to(self.params_dtype), None)
+            if log_residency:
+                rep = layer._xpu_emb_rep
+                source = _xpu_residency_source_descriptor(
+                    qweight_type, "_single", rep, layer.qweight
+                )
+                _xpu_log_residency(
+                    getattr(layer, "prefix", "?"), [source], {"_single": rep}
+                )
             return
         # Repack the [vocab, K] GGUF table to the resident packed rep (q6_k /
         # q8_0 / q4_k ...). _xpu_prepare_shard handles every supported type and
@@ -678,6 +811,14 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
         layer._xpu_emb_rep = _xpu_prepare_shard(
             layer.qweight.data, int(qweight_type), self.params_dtype
         )
+        if log_residency:
+            rep = layer._xpu_emb_rep
+            source = _xpu_residency_source_descriptor(
+                qweight_type, "_single", rep, layer.qweight
+            )
+            _xpu_log_residency(
+                getattr(layer, "prefix", "?"), [source], {"_single": rep}
+            )
         if _XPU_EMB_DEBUG:
             rep = layer._xpu_emb_rep
             msg = ["kind=%s" % rep[0]]
@@ -2675,6 +2816,7 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
         qweight = layer.qweight
         shard_id = getattr(qweight, "shard_id", None)
         reps = {}
+        residency_sources = [] if _xpu_residency_log_enabled() else None
         if shard_id and hasattr(qweight, "shard_offset_map"):
             # shard_id is in checkpoint *load* (yield) order, which for GGUF is
             # the file's tensor order — NOT the fused parameter's logical order.
@@ -2694,6 +2836,10 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 stype = layer.qweight_type.shard_weight_type.get(idx, 0)
                 w = qweight[start:end, :offset].contiguous()
                 reps[idx] = _xpu_prepare_shard(w, stype, self.params_dtype)
+                if residency_sources is not None:
+                    residency_sources.append(
+                        _xpu_residency_source_descriptor(stype, idx, reps[idx], w)
+                    )
             layer._xpu_shard_order = ids
             # D1 (notes §10bf/§10bj): the per-shard q8_0 GEMVs at decode are small-N
             # (k/v [512,2048] hit only ~48 GB/s = 2.31x BW floor — small N starves
@@ -2753,10 +2899,24 @@ class GGUFLinearXPUMethod(GGUFLinearMethod):
                 qweight.data, qweight_type, self.params_dtype, col_perm=perm
             )
             reps["_single"] = rep
+            if residency_sources is not None:
+                residency_sources.append(
+                    _xpu_residency_source_descriptor(
+                        qweight_type, "_single", rep, qweight
+                    )
+                )
             layer._xpu_shard_order = ["_single"]
             layer._xpu_merged = None
             layer._xpu_groups = None
         layer._xpu_reps = reps
+        if residency_sources is not None:
+            _xpu_log_residency(
+                getattr(layer, "prefix", "?"),
+                residency_sources,
+                reps,
+                layer._xpu_merged,
+                layer._xpu_groups,
+            )
         # free the raw GGUF bytes
         if hasattr(layer, "qweight"):
             del layer.qweight
