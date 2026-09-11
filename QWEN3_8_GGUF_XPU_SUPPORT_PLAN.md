@@ -95,12 +95,12 @@ GitHub 网页匿名访问可能返回 404，这是私有仓库的常见表现；
 
 开始功能代码前执行 clean-baseline gate：
 
-- [ ] 把本文档和日志作为独立文档 commit 保存。
-- [ ] llm-scaler 中已有的 `--skip-server-warmup` 修改单独保存，不能与 IQ kernel 混成一个 commit。
-- [ ] 两个 repo 的 `git status --short` 为空。
-- [ ] 日志记录两个 repo 的 branch、HEAD、remote URL 和 merge-base。
-- [ ] 后续每一种量化类型尽量独立 commit：Q4_K、IQ4、Q3_K、IQ3_S、测试/文档。
-- [ ] 不使用 `git reset --hard` 或覆盖现有用户修改来制造“clean”。
+- [x] 把本文档和日志作为独立文档 commit 保存。
+- [x] llm-scaler 中已有的 `--skip-server-warmup` 修改单独保存，不能与 IQ kernel 混成一个 commit。
+- [x] 开始功能改动前两个 repo 的 `git status --short` 为空。
+- [x] 日志记录两个 repo 的 branch、HEAD、remote URL 和 merge-base。
+- [x] Q4_K 与 IQ4 使用独立 commit；后续 Q3_K、IQ3_S 继续保持该边界。
+- [x] 未使用 `git reset --hard`，也未覆盖用户无关修改。
 
 如果需要完全隔离的目录，优先从上述固定 commit 使用 `git worktree add`，而不是重新 clone。新 clone 只用于本地 repo 损坏、权限域不同，或确实需要新增独立的 sgl-kernel-xpu authoring repo。
 
@@ -192,9 +192,9 @@ Qwen3.8 的量化类型分布：
 | Q6_K | 30 |
 | Q8_0 | 106 |
 
-### 4.2 当前阻塞与 fallback 成本
+### 4.2 原始阻塞、已完成项与剩余 fallback
 
-当前最早阻塞点是五个 Q4_K GDN `ssm_out.weight`：
+首次启动的最早阻塞点是五个 Q4_K GDN `ssm_out.weight`：
 
 ```text
 blk.14.ssm_out.weight
@@ -204,20 +204,20 @@ blk.38.ssm_out.weight
 blk.45.ssm_out.weight
 ```
 
-Qwen3.6 对应权重主要是 Q5_K，已有压缩态 `col_perm` 支持；Qwen3.8 的这些权重是 Q4_K，当前 `_xpu_prepare_shard()` 会主动触发：
+Qwen3.6 对应权重主要是 Q5_K，已有压缩态 `col_perm` 支持；Qwen3.8 的这些权重是 Q4_K，原 `_xpu_prepare_shard()` 会主动触发：
 
 ```text
 AssertionError: q4_k GDN out_proj col-perm unsupported
 ```
 
-当前 IQ4_XS、IQ4_NL、IQ3_S、Q3_K 在 XPU 路径会先由 CPU 解量化，然后以 dense FP16 常驻设备。135 个 fallback tensor 的粗略成本是：
+该阻塞已在阶段 1 修复。阶段 2 又完成了 IQ4_XS/IQ4_NL 原生常驻和 GEMV；当前剩余 IQ3_S、Q3_K 仍会先由 CPU 解量化，然后以 dense FP16 常驻设备。阶段 2 前 135 个 IQ4/Q3/IQ3 fallback tensor 的粗略成本是：
 
 - GGUF 压缩 payload：全模型约 5.13 GiB。
 - dense FP16：全模型约 19.61 GiB。
 - TP2 下约 9.80 GiB/卡。
 - 当前 fallback 下主模型权重估计约 15.15 GiB/卡；全部原生支持后估计约 8.10 GiB/卡。
 
-因此 FP16 fallback 可以作为正确性对照和短期启动路径，不能作为最终生产实现。
+实测阶段 2 将每 rank resident weight 从 22.08 GB 降至 12.48 GB，并将 KV capacity 从 35,136 提高到 350,016。剩余 Q3_K/IQ3_S 的 FP16 fallback 仍只能作为正确性对照和短期路径，不能作为最终生产实现。
 
 ### 4.3 原生表示的计划
 
@@ -448,31 +448,33 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 - [x] 分别实现 IQ4_NL、IQ4_XS 的 row-chunked canonical repack。
 - [x] 将二者归一为共享的 packed LUT-index + final-scale ABI。
-- [ ] 实现 `esimd_gemv_iq4` 和 `esimd_gemv_iq4_m`，覆盖 M=1/2/4/8/16。
+- [x] 实现 `esimd_gemv_iq4` 和 `esimd_gemv_iq4_m`，覆盖 M=1/2/4/8/16。
 - [x] 为 IQ4_XS GDN `ssm_out` 实现压缩态 `col_perm`。
-- [ ] 接入 `_xpu_prepare_shard`、matmul、dense reconstruction、row permutation、merge/group 和 output-slice dispatch。
-- [ ] 支持与 Q4_K/Q5_K/Q6_K/Q8_0 等类型混合的输出 shard。
-- [ ] 增加独立的 `SGLANG_GGUF_XPU_NO_IQ4=1` fallback 开关。
-- [ ] 新 kernel 符号单独 import，旧 `.so` 缺少新符号时不得影响旧 kernel。
+- [x] 接入 `_xpu_prepare_shard`、matmul、dense reconstruction、row permutation、merge/group 和 output-slice dispatch。
+- [x] 支持与 Q4_K/Q5_K/Q6_K/Q8_0 等类型混合的输出 shard。
+- [x] 增加独立的 `SGLANG_GGUF_XPU_NO_IQ4=1` fallback 开关。
+- [x] 新 kernel 符号单独 import，旧 `.so` 缺少新符号时不得影响旧 kernel。
 
 ### 局部验证
 
 - [x] synthetic block 覆盖 LUT index、负 subscale 和 canonical scale；kernel 前补充 scale 极值专项。
 - [x] 与 `gguf.dequantize()` 比较 canonical dequant。
 - [x] 全部 124 个实际 IQ4 tensor 验证首/中/末行；五个 `ssm_out` 全 5120 行分块验证。
-- [ ] kernel 在 M=1/2/4/8/16 上与 dense matmul 比较。
-- [ ] 验证非连续输出 slice、多个 shard 写入同一输出、same-kind merge 和 mixed-kind group。
+- [x] kernel 在 M=1/2/4/8/16 上与 dense matmul 比较。
+- [x] 验证非连续输出 slice、多个 shard 写入同一输出、same-kind merge 和 mixed-kind group。
 - [x] 验证五个 IQ4_XS `ssm_out` 的 TP rank 0/1 col-perm。
-- [ ] 验证禁用 IQ4 后仅 IQ4 回退，其他 native kernel 不受影响。
+- [x] 验证禁用 IQ4 后仅 IQ4 回退，其他 native kernel 不受影响。
 
 ### E2E 门禁
 
-- [ ] native IQ4 与 `SGLANG_GGUF_XPU_NO_IQ4=1` 分别启动 30001。
-- [ ] 两条路径固定正确性请求语义一致。
-- [ ] native IQ4 显存相对 fallback 明确下降；解释差值与理论估计的偏差。
-- [ ] 完成同条件性能 A/B，报告中位数与波动。
-- [ ] 日志确认没有 IQ4 dense 常驻；Q3_K/IQ3_S fallback 状态明确。
-- [ ] 30000 已按原配置恢复；卡 4/5 未被本任务使用。
+- [x] native IQ4 与 `SGLANG_GGUF_XPU_NO_IQ4=1` 分别启动 30001。
+- [x] 两条路径固定正确性请求语义一致；并发数字序列退化在两条路径都可复现，另行记录为非 IQ4 专属问题。
+- [x] native IQ4 权重常驻相对 fallback 下降约 9.60 GB/rank；固定 0.8 memory fraction 会把释放空间分给 KV cache，故服务最终显存接近。
+- [x] 完成同条件性能 A/B，报告每次值和中位数；native 单路 decode 提升，但 TTFT/prefill/并发尚未优化。
+- [x] 权重加载统计确认 IQ4 不再 dense 常驻；Q3_K/IQ3_S 仍为 FP16 fallback。
+- [x] 本阶段开始前 30000 已不存在，因此恢复为 N/A；测试进程只设置 `ZE_AFFINITY_MASK=6,7`，未使用卡 4/5。
+
+阶段 2 的正确性与显存门禁通过。性能结果仅说明当前 kernel 的适用区间：M=1 decode 有收益，大 M prefill 和并发仍应在阶段 6 基于 profiling 优化，不能据此提前引入 fusion。
 
 ## 阶段 3：Q3_K 原生纵向切片
 

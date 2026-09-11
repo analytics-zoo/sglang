@@ -21,7 +21,7 @@
 |---|---|---|---|---|---|---|---|
 | 0 基线 | 通过 | `20260910-0451-S0-04` | 30000 已由外部停止 | XPU 6/7 约 229 MiB | N/A | 无待停止服务 | 目标设备为 6/7 |
 | 1 Q4_K col_perm | 通过 | `20260910-0502-S1-03` | 固定请求集通过 | 峰后 31.76/31.01 GiB | 已记录 | 仅使用 6/7 | 含 large-FP16 transpose OOM 修复 |
-| 2 IQ4_NL/XS native | 进行中 | `20260910-0521-S2-02` | canonical + fallback E2E 通过 | 峰后 31.56/30.81 GiB | fallback 已记录 | 仅使用 6/7 | kernel/dispatch 尚未接入 |
+| 2 IQ4_NL/XS native | 通过 | `20260910-0612-S2-04` | reference/kernel/native/fallback E2E 通过 | 权重少约 9.60 GB/rank | A/B 已记录 | 仅使用 6/7 | M=1 decode 提升；prefill/并发待优化 |
 | 3 Q3_K native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 4 IQ3_S native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 5 全量收口 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | — |
@@ -35,11 +35,11 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / 当前基线 commit | `feature/qwen3.8-gguf-xpu` / `3d8d99ecf`（阶段 2 工作区有未提交改动） |
+| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `812e55a9a`（阶段 2B native 集成） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
-| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `4f47c5783f19` |
+| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `03ccfa3`（native IQ4 kernel） |
 | llm-scaler upstream base | `origin/main` / `5e2fea9596146af6e90038365ebd462ef59f5d23` |
 | 容器 | `sglang-dev-gguf` |
 | 宿主机 `gguf.py` | `/home/intel/shaojun/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py` |
@@ -55,7 +55,7 @@
 | 测试设备 | XPU 6、7 |
 | TP | 2 |
 | 测试端口 | 30001 |
-| 既有服务 | 30000，当前占用 XPU 6、7；E2E 前受控停止、结束后原配置恢复 |
+| 既有服务 | 30000 在阶段 1 开始前已由外部停止，后续各 Run 前后均确认不存在；因此没有可恢复实例 |
 | 非任务设备 | XPU 4、5，不得被本任务使用 |
 
 ### 3.2 模型
@@ -82,7 +82,7 @@
 - 触发的 Q4_K `ssm_out`：`blk.14/22/29/38/45.ssm_out.weight`。
 - TP2 预期 `col_perm=(3,8,128)`。
 - IQ4_XS、IQ4_NL、IQ3_S、Q3_K 已确认能被容器中的 `gguf.dequantize()` 解码，但当前会以 dense FP16 常驻 XPU。
-- Q4_K col-perm 与 large-FP16 transpose cache 修复已提交为 `3d8d99ecf`；阶段 2 IQ4 canonical 代码已同步容器 build source，尚未接入 dispatch。
+- Q4_K col-perm 与 large-FP16 transpose cache 修复已提交为 `3d8d99ecf`；IQ4 canonical 已提交为 `f0958175d`；阶段 2B native kernel、dispatch 和 E2E 已完成。
 
 ### 3.4 代码 provenance 与 dirty baseline
 
@@ -453,6 +453,147 @@ python3 test/manual/quant/validate_qwen3_8_q4_k_col_perm.py \
 - 30000 在启动前已不存在，未停止也无需恢复；30001 已释放。
 - 卡 4/5 未被本任务使用。
 
+### Run `20260910-0526-S2-03`
+
+目的：完成 IQ4_NL/IQ4_XS 原生 ESIMD kernel、SGLang dispatch 集成和 native 端到端验证。
+
+关联阶段：阶段 2B native 路径。
+
+结论：局部数值、服务加载、串行正确性、长上下文和资源回收通过；并发 2 发现一路数字序列退化，保留到 forced-fallback A/B 判断。
+
+#### 代码、产物与局部验证
+
+| 项目 | 值 |
+|---|---|
+| UTC 测试区间 | 2026-09-10 05:26～06:03 |
+| SGLang branch/base | `feature/qwen3.8-gguf-xpu` / `f0958175d`，集成 diff 尚未提交 |
+| llm-scaler branch/最终 kernel commit | `feature/qwen3.8-gguf-xpu` / `03ccfa3` |
+| `gguf.py` SHA256 | `2075a19d3ecf55aaa244b80ca177df5bd39ef2f211e87f855cc1d1dfc00fad52` |
+| wheel | `/llm-scaler/sglang/custom-esimd-kernels/dist/custom_esimd_kernels_sglang-0.1.0-cp312-cp312-linux_x86_64.whl` |
+| wheel SHA256 | `3cc2fc247645c29491fc6be54b94c2a3c40087190e33d8edac02a78ab5fc7890` |
+| overlay | `/llm-scaler/overlays/qwen3_8` |
+| runtime core `.so` SHA256 | `6ac73a06bb82000ca2dfcd2acc95d5d2c6d73e3ea3998a89930c2e353da413c5` |
+| runtime `PYTHONPATH` | `/llm-scaler/overlays/qwen3_8:/llm-scaler/sglang/sglang/python` |
+| service PID / 设备 / 端口 | 23568 / XPU 6、7 TP2 / 30001 |
+| 服务日志 / SHA256 | `/tmp/qwen3_8_iq4_native_20260910.log` / `85db9b13553b20fec4b9d960c4ddc0fa077735daa3c4fc10978fa15d4475ea56` |
+| benchmark JSONL / SHA256 | `/tmp/qwen3_8_iq4_native_bench_20260910.jsonl` / `ceea8806c5a7374a4144e6df919b8c01cd2d5ac94dd159c788a46de0a36f870f` |
+
+实现覆盖：
+
+- `esimd_gemv_iq4` 和 `esimd_gemv_iq4_m` 共用 canonical packed LUT-index + final-scale ABI。
+- 接入 prepare、M=1/M<=16 matmul、大 M dense reconstruction、row permutation、same-kind merge、mixed-kind group 和非连续 output slice。
+- `SGLANG_GGUF_XPU_NO_IQ4=1` 仅回退 IQ4；IQ4 kernel symbol 单独 optional import，不影响旧 kernel。
+- kernel synthetic：`20 passed`，覆盖 M=1/2/4/8/16，另覆盖 M=3/17、K=96 fallback、K=256/512/3072 和非连续 output slice。
+- SGLang repack/dispatch：`16 passed`，覆盖两种 IQ4、类型专属 fallback、row permutation、same-kind merge 和 mixed-kind group。
+- 使用不含 IQ4 symbol 的系统旧 `.so` 导入新 `gguf.py`：`esimd_gemv_iq4[_m] is None`，同时 Q4_K/Q5_K/Q6_K symbol 均仍可用，证明 optional import 不会连带关闭旧 kernel。
+- 真实 GGUF kernel validator：23 cases，9 种代表 tensor shape；五个 IQ4_XS `ssm_out` 全 5120 行、TP rank0/rank1；最坏 `max_abs=0.001953125 < 0.01`，全部 finite。
+- validator 日志：`/tmp/qwen3_8_iq4_native_kernel_validation_20260910.log`，SHA256 `2165db819afa29184f52ccc2ff746b19e106e52af163c192d66c7d309ac62a46`。
+
+#### 加载、正确性和显存
+
+- TP0/TP1 权重加载：43.97/43.70 秒；每 rank 权重 12.48 GB、剩余 19.41 GB。
+- KV capacity 为 350,016 tokens；对照 dense IQ4 fallback 为 35,136 tokens。
+- `/health` HTTP 200；`1+1 -> 2`；thinking 256-token 的 `17*23-19 -> 372`；严格 JSON 为 `{"answer":7,"ok":true}`。
+- 固定 2836-token marker 三次均返回 `BLUE-7391`；18,935-token 长上下文返回 `ORANGE-86420`。
+- 256-token 连续 decode 三次均为 HTTP 200、`finish_reason=length`，数字序列连续无乱码。
+
+| 时点 | XPU 6 | XPU 7 |
+|---|---:|---:|
+| 启动前 | 约 45.61 MiB | 约 45.33 MiB |
+| 加载后、首次 forward 前 | 27,322.68 | 26,957.96 |
+| 首次 forward 后 | 28,450.53 | 27,700.54 |
+| 256-token decode 后 | 30,756.36 | 30,006.50 |
+| 2836-token marker 后 | 31,137.39 | 30,385.64 |
+| 并发后 | 31,151.10 | 30,399.34 |
+| 18,935-token 长上下文后 | 32,655.89 | 32,272.40 |
+| 停止后 | 45.85 | 47.75 |
+
+固定 `mem-fraction-static=0.8` 会把 native IQ4 释放的权重空间继续分配给 KV cache，所以压力后的 `xpu-smi` 总占用与 fallback 接近；真实收益体现在权重从 22.08 降到 12.48 GB/rank，以及 KV capacity 约 9.96 倍。
+
+#### 性能和并发现象
+
+| 场景 | Run 1 | Run 2 | Run 3 | 中位数 |
+|---|---:|---:|---:|---:|
+| streaming content TTFT | 1.3876 s | 1.3878 s | 1.3871 s | 1.3876 s |
+| 256-token decode | 23.1018 tok/s | 23.1701 tok/s | 23.1237 tok/s | 23.1237 tok/s |
+| 2836-token marker prompt/e2e | 1011.67 tok/s | 1747.49 tok/s | 1747.79 tok/s | 1747.49 tok/s |
+
+- concurrency 2：256 completion tokens / 8.0873 秒，31.6545 tok/s。
+- concurrency 4：512 completion tokens / 9.0866 秒，56.3469 tok/s。
+- 18,935-token 长上下文端到端 10.7735 秒。
+- 并发 2 首轮有一路出现重复数字；追加三轮时，编号 0 请求均出现不同程度粘连/重复或提前结束，而相同编号 0/1 请求串行均正确。该现象在下一 Run 的 forced fallback 中复现。
+
+#### 清理与隔离性
+
+- 仅向 PID 23568 发送 SIGTERM，约 5 秒退出；30001 释放，XPU 6/7 回落。
+- 30000 在本轮开始前不存在，无需恢复。
+- 服务环境固定 `ZE_AFFINITY_MASK=6,7`。卡 4/5 上有其他既存占用，但本任务没有绑定或启动进程到卡 4/5。
+
+### Run `20260910-0603-S2-04`
+
+目的：通过 `SGLANG_GGUF_XPU_NO_IQ4=1` 做同代码、同 wheel、同启动参数的 forced-fallback A/B，并判断 native 并发异常是否为 IQ4 专属。
+
+关联阶段：阶段 2B fallback 门禁；Issue I-005、I-006。
+
+结论：通过。fallback 正确性与长上下文通过；并发退化同样可复现，排除 IQ4 native 为唯一原因；阶段 2 可以结束，但大 M/prefill 与并发性能留待 profiling。
+
+#### 启动过程和环境
+
+- 第一次手写启动遗漏 `SGLANG_GGUF_HF_CONFIG_DIR`，在解析 GGUF `qwen35` config 时退出，尚未加载权重。
+- 第二次补 config 但仍遗漏 `SGLANG_MAMBA_CONV_DTYPE=float16` 和 `SGLANG_MAMBA_SSM_DTYPE=float16`；权重加载完成后默认 FP32 SSM state 使 memory-pool 可用字节为负，报 `Not enough memory`。日志 `/tmp/qwen3_8_iq4_forced_fallback_20260910.log`，SHA256 `93e41eb0f5ef04bd3eed9884047da1117927f5074000488698e6cbc20ba6bdeb`。
+- 最终直接使用 `scripts/start_qwen3_6_service.sh` 复现完整 GGUF 环境，只额外设置 `SGLANG_GGUF_XPU_NO_IQ4=1`。PID 27908，日志 `/tmp/qwen3_8_iq4_forced_fallback_20260910_run2.log`，SHA256 `2c82874458b9f9598aff5922a06bbdecd0a7e2d6d8764bb7704ff8dc7213038e`。
+- benchmark JSONL `/tmp/qwen3_8_iq4_forced_fallback_bench_20260910.jsonl`，SHA256 `e3183127a7ec828b4c9664a4ca23da61fcb5ab6c8f3346363dea532cccd2c5bf`。
+- TP0/TP1 权重加载：86.21/87.17 秒；每 rank 22.08 GB；KV capacity 35,136 tokens；首次 `/health` HTTP 200、5.011 秒。
+
+#### 正确性、显存和 A/B
+
+- `1+1 -> 2`，严格 JSON 为 `{"answer":7,"ok":true}`。
+- 2836-token marker 三次均返回 `BLUE-7391`；18,935-token 长上下文返回 `ORANGE-86420`。
+- 三次 256-token decode 均连续、无乱码并以长度限制结束。
+- concurrency 2 首轮一路数字粘连；追加三轮也分别出现一路粘连/重复或提前结束，另一条正常。concurrency 4 首轮四条均正常。这与 native 的并发现象同类，因此登记为共同的模型/批调度问题，不归因于 IQ4 kernel。
+
+| 时点 | XPU 6 | XPU 7 |
+|---|---:|---:|
+| 启动前 | 45.85 MiB | 47.75 MiB |
+| 首次 health 后 / benchmark 前 | 28,579.43 | 27,831.58 |
+| 256-token decode 后 | 31,511.73 | 30,763.65 |
+| 2836-token marker 后 | 31,552.95 | 30,803.29 |
+| 并发后 | 31,588.65 | 30,838.99 |
+| 18,935-token 长上下文后 | 32,654.97 | 32,207.12 |
+| 停止后 | 43.43 | 45.33 |
+
+| 场景 | native 中位数/结果 | forced fallback 中位数/结果 | native 相对变化 |
+|---|---:|---:|---:|
+| 权重加载 | 43.84 s | 86.69 s | -49.4% |
+| resident weight/rank | 12.48 GB | 22.08 GB | -9.60 GB |
+| streaming content TTFT | 1.3876 s | 0.9613 s | +44.3% 延迟 |
+| 256-token decode | 23.1237 tok/s | 21.7367 tok/s | +6.4% |
+| 2836-token marker prompt/e2e | 1747.49 tok/s | 2308.74 tok/s | -24.3% |
+| concurrency 2 aggregate | 31.6545 tok/s | 32.9790 tok/s | -4.0% |
+| concurrency 4 aggregate | 56.3469 tok/s | 66.0749 tok/s | -14.7% |
+| 18,935-token marker e2e | 10.7735 s | 9.3620 s | +15.1% 延迟 |
+
+prefill 重复轮次会命中 radix prefix cache，且 TTFT/e2e 同时包含少量 decode，因此这些数据只适合同脚本 A/B。现阶段结论是 native IQ4 明显改善加载时间、权重显存和可用 KV capacity，并改善 M=1 长 decode；大 M/prefill 和并发没有性能收益，进入阶段 6 前不做 fusion 猜测。
+
+#### 清理与阶段结论
+
+- 仅向 PID 27908 发送 SIGTERM，约 3 秒退出；30001 已释放，XPU 6/7 回落至 43.43/45.33 MiB。
+- 30000 在本轮前后均不存在，恢复项为 N/A。
+- 卡 4/5 没有被测试进程使用；结束采样为 30,176.69/1,189.45 MiB，是其他既存负载。
+- 阶段 2 的 reference、kernel、dispatch、native/fallback E2E、显存和性能门禁均完成，允许进入阶段 3 Q3_K。
+
+### 阶段 2 总结
+
+- 状态：通过。
+- commits：llm-scaler kernel `03ccfa3`；SGLang canonical `f0958175d`；SGLang native 集成 `812e55a9a`。
+- Reference 数值：124 个实际 IQ4 tensor canonical 验证通过，最坏 `max_abs=0.0002422333`。
+- Kernel 数值：23 个真实 case，最坏 `max_abs=0.001953125 < 0.01`，无 NaN/Inf。
+- E2E：native/fallback 均加载并通过固定算术、JSON、marker 和 18,935-token 长上下文。
+- 显存：native resident weight 少约 9.60 GB/rank，KV capacity 从 35,136 增至 350,016。
+- 性能：M=1 decode 中位数 +6.4%；prefill/并发当前退化，留待阶段 6 profiling。
+- 已知限制：Q3_K 与 IQ3_S 仍为 dense FP16 fallback；并发数字序列退化在 native/fallback 均存在。
+- 资源：30001 已停止；30000 原本不存在；仅使用 XPU 6、7。
+
 ## 5. Run 记录模板
 
 复制本节建立新 Run，不要覆盖旧 Run。
@@ -617,6 +758,8 @@ python3 test/manual/quant/validate_qwen3_8_q4_k_col_perm.py \
 | I-002 | `20260910-0436-S0-01` | 外部状态变化 | 30000 `/health` 5 秒超时 | 未确认；阶段 1 开始前服务已由外部停止 | 本轮停止/恢复为 N/A | `20260910-0451-S0-04` |
 | I-003 | `20260910-0446-S0-02` | 已修复 | 复制容器 build source 可能不被默认 Python 使用 | 默认 import 来自 site-packages，`PYTHONPATH` 为空 | 30001 使用 source overlay，并验证模块 `__file__` | `20260910-0502-S1-03` |
 | I-004 | `20260910-0458-S1-02` | 已修复 | 首次 forward 在 `w.t().contiguous()` OOM | 大型 dense FP16 fallback 被永久缓存第二份 transpose | 仅缓存不超过 16 MiB 的小型 FP16 shard | `20260910-0502-S1-03` |
+| I-005 | `20260910-0603-S2-04` | 已修复（测试流程） | 手写 fallback 启动先后因 GGUF config 缺失和 FP32 SSM state 内存不足退出 | 没有复现 `start_qwen3_6_service.sh` 设置的完整环境 | E2E 统一通过启动脚本，只增加被测 fallback 开关 | `20260910-0603-S2-04` |
+| I-006 | `20260910-0526-S2-03` | 待后续诊断 | concurrency 2 的数字序列偶发粘连、重复或提前结束，串行正常 | native IQ4 与 forced fallback 均可复现，已排除 IQ4 为唯一原因；模型/批调度路径待定位 | 不阻塞 IQ4 数值与显存闭环；后续使用更稳健并发正确性集并单独定位 | `20260910-0603-S2-04`（确认非 IQ4 专属） |
 
 ## 7. 阶段总结模板
 
