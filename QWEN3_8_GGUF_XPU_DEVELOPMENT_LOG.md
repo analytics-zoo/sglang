@@ -21,7 +21,7 @@
 |---|---|---|---|---|---|---|---|
 | 0 基线 | 通过 | `20260910-0451-S0-04` | 30000 已由外部停止 | XPU 6/7 约 229 MiB | N/A | 无待停止服务 | 目标设备为 6/7 |
 | 1 Q4_K col_perm | 通过 | `20260910-0502-S1-03` | 固定请求集通过 | 峰后 31.76/31.01 GiB | 已记录 | 仅使用 6/7 | 含 large-FP16 transpose OOM 修复 |
-| 2 IQ4_NL/XS native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
+| 2 IQ4_NL/XS native | 进行中 | `20260910-0521-S2-02` | canonical + fallback E2E 通过 | 峰后 31.56/30.81 GiB | fallback 已记录 | 仅使用 6/7 | kernel/dispatch 尚未接入 |
 | 3 Q3_K native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 4 IQ3_S native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 5 全量收口 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | — |
@@ -35,7 +35,7 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / 当前基线 commit | `feature/qwen3.8-gguf-xpu` / `5034fd1b6d8f`（功能改动尚未提交） |
+| SGLang branch / 当前基线 commit | `feature/qwen3.8-gguf-xpu` / `3d8d99ecf`（阶段 2 工作区有未提交改动） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
@@ -82,7 +82,7 @@
 - 触发的 Q4_K `ssm_out`：`blk.14/22/29/38/45.ssm_out.weight`。
 - TP2 预期 `col_perm=(3,8,128)`。
 - IQ4_XS、IQ4_NL、IQ3_S、Q3_K 已确认能被容器中的 `gguf.dequantize()` 解码，但当前会以 dense FP16 常驻 XPU。
-- 当前没有提交 Q4_K col-perm 改动，没有同步新代码，没有启动 30001。
+- Q4_K col-perm 与 large-FP16 transpose cache 修复已提交为 `3d8d99ecf`；阶段 2 IQ4 canonical 代码已同步容器 build source，尚未接入 dispatch。
 
 ### 3.4 代码 provenance 与 dirty baseline
 
@@ -354,6 +354,104 @@ python3 test/manual/quant/validate_qwen3_8_q4_k_col_perm.py \
 - 峰后显存达到 97.26%/94.95%，仅适合作为过渡正确性路径。
 - 日志中的部分 fusion 因混合 quant type 不适用，这是阶段 2 后需要重新评估的性能现象。
 - 下一步进入阶段 2：IQ4_NL/IQ4_XS canonical repack、native kernel 和完整 E2E A/B。
+
+### Run `20260910-0519-S2-01`
+
+目的：完成 IQ4_NL/IQ4_XS canonical repack、共享 ABI、reference dequant 和 IQ4_XS GDN TP2 `col_perm` 验证；本 Run 尚未接入 native kernel/dispatch。
+
+关联阶段：阶段 2A。
+
+结论：局部验证通过，E2E fallback 回归另记后续 Run。
+
+#### 实现与 ABI
+
+- IQ4_NL：解析 32 元素/18 字节 raw block，输出相邻元素 packed LUT index `[N,K/2] uint8` 与 `[N,K/32] fp16` scale。
+- IQ4_XS：解析 256 元素/136 字节 raw super-block，将 high/low bits 合成 signed 6-bit subscale，并预计算同一 `[N,K/32] fp16` final scale。
+- 两类 resident rep 统一使用 `weight = final_scale * IQ4_LUT[index]`；LUT 为 `[-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113]`。
+- `col_perm=(3,8,128)` 同步排列 element index 和每 head 4 个 scale group；`head_v_dim` 必须被 32 整除。
+- 当前代码仅定义 canonical repack/dequant，不进入 `_xpu_prepare_shard()`，所以服务仍使用原 FP16 fallback。
+
+#### 代码和产物
+
+| 项目 | 值 |
+|---|---|
+| UTC 完成时间 | 2026-09-10 05:19 UTC |
+| SGLang commit | `3d8d99ecf` + 未提交阶段 2A diff |
+| llm-scaler commit | `4f47c5783f19`，clean |
+| host/build-source `gguf.py` SHA256 | `5d7a6148e615afaff5e9d4867aed5a1190be8941c83857833dfb6a911890eda3` |
+| runtime import | `/llm-scaler/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py`，已确认新 symbol 存在 |
+| unit test | `test/registered/unit/layers/quantization/test_gguf_xpu_iq4_repack.py` |
+| actual-weight validator | `test/manual/quant/validate_qwen3_8_iq4_repack.py` |
+| validator 日志 | 宿主机 `/tmp/qwen3_8_iq4_canonical_20260910.log` |
+| validator 日志 SHA256 | `ddbba89c26cff30b0f2d8132144934d0a98e7e73d28448dd4c07f8c2c3023e64` |
+
+#### 测试结果
+
+- 第一次宿主机 pytest 因未设置 `PYTHONPATH` 无法 import `sglang`；设置后又因宿主机环境缺 `orjson` 无法收集。因此正式单测在容器开发源码环境执行。
+- 容器第一次单测失败 10 项，根因仅为 synthetic fixture 对 0 维 FP16 tensor 执行 byte reinterpret；改为一元素 tensor 后修复。
+- 修复后单测：`12 passed`，覆盖 reference、共享 ABI、row chunk、两类 `col_perm`、非法 shape。
+- 实际权重：确认并验证 `IQ4_NL=7`、`IQ4_XS=117`；所有 tensor 验证首/中/末行。
+- 五个 IQ4_XS `ssm_out` 全部 5120 行均验证 base、TP rank0、TP rank1，共覆盖各 tensor base 31,457,280 元素、每 rank 15,728,640 元素。
+- IQ4_NL 与 GGUF reference bit-exact：`max_abs=0`。
+- IQ4_XS 总体最坏 `max_abs=0.0002422333 < 0.0005`，mean abs `1.4001e-6`；五个 `ssm_out` 各路径最坏值不超过该值。
+- 本 Run 未启动服务、未使用 XPU，30000/30001 均无 listener，卡 4/5 未使用。
+
+### Run `20260910-0521-S2-02`
+
+目的：阶段 2A 结束时执行一次完整 fallback 服务回归，确保尚未接 dispatch 的 canonical 辅助代码不改变既有推理路径，并为后续 native IQ4 A/B 保留同机基线。
+
+关联阶段：阶段 2A E2E 门禁。
+
+结论：通过；存在一条关闭 thinking 的额外算术请求答错，按阶段 1 同条件开启 thinking 后正确，已保留原始现象。
+
+#### 环境
+
+| 项目 | 值 |
+|---|---|
+| UTC 开始/结束 | 2026-09-10 05:21 / 05:25 |
+| 服务 PID | 15516 |
+| 设备/TP/端口 | `ZE_AFFINITY_MASK=6,7` / TP2 / 30001 |
+| source overlay | `PYTHONPATH=/llm-scaler/sglang/sglang/python` |
+| 模型/GGUF config | `/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf` / `/models/Qwen3.8-27B` |
+| 日志 | 容器 `/tmp/qwen3_8_iq4_stage2a_fallback_20260910.log` |
+| 日志 SHA256 | `2b97f6feef6abe2f8a0719318523b90efac798dce605097fdc7822454e5ee29e` |
+
+#### 启动与正确性
+
+- TP0/TP1 load weight：87.98/90.31 秒；各 rank 权重仍为 22.08 GB，证明 IQ4 仍走 dense FP16 fallback。
+- `/health` 首次 forward：HTTP 200，5.0138 秒；`/v1/models`：HTTP 200，model id 正确。
+- non-thinking：`1+1 -> 2`；严格 JSON 得到 `{"answer":7,"ok":true}`；1428-token marker 三次均得到 `BLUE-7391`。
+- 额外 non-thinking 请求 `17*23-19` 得到错误的 `272`；同题按阶段 1 条件启用 thinking、`max_tokens=128` 后得到正确 `372`。
+- 第二条 thinking 逐步计算请求的 reasoning 正确，但 128 token 用尽导致最终正文截断；这是已知 token budget 行为，后续 thinking 正确性用例至少给 256 token。
+- canonical helper 尚未进入 `_xpu_prepare_shard()`，因此上述波动不能由新 IQ4 repack 数值导致。
+
+#### 显存
+
+| 时点 | XPU 6 | XPU 7 |
+|---|---:|---:|
+| 启动前 | 45.61 MiB | 45.33 MiB |
+| 加载后、首次 forward 前 | 27,335.65 | 26,970.91 |
+| 首次 forward 后 | 28,581.37 | 27,831.72 |
+| decode/prefill 后 | 31,564.62 | 30,812.85 |
+| 停止后 | 45.61 | 45.33 |
+
+#### 简单性能回归
+
+固定 `temperature=0`、`enable_thinking=false`：
+
+| 场景 | Run 1 | Run 2 | Run 3 | 中位数 |
+|---|---:|---:|---:|---:|
+| streaming 首个 content TTFT | 0.0982 s | 0.1307 s | 0.1212 s | 0.1212 s |
+| decode 256 e2e | 20.822 tok/s | 20.820 tok/s | 21.222 tok/s | 20.822 tok/s |
+| 1428-token 请求端 prompt/e2e | 725.70 tok/s | 1145.81 tok/s | 1152.87 tok/s | 1145.81 tok/s |
+
+前两次后缀相同的 prefill 命中 radix prefix cache，因此该数字只作为后续使用完全相同脚本的 A/B 基线，不能当作纯 uncached prefill kernel 吞吐。
+
+#### 清理与隔离性
+
+- 仅向记录的 PID 15516 发送 SIGTERM，服务 graceful exit。
+- 30000 在启动前已不存在，未停止也无需恢复；30001 已释放。
+- 卡 4/5 未被本任务使用。
 
 ## 5. Run 记录模板
 

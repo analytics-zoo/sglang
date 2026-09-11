@@ -446,10 +446,10 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 ### 实现
 
-- [ ] 分别实现 IQ4_NL、IQ4_XS 的 row-chunked canonical repack。
-- [ ] 将二者归一为共享的 packed LUT-index + final-scale ABI。
+- [x] 分别实现 IQ4_NL、IQ4_XS 的 row-chunked canonical repack。
+- [x] 将二者归一为共享的 packed LUT-index + final-scale ABI。
 - [ ] 实现 `esimd_gemv_iq4` 和 `esimd_gemv_iq4_m`，覆盖 M=1/2/4/8/16。
-- [ ] 为 IQ4_XS GDN `ssm_out` 实现压缩态 `col_perm`。
+- [x] 为 IQ4_XS GDN `ssm_out` 实现压缩态 `col_perm`。
 - [ ] 接入 `_xpu_prepare_shard`、matmul、dense reconstruction、row permutation、merge/group 和 output-slice dispatch。
 - [ ] 支持与 Q4_K/Q5_K/Q6_K/Q8_0 等类型混合的输出 shard。
 - [ ] 增加独立的 `SGLANG_GGUF_XPU_NO_IQ4=1` fallback 开关。
@@ -457,12 +457,12 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 ### 局部验证
 
-- [ ] synthetic exhaustive block 覆盖 LUT index、负 subscale、scale 极值。
-- [ ] 与 `gguf.dequantize()` 比较 canonical dequant。
-- [ ] 每种实际 shape 至少验证首行、中间行、末行；关键权重做全 tensor 分块验证。
+- [x] synthetic block 覆盖 LUT index、负 subscale 和 canonical scale；kernel 前补充 scale 极值专项。
+- [x] 与 `gguf.dequantize()` 比较 canonical dequant。
+- [x] 全部 124 个实际 IQ4 tensor 验证首/中/末行；五个 `ssm_out` 全 5120 行分块验证。
 - [ ] kernel 在 M=1/2/4/8/16 上与 dense matmul 比较。
 - [ ] 验证非连续输出 slice、多个 shard 写入同一输出、same-kind merge 和 mixed-kind group。
-- [ ] 验证五个 IQ4_XS `ssm_out` 的 TP rank 0/1 col-perm。
+- [x] 验证五个 IQ4_XS `ssm_out` 的 TP rank 0/1 col-perm。
 - [ ] 验证禁用 IQ4 后仅 IQ4 回退，其他 native kernel 不受影响。
 
 ### E2E 门禁

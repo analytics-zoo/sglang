@@ -927,6 +927,15 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
 _Q4_0_TYPE = int(WeightType.Q4_0)
 _Q8_0_TYPE = int(WeightType.Q8_0)
 _Q4_K_TYPE = int(WeightType.Q4_K)
+_IQ4_NL_TYPE = int(WeightType.IQ4_NL)
+_IQ4_XS_TYPE = int(WeightType.IQ4_XS)
+
+_IQ4_NL_SB = 32
+_IQ4_NL_BYTES = 18       # d(f16) + qs[16]
+_IQ4_XS_SB = 256
+_IQ4_XS_BYTES = 136      # d(f16) + scales_h(u16) + scales_l[4] + qs[128]
+_IQ4_LUT = (-127, -104, -83, -65, -49, -35, -22, -10,
+            1, 13, 25, 38, 53, 69, 89, 113)
 
 _Q4_K_SB = 256          # q4_K super-block elements
 _Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
@@ -939,6 +948,127 @@ _MOE_DOWN_REPACK_CHUNK_ROWS = int(
 # Chunk rows are derived from this budget so wide tensors are split finer.
 _REPACK_CHUNK_BUDGET_BYTES = int(
     os.environ.get("SGLANG_GGUF_XPU_REPACK_CHUNK_BYTES", str(32 << 20)))
+
+
+def _xpu_iq4_apply_col_perm(indices: torch.Tensor, scale: torch.Tensor,
+                            col_perm, kind: str):
+    """Permute an IQ4 canonical rep in element order for GDN out_proj."""
+    if col_perm is None:
+        return indices, scale
+    ratio, nk, hvd = col_perm
+    K = indices.shape[1]
+    if hvd % 32 != 0:
+        raise ValueError(
+            f"{kind} col_perm head_v_dim must be divisible by 32, got {hvd}"
+        )
+    if ratio * nk * hvd != K:
+        raise ValueError(
+            f"{kind} col_perm shape does not match K: "
+            f"ratio={ratio}, nk={nk}, head_v_dim={hvd}, K={K}"
+        )
+    indices = _q5q6_col_perm_elems(indices, col_perm)
+    scale = _q5q6_col_perm_elems(
+        scale, (ratio, nk, hvd // 32)
+    )
+    return indices, scale
+
+
+def _xpu_repack_iq4_nl(qweight: torch.Tensor, col_perm=None):
+    """GGUF IQ4_NL -> canonical packed LUT indices and final FP16 scales.
+
+    The raw block stores one FP16 scale and 16 bytes whose low nibbles are
+    elements 0..15 and high nibbles are elements 16..31.  The canonical rep
+    packs adjacent element indices in each byte, matching the other XPU u4
+    reps, and stores one scale per 32 elements.
+    """
+    N = qweight.shape[0]
+    if qweight.ndim != 2 or qweight.shape[1] % _IQ4_NL_BYTES:
+        raise ValueError(
+            f"invalid IQ4_NL packed shape {tuple(qweight.shape)}"
+        )
+    nb = qweight.shape[1] // _IQ4_NL_BYTES
+    buf = qweight.reshape(N, nb, _IQ4_NL_BYTES)
+    scale = (
+        buf[:, :, :2]
+        .contiguous()
+        .view(torch.float16)
+        .view(N, nb)
+        .contiguous()
+    )
+    qs = buf[:, :, 2:18]
+    indices = torch.cat((qs & 0x0F, qs >> 4), dim=-1).view(
+        N, nb * _IQ4_NL_SB
+    )
+    indices, scale = _xpu_iq4_apply_col_perm(
+        indices, scale, col_perm, "iq4_nl"
+    )
+    return _pack_nibble_interleaved(indices), scale.contiguous()
+
+
+def _xpu_repack_iq4_xs(qweight: torch.Tensor, col_perm=None):
+    """GGUF IQ4_XS -> the same canonical ABI as IQ4_NL.
+
+    IQ4_XS has one FP16 super-scale and eight signed 6-bit subscales per 256
+    elements.  Expand them to eight final FP16 scales during repack so the
+    native GEMV can share the IQ4_NL kernel and only perform a LUT lookup plus
+    multiply in its inner loop.
+    """
+    N = qweight.shape[0]
+    if qweight.ndim != 2 or qweight.shape[1] % _IQ4_XS_BYTES:
+        raise ValueError(
+            f"invalid IQ4_XS packed shape {tuple(qweight.shape)}"
+        )
+    nsb = qweight.shape[1] // _IQ4_XS_BYTES
+    buf = qweight.reshape(N, nsb, _IQ4_XS_BYTES)
+    d = buf[:, :, :2].contiguous().view(torch.float16).view(N, nsb).float()
+    scales_h = (
+        buf[:, :, 2:4]
+        .contiguous()
+        .view(torch.uint16)
+        .view(N, nsb)
+        .to(torch.int32)
+    )
+    scales_l_raw = buf[:, :, 4:8].to(torch.int32)
+    scales_l = torch.stack(
+        (scales_l_raw & 0x0F, scales_l_raw >> 4), dim=-1
+    ).view(N, nsb, 8)
+    shifts = (
+        2 * torch.arange(8, dtype=torch.int32, device=qweight.device)
+    ).view(1, 1, 8)
+    scales_hi = (scales_h.unsqueeze(-1) >> shifts) & 0x03
+    subscale = (scales_l | (scales_hi << 4)) - 32
+    scale = (d.unsqueeze(-1) * subscale.float()).to(torch.float16)
+
+    qs = buf[:, :, 8:136].view(N, nsb, 8, 16)
+    indices = torch.cat((qs & 0x0F, qs >> 4), dim=-1).view(
+        N, nsb * _IQ4_XS_SB
+    )
+    scale = scale.view(N, nsb * (_IQ4_XS_SB // 32))
+    indices, scale = _xpu_iq4_apply_col_perm(
+        indices, scale, col_perm, "iq4_xs"
+    )
+    return _pack_nibble_interleaved(indices), scale.contiguous()
+
+
+def _xpu_dequant_iq4(packed: torch.Tensor, scale: torch.Tensor,
+                     out_dtype: torch.dtype) -> torch.Tensor:
+    """Canonical IQ4_NL/IQ4_XS rep -> dense [N, K]."""
+    N, half = packed.shape
+    K = half * 2
+    if scale.shape != (N, K // 32):
+        raise ValueError(
+            f"IQ4 scale shape {tuple(scale.shape)} does not match {(N, K // 32)}"
+        )
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    indices = torch.stack((lo, hi), dim=2).view(N, K).long()
+    lut = torch.tensor(_IQ4_LUT, dtype=torch.int8, device=packed.device)
+    values = lut[indices].to(out_dtype).view(N, K // 32, 32)
+    return (
+        (values * scale.to(out_dtype).unsqueeze(-1))
+        .view(N, K)
+        .contiguous()
+    )
 
 
 def _xpu_repack_q4_k(qweight: torch.Tensor, col_perm=None):
