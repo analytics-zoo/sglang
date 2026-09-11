@@ -2550,7 +2550,14 @@ class Scheduler(
         # over-indexes the size-N mamba pool → GPU index OOB → SIGABRT.
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
-            res = min(res, mamba_allocator.available_size())
+            # Prefix-COW group allocation temporarily removes slots from the
+            # free list.  They remain available to this prefill pass through
+            # one-slot `alloc()` calls, so include only the unconsumed group
+            # reservation in this admission bound.
+            res = min(
+                res,
+                mamba_allocator.available_size() + mamba_allocator.reserved_size(),
+            )
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

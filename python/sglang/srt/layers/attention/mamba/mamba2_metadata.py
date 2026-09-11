@@ -44,7 +44,9 @@ class ForwardMetadata:
     is_target_verify: bool = False
     draft_token_num: int = 1
 
-    has_mamba_track_mask: bool = False
+    # None means this metadata did not establish the flag (for example, a
+    # graph-replay wrapper). Producers that inspect the batch set True/False.
+    has_mamba_track_mask: Optional[bool] = None
     mamba_track_mask_indices: Optional[torch.Tensor] = None
     conv_states_mask_indices: Optional[torch.Tensor] = None
 
