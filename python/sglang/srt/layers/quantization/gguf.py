@@ -931,6 +931,7 @@ class GGUFEmbeddingXPUMethod(GGUFLinearMethod):
 _Q4_0_TYPE = int(WeightType.Q4_0)
 _Q8_0_TYPE = int(WeightType.Q8_0)
 _Q4_K_TYPE = int(WeightType.Q4_K)
+_Q3_K_TYPE = int(WeightType.Q3_K)
 _IQ4_NL_TYPE = int(WeightType.IQ4_NL)
 _IQ4_XS_TYPE = int(WeightType.IQ4_XS)
 
@@ -940,6 +941,9 @@ _IQ4_XS_SB = 256
 _IQ4_XS_BYTES = 136      # d(f16) + scales_h(u16) + scales_l[4] + qs[128]
 _IQ4_LUT = (-127, -104, -83, -65, -49, -35, -22, -10,
             1, 13, 25, 38, 53, 69, 89, 113)
+
+_Q3_K_SB = 256
+_Q3_K_BYTES = 110       # hmask[32] + qs[64] + scales[12] + d(f16)
 
 _Q4_K_SB = 256          # q4_K super-block elements
 _Q4_K_BYTES = 144       # half2 dm(4) + scales[12] + qs[128]
@@ -1068,6 +1072,144 @@ def _xpu_dequant_iq4(packed: torch.Tensor, scale: torch.Tensor,
     indices = torch.stack((lo, hi), dim=2).view(N, K).long()
     lut = torch.tensor(_IQ4_LUT, dtype=torch.int8, device=packed.device)
     values = lut[indices].to(out_dtype).view(N, K // 32, 32)
+    return (
+        (values * scale.to(out_dtype).unsqueeze(-1))
+        .view(N, K)
+        .contiguous()
+    )
+
+
+def _xpu_q3_k_apply_col_perm(low: torch.Tensor, subtract: torch.Tensor,
+                             scale: torch.Tensor, col_perm):
+    """Permute a Q3_K canonical rep in element order for a GDN out_proj."""
+    if col_perm is None:
+        return low, subtract, scale
+    ratio, nk, hvd = col_perm
+    K = low.shape[1]
+    if hvd % 16 != 0:
+        raise ValueError(
+            f"q3_k col_perm head_v_dim must be divisible by 16, got {hvd}"
+        )
+    if ratio * nk * hvd != K:
+        raise ValueError(
+            "q3_k col_perm shape does not match K: "
+            f"ratio={ratio}, nk={nk}, head_v_dim={hvd}, K={K}"
+        )
+    low = _q5q6_col_perm_elems(low, col_perm)
+    subtract = _q5q6_col_perm_elems(subtract, col_perm)
+    scale = _q5q6_col_perm_elems(
+        scale, (ratio, nk, hvd // 16)
+    )
+    return low, subtract, scale
+
+
+def _xpu_repack_q3_k(qweight: torch.Tensor, col_perm=None):
+    """GGUF Q3_K -> packed low-2 bits, subtract mask and final FP16 scale.
+
+    The canonical representation is independent of the GGUF super-block
+    ordering:
+
+      ql       [N,K/4]  byte j packs elements 4j..4j+3, two bits each
+      subtract [N,K/8]  bit j marks ``q = ql - 4`` for that element
+      scale    [N,K/16] final ``d * signed_scale6`` in FP16
+
+    Thus ``weight[k] = scale[k/16] * (low2[k] - 4*subtract[k])``.
+    """
+    if qweight.ndim != 2 or qweight.shape[1] % _Q3_K_BYTES:
+        raise ValueError(f"invalid Q3_K packed shape {tuple(qweight.shape)}")
+    N = qweight.shape[0]
+    nsb = qweight.shape[1] // _Q3_K_BYTES
+    buf = qweight.reshape(N, nsb, _Q3_K_BYTES)
+    hmask = buf[:, :, :32].to(torch.int32)
+    qs = buf[:, :, 32:96].to(torch.int32)
+    scales_raw = buf[:, :, 96:108].to(torch.int32)
+    d = (
+        buf[:, :, 108:110]
+        .contiguous()
+        .view(torch.float16)
+        .view(N, nsb)
+        .float()
+    )
+
+    # Six-bit signed scales. The first eight bytes provide the low nibbles
+    # for scales 0..15; the last four provide their two high bits in groups
+    # of four, matching GGML block_q3_K exactly.
+    scale_low = torch.stack(
+        (scales_raw[:, :, :8] & 0x0F,
+         (scales_raw[:, :, :8] >> 4) & 0x0F),
+        dim=2,
+    ).reshape(N, nsb, 16)
+    scale_shifts = (
+        2 * torch.arange(4, dtype=torch.int32, device=qweight.device)
+    ).view(1, 1, 4, 1)
+    scale_high = (
+        (scales_raw[:, :, 8:12].unsqueeze(2) >> scale_shifts) & 0x03
+    ).reshape(N, nsb, 16)
+    scale6 = (scale_low | (scale_high << 4)) - 32
+    scale = (d.unsqueeze(-1) * scale6.float()).to(torch.float16)
+
+    # Restore element order before canonical packing. GGUF stores four 2-bit
+    # planes per 32-byte segment and eight hmask bit planes per super-block.
+    low_shifts = (
+        2 * torch.arange(4, dtype=torch.int32, device=qweight.device)
+    ).view(1, 1, 1, 4, 1)
+    low = (
+        (qs.reshape(N, nsb, 2, 1, 32) >> low_shifts) & 0x03
+    ).reshape(N, nsb * _Q3_K_SB)
+    high_shifts = torch.arange(
+        8, dtype=torch.int32, device=qweight.device
+    ).view(1, 1, 8, 1)
+    subtract = (
+        ((hmask.reshape(N, nsb, 1, 32) >> high_shifts) & 1) ^ 1
+    ).reshape(N, nsb * _Q3_K_SB)
+    scale = scale.reshape(N, nsb * (_Q3_K_SB // 16))
+
+    low, subtract, scale = _xpu_q3_k_apply_col_perm(
+        low, subtract, scale, col_perm
+    )
+    low4 = low.reshape(N, -1, 4)
+    ql = (
+        low4[:, :, 0]
+        | (low4[:, :, 1] << 2)
+        | (low4[:, :, 2] << 4)
+        | (low4[:, :, 3] << 6)
+    ).to(torch.uint8)
+    sub8 = subtract.reshape(N, -1, 8)
+    bit_shifts = torch.arange(
+        8, dtype=torch.int32, device=qweight.device
+    ).view(1, 1, 8)
+    qh = (sub8 << bit_shifts).sum(dim=2).to(torch.uint8)
+    return ql.contiguous(), qh.contiguous(), scale.contiguous()
+
+
+def _xpu_dequant_q3_k(ql: torch.Tensor, qh: torch.Tensor,
+                      scale: torch.Tensor,
+                      out_dtype: torch.dtype) -> torch.Tensor:
+    """Canonical Q3_K rep -> dense [N,K]."""
+    N, quarter = ql.shape
+    K = quarter * 4
+    if qh.shape != (N, K // 8):
+        raise ValueError(
+            f"Q3_K mask shape {tuple(qh.shape)} does not match {(N, K // 8)}"
+        )
+    if scale.shape != (N, K // 16):
+        raise ValueError(
+            f"Q3_K scale shape {tuple(scale.shape)} does not match "
+            f"{(N, K // 16)}"
+        )
+    low_shifts = torch.tensor(
+        [0, 2, 4, 6], dtype=torch.int32, device=ql.device
+    ).view(1, 1, 4)
+    low = (
+        (ql.to(torch.int32).unsqueeze(-1) >> low_shifts) & 0x03
+    ).reshape(N, K)
+    high_shifts = torch.arange(
+        8, dtype=torch.int32, device=qh.device
+    ).view(1, 1, 8)
+    subtract = (
+        (qh.to(torch.int32).unsqueeze(-1) >> high_shifts) & 1
+    ).reshape(N, K)
+    values = (low - 4 * subtract).to(out_dtype).view(N, K // 16, 16)
     return (
         (values * scale.to(out_dtype).unsqueeze(-1))
         .view(N, K)
