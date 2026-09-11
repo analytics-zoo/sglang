@@ -660,6 +660,11 @@ class Envs:
     # at each TP all-reduce, running the (non-capturable) oneCCL collective eager
     # between segments. Fixes the TP>1 XPU-graph decode garble.
     SGLANG_XPU_BREAKABLE_GRAPH = EnvBool(False)
+    # XPU GDN kernels for MTP target verification and per-token state snapshots.
+    # MTP launchers enable this explicitly; ordinary inference defaults to off.
+    SGLANG_XPU_MTP_GDN_VERIFY = EnvBoolWithAlias(
+        False, deprecated_name="SGL_XPU_GDN_VERIFY_ESIMD"
+    )
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
