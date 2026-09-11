@@ -217,7 +217,7 @@ AssertionError: q4_k GDN out_proj col-perm unsupported
 - TP2 下约 9.80 GiB/卡。
 - 当前 fallback 下主模型权重估计约 15.15 GiB/卡；全部原生支持后估计约 8.10 GiB/卡。
 
-实测阶段 2 将每 rank resident weight 从 22.08 GB 降至 12.48 GB，并将 KV capacity 从 35,136 提高到 350,016。剩余 Q3_K/IQ3_S 的 FP16 fallback 仍只能作为正确性对照和短期路径，不能作为最终生产实现。
+实测阶段 2 将每 rank resident weight 从 22.08 GB 降至 12.48 GB，并将 KV capacity 从 35,136 提高到 350,016。阶段3/4又完成Q3_K/IQ3_S原生支持；四种新增类型当前metadata probe均0 fallback，resident weight降至11.65 GB/rank，KV capacity升至376,960。
 
 ### 4.3 原生表示的计划
 
@@ -505,23 +505,23 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 ### 实现
 
 - [x] 实现 row-chunked IQ3_S canonical repack。
-- [ ] 实现 `esimd_gemv_iq3_s` 和 `esimd_gemv_iq3_s_m`，覆盖 M=1/2/4/8/16。
-- [ ] 完整接入 rep、dense reconstruction、merge/group、mixed output-slice dispatch。
-- [ ] 增加 `SGLANG_GGUF_XPU_NO_IQ3S=1` fallback 开关。
+- [x] 实现 `esimd_gemv_iq3_s` 和 `esimd_gemv_iq3_s_m`，覆盖 M=1/2/4/8/16。
+- [x] 完整接入 rep、dense reconstruction、merge/group、mixed output-slice dispatch。
+- [x] 增加 `SGLANG_GGUF_XPU_NO_IQ3S=1` fallback 开关。
 
 ### 局部验证
 
 - [x] synthetic block 覆盖 magnitude grid、sign 和 scale 边界。
 - [x] 四个实际 IQ3_S tensor 全部做 reference dequant 检查。
-- [ ] M=1/2/4/8/16 与 dense matmul 对比通过。
-- [ ] mixed shard、output slice 和单类型 fallback 通过。
+- [x] M=1/2/4/8/16 与 dense matmul 对比通过。
+- [x] mixed shard、output slice 和单类型 fallback 通过。
 
 ### E2E 门禁
 
-- [ ] native IQ3_S 与 `SGLANG_GGUF_XPU_NO_IQ3S=1` 做正确性、显存、性能 A/B。
-- [ ] 日志确认没有 IQ3_S dense 常驻。
-- [ ] IQ4、Q3_K native 路径没有回归。
-- [ ] 30000 已按原配置恢复；卡 4/5 未被本任务使用。
+- [x] native IQ3_S 与 `SGLANG_GGUF_XPU_NO_IQ3S=1` 做正确性、显存、性能 A/B。
+- [x] 日志确认没有 IQ3_S dense 常驻。
+- [x] IQ4、Q3_K native 路径没有回归。
+- [x] 30000原本不存在且未操作；卡4/5未被本任务使用。
 
 ## 阶段 5：全量收口与稳定性
 

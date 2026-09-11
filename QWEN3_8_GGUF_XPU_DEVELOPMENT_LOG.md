@@ -23,7 +23,7 @@
 | 1 Q4_K col_perm | 通过 | `20260910-0502-S1-03` | 固定请求集通过 | 峰后 31.76/31.01 GiB | 已记录 | 仅使用 6/7 | 含 large-FP16 transpose OOM 修复 |
 | 2 IQ4_NL/XS native | 通过 | `20260910-0612-S2-04` | reference/kernel/native/fallback E2E 通过 | 权重少约 9.60 GB/rank | A/B 已记录 | 仅使用 6/7 | M=1 decode 提升；prefill/并发待优化 |
 | 3 Q3_K native | 通过 | `20260910-0640-S3-01` | canonical/kernel/native/fallback E2E 通过 | 权重少约 0.57 GB/rank | A/B 已记录 | 仅使用 6/7 | decode 基本持平；获得显存/KV 收益 |
-| 4 IQ3_S native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
+| 4 IQ3_S native | 通过 | `20260910-S4-E2E` | canonical/kernel/native/fallback E2E通过 | 权重少约0.26 GB/rank | decode基本持平 | 仅使用6/7；30000未操作 | 新增四类型0 fallback |
 | 5 全量收口 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | — |
 | 6 性能优化 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 正确性完成后开始 |
 
@@ -35,11 +35,11 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `bb76c0bcc`（阶段 3 Q3_K native 集成） |
+| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `a74c8a047`（阶段 4 IQ3_S native 集成） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
-| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `9449de8`（native Q3_K kernel） |
+| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `8a1a725`（native IQ3_S kernel） |
 | llm-scaler upstream base | `origin/main` / `5e2fea9596146af6e90038365ebd462ef59f5d23` |
 | 容器 | `sglang-dev-gguf` |
 | 宿主机 `gguf.py` | `/home/intel/shaojun/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py` |
@@ -81,10 +81,10 @@
 - Qwen3.8 首次启动在 `_xpu_prepare_shard()` 失败：`AssertionError: q4_k GDN out_proj col-perm unsupported`。
 - 触发的 Q4_K `ssm_out`：`blk.14/22/29/38/45.ssm_out.weight`。
 - TP2 预期 `col_perm=(3,8,128)`。
-- IQ4_XS、IQ4_NL、IQ3_S、Q3_K 已确认能被容器中的 `gguf.dequantize()` 解码，但当前会以 dense FP16 常驻 XPU。
+- IQ4_XS、IQ4_NL、IQ3_S、Q3_K 均已有原生压缩态常驻；保留逐类型 FP16 fallback 用于正确性与性能对照。
 - Q4_K col-perm 与 large-FP16 transpose cache 修复已提交为 `3d8d99ecf`；IQ4 canonical 已提交为 `f0958175d`；阶段 2B native kernel、dispatch 和 E2E 已完成。
 
-### 3.4 代码 provenance 与 dirty baseline
+### 3.4 任务开始时的代码 provenance 与 dirty baseline
 
 - 三个私有/公开 Git remote 均已通过 `git ls-remote` 读取，不需要在容器内 `gh login`。
 - SGLang 当前任务 branch 比 `origin/dev-bmg` 多一个基线 commit：`b4599c0ef xpu: disable GGUF kernel probes by default`。
@@ -673,6 +673,51 @@ concurrency 2 因 fallback 一路只生成 11 tokens，吞吐不可比。阶段 
 - 依据该舍入证据，将 IQ3_S canonical 固定阈值设为 1.2e-4；validator 增加全行 scale 舍入解释检查后重跑。Kernel 阈值继续固定为 0.01。
 - 重跑通过：四个 tensor 全部 32,768 行，所有误差均由 FP16 scale 舍入解释，cosine >= 0.9999999792；CPU/XPU bit-exact。通过日志 `/tmp/qwen3_8_iq3_s_canonical_pass_20260910.log`。
 - 初测日志 `/tmp/qwen3_8_iq3_s_canonical_20260910.log`；诊断 `/tmp/qwen3_8_iq3_s_rounding_20260910.log`；单测 `/tmp/qwen3_8_iq3_s_unit_canonical_20260910.log`（容器内）。
+
+### Run `20260910-S4-kernel-integration`
+
+- canonical commit `08de9966c`；llm-scaler kernel `8a1a725`；SGLang integration `a74c8a047`。
+- IQ3_S 常驻 9-bit grid index + sign + final scale，512x4 LUT 以 kernel 固定常量 lookup，不展开为 [N,K] 常驻 magnitude。
+- `CXX=icpx MAX_JOBS=8 python3 -m build --wheel --no-isolation` 构建通过；只安装到 `/llm-scaler/overlays/qwen3_8`。
+- wheel SHA256 `fe61a59fa84d7c6033576f48971c899d86af3b6d43c607f226e20dcdff80b667`；core .so SHA256 `62f4c6051f595104ea7187a271ef40609ea6eb0aa081e9df342969a807d6143d`。
+- runtime `gguf.py` SHA256 `8b23158b796e99af653435d1e841224537f4f23f4cc783c55b6e63c900fd9bf3`，import 已确认指向 source + overlay。
+- kernel synthetic 23/23，覆盖 M=1/2/3/4/8/16/17、K=256/512/5120、非连续 output slice 和 ABI 参数拒绝。
+- 真实 kernel 20/20：两种完整矩阵方向、首/中/末共192行、down 的 TP0/TP1 local K=8704、M=1/2/4/8/16；worst max_abs=0.00048828125 < 0.01，全部 finite。
+- SGLang IQ3/Q3/IQ4/Q4 联合单测49/49；原 IQ4/Q3 kernel 回归38/38。
+- 新 gguf.py 使用 `/llm-scaler/overlays/qwen3_8_pre_iq3` 旧产物导入：仅 IQ3_S 两个 symbol 为 None，Q4/Q5/Q6/Q8/IQ4/Q3 均保留。
+- 覆盖审计（每个源 tensor 一行实际 `_xpu_prepare_shard` probe，再外推逻辑字节数）：main 851 tensors、MTP blk.64另15；四种新增类型均0 fallback。IQ3_S四个 tensor 全量逻辑字节为167,116,800，相比 FP16 713,031,680 少545,914,880 bytes（未计TP、merge副本、allocator）。
+- 局部日志：`/tmp/qwen3_8_iq3_s_{build,kernel_synthetic,kernel_tp,sglang_regression,older_kernel_regression,old_wheel}_20260910.log`。覆盖 JSON：`/tmp/qwen3_8_iq3_s_coverage_{before,native}_20260910.json`。
+- 首轮 native 服务 PID43714，memory sampler PID43715；端口30001，ZE_AFFINITY_MASK=6,7，TP2，不设置SPEC_DRAFT_PATH。30000仍无listener。
+
+### Run `20260910-S4-E2E`
+
+结论：阶段4通过。native/fallback均加载、完成串行正确性与长上下文，IQ3_S压缩常驻收益成立；既有Issue I-006仍然存在。
+
+| 指标 | IQ3_S native | IQ3_S fallback |
+|---|---:|---:|
+| PID | 43714 | 51816 |
+| load weight TP0/TP1 | 47.67 / 49.72 s | 43.97 / 44.17 s |
+| resident weight/rank | 11.65 GB | 11.91 GB |
+| KV capacity/rank | 376,960 | 368,640 |
+| short TTFT median | 1.4563 s | 1.4230 s |
+| decode 256 median | 23.1303 tok/s | 23.2023 tok/s |
+| 2,829-token cold marker prompt/e2e | 971.95 tok/s | 997.81 tok/s |
+| 2,829-token cached marker median（仅后两轮） | 7778.14 tok/s | 7713.16 tok/s |
+| 18,831-token marker E2E | 11.0080 s | 10.8145 s |
+| sampled peak XPU6/7 | 32655.95 / 32537.14 MiB | 32655.39 / 32340.72 MiB |
+| stop后 XPU6/7 | 43.43 / 45.33 MiB | 43.43 / 45.33 MiB |
+
+- 同一source/wheel/TP2/启动模板，fallback仅增加`SGLANG_GGUF_XPU_NO_IQ3S=1`。具体启动参数同交接模板，未设置SPEC_DRAFT_PATH。
+- 健康与models均200；两边1+1=2，严格JSON正确，素数函数正确，巴黎正确，BLUE-7391与ORANGE-86420均提取正确。
+- native/fallback的三轮256-token连续decode均顺序正常；concurrency2均有一路数字粘连/重复，concurrency4均四路正常。不能把此共同问题归因于IQ3_S。
+- 禁用thinking的17*23-19均回答362；单独开启thinking后两边均回答372，并保存完整reasoning与content。
+- native节省约0.26 GB/rank，KV多8,320 tokens；decode -0.31%，TTFT +2.34%，cold marker -2.59%，性能基本持平或略慢。仅4个tensor，当前不进行未经profile的fusion。
+- memory sampler每轮查询4/5/6/7后等待5秒（含查询实际约6～7秒），记录加载、forward、decode、prefill和long-context阶段。4/5其他负载从约992 MiB变化到约26 GB后回落；本任务进程始终只绑定6/7。
+- 只向记录PID43714、51816发送SIGTERM，服务均正常退出，30001释放；30000在全部检查中无listener，未停止或恢复任何30000实例。
+- 原始服务日志`/tmp/qwen_iq3_{native,fallback}_20260910.log`；bench`/tmp/qwen_iq3_{native,fallback}_bench_20260910.jsonl`已记录完整request/response，重复prompt不再把cached速率冒充cold prefill。
+- native service SHA256 `adb25152f5f1a31b9ae4a87b6305829ccd89244dd2b8e7de897b5e7d0bd868af`，fallback service `96d64c12523f7d30307439722462a06b41c33a0e2ff38a2dd8319c777940ae5b`。
+- native bench SHA256 `c26759aba1978639f3b5acf23694b5cad93418db074a69a36d1814d9961f4ce4`，fallback bench `9bb5f05dc8f2326c4d191a8eaa21dd5bf601c0ce1fe07b6841b0b062600ae968`。
+- 允许进入阶段5覆盖收口、Qwen3.6与持续稳定性回归。
 
 ## 5. Run 记录模板
 

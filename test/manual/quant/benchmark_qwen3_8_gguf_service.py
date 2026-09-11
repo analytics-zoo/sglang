@@ -48,6 +48,7 @@ def _stream(url, payload):
     start = time.perf_counter()
     first_token = None
     content = []
+    events = []
     finish_reason = None
     with urllib.request.urlopen(request, timeout=300) as response:
         status = response.status
@@ -56,6 +57,7 @@ def _stream(url, payload):
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             event = json.loads(line[6:])
+            events.append(event)
             choice = event["choices"][0]
             token = choice.get("delta", {}).get("content") or ""
             if token and first_token is None:
@@ -65,6 +67,8 @@ def _stream(url, payload):
     end = time.perf_counter()
     return {
         "status": status,
+        "request": payload,
+        "events": events,
         "elapsed_s": end - start,
         "ttft_s": None if first_token is None else first_token - start,
         "finish_reason": finish_reason,
@@ -77,12 +81,15 @@ def _record(kind, **values):
 
 
 def _completion(url, model, name, prompt, max_tokens):
-    status, elapsed, body = _post(url, _payload(model, prompt, max_tokens))
+    payload = _payload(model, prompt, max_tokens)
+    status, elapsed, body = _post(url, payload)
     choice = body["choices"][0]
     usage = body.get("usage", {})
     content = choice["message"].get("content") or ""
     return {
         "name": name,
+        "request": payload,
+        "response": body,
         "status": status,
         "elapsed_s": elapsed,
         "prompt_tokens": usage.get("prompt_tokens"),
@@ -196,6 +203,7 @@ def main():
             wall_s=wall,
             total_completion_tokens=total_tokens,
             aggregate_tok_s=total_tokens / wall,
+            responses=results,
             statuses=[result["status"] for result in results],
             prefix_sequential=[
                 _number_prefix_is_sequential(result["content"], 20)
