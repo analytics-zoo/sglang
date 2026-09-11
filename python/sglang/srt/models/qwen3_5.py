@@ -2180,9 +2180,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Decode updates the working slots above. Preserve the snapshots used
         # when a later request reuses this generated prefix, as the regular
         # GDN backend does before returning its attention output.
-        linear_backend._track_mamba_state_decode(
-            forward_batch, pool_conv, pool_ssm, cache_indices
-        )
+        # Only an explicit eager-producer False proves no state needs tracking.
+        # Graph replay metadata can omit this field, in which case preserving
+        # the generated-prefix snapshot is safer than skipping it.
+        if getattr(fwd_md, "has_mamba_track_mask", None) is not False:
+            linear_backend._track_mamba_state_decode(
+                forward_batch, pool_conv, pool_ssm, cache_indices
+            )
 
         # Norm + out_proj. Mirrors the default path.
         # Fast path: fuse RMSNormGated + fp8 out_proj into one ESIMD launch,
