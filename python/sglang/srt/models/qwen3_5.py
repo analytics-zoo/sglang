@@ -2177,6 +2177,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 ssm_state_view.index_select(0, cache_indices_long).to(pool_ssm.dtype),
             )
 
+        # Decode updates the working slots above. Preserve the snapshots used
+        # when a later request reuses this generated prefix, as the regular
+        # GDN backend does before returning its attention output.
+        linear_backend._track_mamba_state_decode(
+            forward_batch, pool_conv, pool_ssm, cache_indices
+        )
+
         # Norm + out_proj. Mirrors the default path.
         # Fast path: fuse RMSNormGated + fp8 out_proj into one ESIMD launch,
         # eliminating the standalone norm kernel + separate GEMV + cast/reshape
