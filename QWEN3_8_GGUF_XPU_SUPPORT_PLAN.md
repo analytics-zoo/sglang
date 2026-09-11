@@ -210,7 +210,7 @@ Qwen3.6 对应权重主要是 Q5_K，已有压缩态 `col_perm` 支持；Qwen3.8
 AssertionError: q4_k GDN out_proj col-perm unsupported
 ```
 
-该阻塞已在阶段 1 修复。阶段 2 又完成了 IQ4_XS/IQ4_NL 原生常驻和 GEMV；当前剩余 IQ3_S、Q3_K 仍会先由 CPU 解量化，然后以 dense FP16 常驻设备。阶段 2 前 135 个 IQ4/Q3/IQ3 fallback tensor 的粗略成本是：
+该阻塞已在阶段 1 修复。阶段 2 又完成了 IQ4_XS/IQ4_NL 原生常驻和 GEMV；阶段 2 结束时 IQ3_S、Q3_K 仍会先由 CPU 解量化，然后以 dense FP16 常驻设备。阶段 2 前 135 个 IQ4/Q3/IQ3 fallback tensor 的粗略成本是：
 
 - GGUF 压缩 payload：全模型约 5.13 GiB。
 - dense FP16：全模型约 19.61 GiB。
@@ -480,25 +480,25 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 ### 实现
 
-- [ ] 实现 row-chunked Q3_K canonical repack。
-- [ ] 实现 `esimd_gemv_q3_k` 和 `esimd_gemv_q3_k_m`，覆盖 M=1/2/4/8/16。
-- [ ] 完整接入 rep、dense reconstruction、merge/group、mixed output-slice dispatch。
-- [ ] 增加 `SGLANG_GGUF_XPU_NO_Q3K=1` fallback 开关。
+- [x] 实现 row-chunked Q3_K canonical repack。
+- [x] 实现 `esimd_gemv_q3_k` 和 `esimd_gemv_q3_k_m`，覆盖 M=1/2/4/8/16。
+- [x] 完整接入 rep、dense reconstruction、merge/group、mixed output-slice dispatch。
+- [x] 增加 `SGLANG_GGUF_XPU_NO_Q3K=1` fallback 开关。
 
 ### 局部验证
 
-- [ ] synthetic block 覆盖 low bits、high/sign mask 和 signed scale 边界。
-- [ ] 七个实际 Q3_K tensor 全部做 reference dequant 检查。
-- [ ] 所有实际 K 和 TP-local K 的 kernel shape 均被覆盖。
-- [ ] M=1/2/4/8/16 与 dense matmul 对比通过。
-- [ ] mixed shard、output slice 和单类型 fallback 通过。
+- [x] synthetic block 覆盖 low bits、high/sign mask 和 signed scale 边界。
+- [x] 七个实际 Q3_K tensor 全部做 reference dequant 检查。
+- [x] 所有实际 K 和 TP-local K 的 kernel shape 均被覆盖。
+- [x] M=1/2/4/8/16 与 dense matmul 对比通过。
+- [x] mixed shard、output slice 和单类型 fallback 通过。
 
 ### E2E 门禁
 
-- [ ] native Q3_K 与 `SGLANG_GGUF_XPU_NO_Q3K=1` 做正确性、显存、性能 A/B。
-- [ ] 日志确认没有 Q3_K dense 常驻。
-- [ ] IQ4 native 路径没有回归。
-- [ ] 30000 已按原配置恢复；卡 4/5 未被本任务使用。
+- [x] native Q3_K 与 `SGLANG_GGUF_XPU_NO_Q3K=1` 做正确性、显存、性能 A/B。
+- [x] 日志确认没有 Q3_K dense 常驻。
+- [x] IQ4 native 路径没有回归。
+- [x] 30000 原本不存在，恢复为 N/A；卡 4/5 未被本任务使用。
 
 ## 阶段 4：IQ3_S 原生纵向切片
 

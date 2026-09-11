@@ -22,7 +22,7 @@
 | 0 基线 | 通过 | `20260910-0451-S0-04` | 30000 已由外部停止 | XPU 6/7 约 229 MiB | N/A | 无待停止服务 | 目标设备为 6/7 |
 | 1 Q4_K col_perm | 通过 | `20260910-0502-S1-03` | 固定请求集通过 | 峰后 31.76/31.01 GiB | 已记录 | 仅使用 6/7 | 含 large-FP16 transpose OOM 修复 |
 | 2 IQ4_NL/XS native | 通过 | `20260910-0612-S2-04` | reference/kernel/native/fallback E2E 通过 | 权重少约 9.60 GB/rank | A/B 已记录 | 仅使用 6/7 | M=1 decode 提升；prefill/并发待优化 |
-| 3 Q3_K native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
+| 3 Q3_K native | 通过 | `20260910-0640-S3-01` | canonical/kernel/native/fallback E2E 通过 | 权重少约 0.57 GB/rank | A/B 已记录 | 仅使用 6/7 | decode 基本持平；获得显存/KV 收益 |
 | 4 IQ3_S native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 5 全量收口 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | — |
 | 6 性能优化 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 正确性完成后开始 |
@@ -35,11 +35,11 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `812e55a9a`（阶段 2B native 集成） |
+| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `bb76c0bcc`（阶段 3 Q3_K native 集成） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
-| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `03ccfa3`（native IQ4 kernel） |
+| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `9449de8`（native Q3_K kernel） |
 | llm-scaler upstream base | `origin/main` / `5e2fea9596146af6e90038365ebd462ef59f5d23` |
 | 容器 | `sglang-dev-gguf` |
 | 宿主机 `gguf.py` | `/home/intel/shaojun/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py` |
@@ -591,8 +591,78 @@ prefill 重复轮次会命中 radix prefix cache，且 TTFT/e2e 同时包含少�
 - E2E：native/fallback 均加载并通过固定算术、JSON、marker 和 18,935-token 长上下文。
 - 显存：native resident weight 少约 9.60 GB/rank，KV capacity 从 35,136 增至 350,016。
 - 性能：M=1 decode 中位数 +6.4%；prefill/并发当前退化，留待阶段 6 profiling。
-- 已知限制：Q3_K 与 IQ3_S 仍为 dense FP16 fallback；并发数字序列退化在 native/fallback 均存在。
+- 阶段 2 结束时的已知限制：Q3_K 与 IQ3_S 仍为 dense FP16 fallback；并发数字序列退化在 native/fallback 均存在。
 - 资源：30001 已停止；30000 原本不存在；仅使用 XPU 6、7。
+
+### Run `20260910-0640-S3-01`
+
+目的：完成 Q3_K canonical ABI、原生 ESIMD kernel、SGLang dispatch，以及 native/单类型 fallback 的完整 A/B。
+
+关联阶段：阶段 3 Q3_K 原生纵向切片。
+
+结论：通过。Q3_K 数值、服务加载、串行输出、长上下文、显存回收通过；native 相对 fallback 主要收益是约 0.57 GB/rank 权重显存和 18,624 tokens/rank KV capacity，单路 decode 基本持平。
+
+#### 代码、产物与局部验证
+
+| 项目 | 值 |
+|---|---|
+| UTC 测试区间 | 2026-09-10 约 06:40～07:09 |
+| SGLang branch/commits | `feature/qwen3.8-gguf-xpu`；canonical `be56dd188`；integration `bb76c0bcc` |
+| llm-scaler branch/kernel commit | `feature/qwen3.8-gguf-xpu` / `9449de8` |
+| `gguf.py` SHA256 | `a362e5f5ab4d8c493c7ed701378246830341ded5540c71925689ba10643e770e` |
+| wheel / SHA256 | `/llm-scaler/sglang/custom-esimd-kernels/dist/custom_esimd_kernels_sglang-0.1.0-cp312-cp312-linux_x86_64.whl` / `41ecb47ab904829f07d988eded87a2ed229b6849a96ea22320f95640453c912b` |
+| runtime core `.so` SHA256 | `288f7b306e0494e3c34ebe0afcaacec445cb7b01235a32e03cedfcc6f70c4fc5` |
+| runtime `PYTHONPATH` | `/llm-scaler/overlays/qwen3_8:/llm-scaler/sglang/sglang/python` |
+| native PID / fallback PID | 37862 / 39269 |
+| native service log / SHA256 | `/tmp/qwen3_8_q3_native_20260910.log` / `01bab460951a5b8a6caa201ce5b0e6e7785e3f7c607a38e2b8412224c24d3ca6` |
+| fallback service log / SHA256 | `/tmp/qwen3_8_q3_fallback_20260910.log` / `914a7ec2884ac63d7dccc3cf682548c013e13bcbf03d39aac707f2b5b1751b05` |
+| native benchmark / SHA256 | `/tmp/qwen3_8_q3_native_bench_20260910.jsonl` / `1222fdf847dfd238d6830d1e9329bd3f7c6784dfb4254c22cb9fb5e0673746ed` |
+| fallback benchmark / SHA256 | `/tmp/qwen3_8_q3_fallback_bench_20260910.jsonl` / `d2e4a252bd0f75681c5f47cd2cb8ca1355f9b5fa132b99f865ed075aaf8c8326` |
+
+实现与验证：
+
+- canonical resident ABI 为 `ql[N,K/4] uint8`、`qh[N,K/8] uint8`、`scale[N,K/16] fp16`，其中 `weight[k] = scale[k/16] * (low2[k] - 4*subtract[k])`。
+- 七个真实 Q3_K tensor 的 109,568 行全部与 `gguf.dequantize` 对比；最坏 `max_abs=6.103515625e-05 < 1e-4`，CPU/XPU repack bit-exact。
+- kernel synthetic 18/18，通过 K=256/512/5120、M=1/2/3/4/8/16/17 和 non-contiguous output slice。
+- 真实 kernel 覆盖 `[17408,5120]`、`[5120,17408]` 两种方向，首/中/末三个区段共 192 行、M=1/2/4/8/16；10/10 通过，最坏 `max_abs=0.00048828125 < 0.01`。
+- SGLang Q3+IQ4 回归 26/26；覆盖 native/fallback、dense reconstruction、row permutation、same-kind merge、mixed-kind group 和 output slice。
+- `SGLANG_GGUF_XPU_NO_Q3K=1` 只回退 Q3_K；Q3 symbol 独立 optional import，不影响 IQ4/Q4/Q5/Q6/Q8。
+
+#### E2E、显存与正确性
+
+| 项目 | Q3 native | Q3 forced fallback |
+|---|---:|---:|
+| TP0/TP1 load weight | 56.96 / 57.33 s | 45.37 / 45.57 s |
+| resident weight/rank | 11.91 GB | 12.48 GB |
+| KV capacity/rank | 368,640 tokens | 350,016 tokens |
+| memory-pool 后余量 | 6.32 GB | 6.32 GB |
+| benchmark 后 XPU 6/7 | 32,655.05 / 32,333.44 MiB | 32,655.00 / 32,282.46 MiB |
+| 停止后 XPU 6/7 | 43.43 / 45.33 MiB | 43.43 / 45.34 MiB |
+
+- 两条路径 `/health`、`/v1/models` 均 HTTP 200，model id 为 `/models/Qwen3.8-27B`。
+- 两条路径均有 `1+1 -> 2`、严格 JSON 正确、素数函数合理、`巴黎` 正确、2,829-token `BLUE-7391` 与 18,831-token `ORANGE-86420` 提取正确。
+- 禁用 thinking 的 `17*23-19` 在 native/fallback 均稳定回答 `362`（正确值 372），因此不是 Q3 kernel 专属数值问题；该请求不能单独作为 kernel 判错依据，严格数值由 tensor/kernel validator 保证。
+- native/fallback 的 concurrency 2 都出现一路数字粘连或提前停止，concurrency 4 都正常，继续归入 Issue I-006，不归因于 Q3_K。
+- XPU 4/5 在测试前后保持约 985～992 MiB 的既存占用；启动环境只设置 `ZE_AFFINITY_MASK=6,7`。30000 原本不存在，恢复为 N/A。
+
+#### 性能 A/B
+
+| 场景 | Q3 native | Q3 fallback | native 相对变化 |
+|---|---:|---:|---:|
+| short TTFT 中位数 | 1.4196 s | 1.3889 s | +2.2% 延迟 |
+| 256-token decode 中位数 | 23.1910 tok/s | 23.1078 tok/s | +0.36% |
+| 2,829-token cold prefill | 979.23 tok/s | 1007.16 tok/s | -2.8% |
+| 2,829-token cached prefill 中位数 | 7666.30 tok/s | 7729.51 tok/s | -0.8% |
+| concurrency 4 aggregate | 58.73 tok/s | 58.97 tok/s | -0.4% |
+| 18,831-token marker E2E | 11.2636 s | 10.6528 s | +5.7% 延迟 |
+
+concurrency 2 因 fallback 一路只生成 11 tokens，吞吐不可比。阶段 3 的结论是 Q3_K native 显著降低常驻权重并增加 KV capacity，但只有七个 tensor，当前端到端性能基本持平且 prefill 略慢；优化前应 profile，不引入未经证据支持的 fusion。
+
+#### 清理与阶段结论
+
+- 仅分别向记录 PID 37862、39269 发送 SIGTERM；两次均正常退出，30001 释放，XPU 6/7 回落。
+- 30000 在阶段前后都不存在；没有恢复动作。
+- 阶段 3 所有门禁完成，下一步进入阶段 4 IQ3_S。
 
 ## 5. Run 记录模板
 
