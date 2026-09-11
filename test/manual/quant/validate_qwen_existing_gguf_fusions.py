@@ -25,7 +25,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-
 K_HIDDEN = 5120
 K_GDN = 3072
 V_GDN = 128
@@ -48,7 +47,9 @@ def _require_xpu() -> None:
         raise RuntimeError("torch.xpu is unavailable; this validator must run on XPU.")
 
 
-def _finite_raw(rows: int, k: int, kind: str, generator: torch.Generator) -> torch.Tensor:
+def _finite_raw(
+    rows: int, k: int, kind: str, generator: torch.Generator
+) -> torch.Tensor:
     """Build valid GGUF block bytes, then rely on production repack/dequant.
 
     Random raw bytes exercise the quant payload and scale packing.  The only
@@ -60,16 +61,17 @@ def _finite_raw(rows: int, k: int, kind: str, generator: torch.Generator) -> tor
     if k % block_k:
         raise ValueError(f"{kind}: K={k} is not block aligned")
     raw = torch.randint(
-        0, 256, (rows, k // block_k, block_bytes), dtype=torch.uint8,
+        0,
+        256,
+        (rows, k // block_k, block_bytes),
+        dtype=torch.uint8,
         generator=generator,
     )
     if kind in ("q4", "q5"):
         # GGML block_q{4,5}_K begins with dall,dmin.
         # Small block scales keep random 6/8-bit subscales in a
         # weight range suited to FP16 activation/error checks.
-        dm = torch.tensor([2.0**-15, 2.0**-16], dtype=torch.float16).view(
-            torch.uint8
-        )
+        dm = torch.tensor([2.0**-15, 2.0**-16], dtype=torch.float16).view(torch.uint8)
         raw[:, :, :4] = dm
     else:
         # GGML block_q6_K ends with its FP16 scale.
@@ -92,9 +94,7 @@ def _reps(generator: torch.Generator) -> dict[str, tuple[torch.Tensor, ...]]:
 
     q4 = _xpu_repack_q4_k(_finite_raw(N_Q4, K_HIDDEN, "q4", generator))
     q6 = _xpu_repack_q6_k(_finite_raw(N_Q6, K_HIDDEN, "q6", generator))
-    q4_mlp = _xpu_repack_q4_k(
-        _finite_raw(2 * I_MLP, K_HIDDEN, "q4", generator)
-    )
+    q4_mlp = _xpu_repack_q4_k(_finite_raw(2 * I_MLP, K_HIDDEN, "q4", generator))
     q5 = _xpu_repack_q5_k(_finite_raw(N_Q5, K_GDN, "q5", generator))
 
     # Dequantization is deliberately performed by the same canonical helpers
@@ -111,7 +111,9 @@ def _to_xpu(rep: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     return tuple(x.to("xpu") for x in rep)
 
 
-def _gemma_norm(h: torch.Tensor, residual: torch.Tensor, nw: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _gemma_norm(
+    h: torch.Tensor, residual: torch.Tensor, nw: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference the exact FP16 residual and normed-activation stores."""
     nr = (h + residual).to(torch.float16)
     rstd = torch.rsqrt(nr.float().square().mean(dim=1, keepdim=True) + EPS)
@@ -125,11 +127,19 @@ def _max_abs(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float((actual.float() - expected.float()).abs().max().cpu())
 
 
-def _check(name: str, actual: torch.Tensor, expected: torch.Tensor, atol: float, out: dict[str, Any]) -> None:
+def _check(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    out: dict[str, Any],
+) -> None:
     err = _max_abs(actual, expected)
     out[name] = {"max_abs": err, "atol": atol, "shape": list(actual.shape)}
     if err > atol:
-        raise AssertionError(f"{name}: max_abs={err:.8g} exceeds requested atol={atol:g}")
+        raise AssertionError(
+            f"{name}: max_abs={err:.8g} exceeds requested atol={atol:g}"
+        )
 
 
 def _kq_case(
@@ -163,10 +173,24 @@ def _kq_case(
     oba = torch.empty((m, N_BA), device="xpu", dtype=torch.float16)
     empty = torch.empty(0, device="xpu", dtype=torch.float16)
     op(
-        h, residual, nw, EPS, nr, xn,
-        q4w, q4sc, q4mn, out, off4,
-        q6ql, q6qh, q6sc, out, off6,
-        ba, oba,
+        h,
+        residual,
+        nw,
+        EPS,
+        nr,
+        xn,
+        q4w,
+        q4sc,
+        q4mn,
+        out,
+        off4,
+        q6ql,
+        q6qh,
+        q6sc,
+        out,
+        off6,
+        ba,
+        oba,
     )
     torch.xpu.synchronize()
     if not torch.equal(residual, residual_before):
@@ -178,10 +202,12 @@ def _kq_case(
     result: dict[str, Any] = {}
     _check("new_residual", nr, nr_ref, atol, result)
     _check("normed", xn, xn_ref, atol, result)
-    _check("q4_offset", out[:, off4:off4 + N_Q4], q4_ref, atol, result)
-    _check("q6_offset", out[:, off6:off6 + N_Q6], q6_ref, atol, result)
+    _check("q4_offset", out[:, off4 : off4 + N_Q4], q4_ref, atol, result)
+    _check("q6_offset", out[:, off6 : off6 + N_Q6], q6_ref, atol, result)
     _check("fp16_ba", oba, ba_ref, atol, result)
-    untouched = torch.cat((out[:, :off4], out[:, off4 + N_Q4:off6], out[:, off6 + N_Q6:]), 1)
+    untouched = torch.cat(
+        (out[:, :off4], out[:, off4 + N_Q4 : off6], out[:, off6 + N_Q6 :]), 1
+    )
     if not torch.equal(untouched, torch.full_like(untouched, SENTINEL)):
         raise AssertionError("kq: mixed-output gap or guard columns were written")
     return result
@@ -258,7 +284,12 @@ def _q5_case(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--atol", type=float, default=0.01, help="strict max absolute error threshold (default: 0.01)")
+    parser.add_argument(
+        "--atol",
+        type=float,
+        default=0.01,
+        help="strict max absolute error threshold (default: 0.01)",
+    )
     args = parser.parse_args()
     _require_xpu()
     try:
@@ -282,7 +313,9 @@ def main() -> None:
         "ze_affinity_mask": os.environ["ZE_AFFINITY_MASK"],
         "atol": args.atol,
         "shapes": {"kq_mlp_k": K_HIDDEN, "q5_k": K_GDN, "q5_v": V_GDN},
-        "kq": {}, "mlp_silu": {}, "q5_norm_gemv": {},
+        "kq": {},
+        "mlp_silu": {},
+        "q5_norm_gemv": {},
     }
     # KQ supports the regular per-token fallback beyond M=4; M=2/4 uses the
     # M-tiled implementation. MLP is intentionally limited to the production
