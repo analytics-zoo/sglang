@@ -24,8 +24,8 @@
 | 2 IQ4_NL/XS native | 通过 | `20260910-0612-S2-04` | reference/kernel/native/fallback E2E 通过 | 权重少约 9.60 GB/rank | A/B 已记录 | 仅使用 6/7 | M=1 decode 提升；prefill/并发待优化 |
 | 3 Q3_K native | 通过 | `20260910-0640-S3-01` | canonical/kernel/native/fallback E2E 通过 | 权重少约 0.57 GB/rank | A/B 已记录 | 仅使用 6/7 | decode 基本持平；获得显存/KV 收益 |
 | 4 IQ3_S native | 通过 | `20260910-S4-E2E` | canonical/kernel/native/fallback E2E通过 | 权重少约0.26 GB/rank | decode基本持平 | 仅使用6/7；30000未操作 | 新增四类型0 fallback |
-| 5 全量收口 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | — |
-| 6 性能优化 | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 正确性完成后开始 |
+| 5 全量收口 | 通过（保留算术例外） | `20260910-S5-delivery-close` | 314请求持续门禁及完整回归通过 | 新增四类型0 fallback | 最终矩阵完成；Qwen3.6恢复35.01 tok/s | 30001已停，30000未操作 | 精确显存/产物/清理完成 |
+| 6 可选性能优化 | 未开始（后续可选） | — | N/A | N/A | I-009回归修复已完成 | N/A | 不阻塞本次原生支持交付 |
 
 ## 3. 已确认事实
 
@@ -35,11 +35,11 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `a74c8a047`（阶段 4 IQ3_S native 集成） |
+| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `998a68870`（运行逻辑51a0d849b，后续仅测试脚本；另有最终文档提交） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
-| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `8a1a725`（native IQ3_S kernel） |
+| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `0a08e20`（native IQ3_S 及 GDN 有序状态更新） |
 | llm-scaler upstream base | `origin/main` / `5e2fea9596146af6e90038365ebd462ef59f5d23` |
 | 容器 | `sglang-dev-gguf` |
 | 宿主机 `gguf.py` | `/home/intel/shaojun/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py` |
@@ -719,9 +719,303 @@ concurrency 2 因 fallback 一路只生成 11 tokens，吞吐不可比。阶段 
 - native bench SHA256 `c26759aba1978639f3b5acf23694b5cad93418db074a69a36d1814d9961f4ce4`，fallback bench `9bb5f05dc8f2326c4d191a8eaa21dd5bf601c0ce1fe07b6841b0b062600ae968`。
 - 允许进入阶段5覆盖收口、Qwen3.6与持续稳定性回归。
 
-## 5. Run 记录模板
+## 5. 后续验证与 Run 记录模板
 
 复制本节建立新 Run，不要覆盖旧 Run。
+
+### Run `20260910-S5-stability-first`
+
+- 第二次 native 冷启动成功：`iq3_stability`，server PID `58492`，sampler `58493`，TP PID `59032/59033`，detokenizer `59034`；仅 XPU 6/7、TP=2、30001。
+- 计划连续 1800 秒，实际没有完成：前置 0.1 秒客户端 timeout、SSE cancel、health/JSON recovery 均通过；完成请求 42 后，请求 43 超时 300 秒。随后生成式 `/health` 也超时，故本轮稳定性失败。
+- 请求 34（concurrency=2、4K filler、256 decode tokens、`ignore_eos=True`）返回 HTTP 200，但 content 为空，reasoning_content 出现重复文本；同批请求 33 正常。完整请求/响应保留，不将其归为运输超时，也不据此单独归因 IQ3_S。
+- TP 栈采样处于 `SchedulerRequestReceiver` 的空请求 CPU Gloo broadcast，`batch=None`，未执行模型 kernel；TP0/TP1 分别在 `common.py:1423/1438`，是匹配的 size broadcast。此证据定位采样等待点，尚未证明 collective 本身是根因。默认 `/health` 会生成 token，超时不能单独证明 HTTP event loop 挂起。
+- 显存平台约 XPU6 `32655.72 MiB`、XPU7 `32286.20 MiB`，未见持续上升。停止准确 client PID `61663` 和 server PID `58492`（SIGTERM），稍后确认父子进程均退出且 30001 释放；30000 始终无 listener。
+- 原始容器日志：`/tmp/qwen_iq3_stability_20260910.log`、`/tmp/qwen_iq3_stability_stress_20260910.jsonl`、`/tmp/qwen_iq3_stability_memory_20260910.jsonl`；TP 栈 `/tmp/qwen_iq3_stability_tp{0,1}_stack_20260910.txt`。异常并发请求另存 `/tmp/qwen_concurrency_33_34_repro.json`。客户端因人工终止没有末尾 summary，不得将预设 duration 当成已完成时长。
+- 新登记 I-007；后续先补逐类型 fallback 与旧模型回归，并做有限时长的相同压力客户端对照。固定 TP=2，不采用改变 TP 的绕过来宣称完成。
+
+### Run `20260910-S5-q36-regression`
+
+- Qwen3.6 `/models/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf` + `/models/Qwen3.6-27B`，仍通过同一脚本、overlay、新 wheel 和 IQ3 integration 源码启动。server PID `80529`，sampler `80530`；health 200，模型枚举正确。
+- load TP0/TP1 `47.20/46.56 s`；resident weight `14.10 GB/rank`，KV `296832 tokens`；decode256 三次 `35.0600/35.2965/35.3117 tok/s`，中位数 `35.2965`；TTFT 中位数 `1.2567 s`。
+- 1+1=`2`，17*23-19=`372`，严格 JSON、素数代码、巴黎均正常；marker 三次和 18,831-token 长上下文 marker 正确。冷 marker `1178.41 tok/s`（prompt/e2e），cached 两次 `10467.71/12106.23` 单列；长上下文 `9.8258 s`。
+- concurrency2 数字序列 `[true,false]`，concurrency4 全通过；此基线也复现 I-006，因此不将并发异常称作已解决。指定的旧模型启动/固定正确性/基础性能回归完成。
+- 采样峰值 XPU6/7 `32373.00/31623.36 MiB`。准确 PID SIGTERM 后 30001 释放；30000 始终无 listener。日志 `/tmp/qwen_q36_regression_20260910.log`、`/tmp/qwen_q36_regression_bench_20260910.jsonl`、`/tmp/qwen_q36_regression_memory_20260910.jsonl`。
+
+### Run `20260910-S5-coverage`
+
+- 源文件 866 tensors：主模型 851，另有未启用 MTP `blk.64` 的 15 个（7 F32、6 Q6_K、2 Q8_0）。下表为主模型原始 tensor 计数和 canonical 逻辑 bytes；metadata probe 按单行 repack 推算完整 tensor，不包含 TP、合并复制和 allocator 开销。
+
+| 原始类型 | tensors | native | FP16 fallback | 未量化 | canonical native bytes |
+|---|---:|---:|---:|---:|---:|
+| F32 | 353 | 0 | 0 | 353 | 0 |
+| IQ3_S | 4 | 4 | 0 | 0 | 167,116,800 |
+| IQ4_NL | 7 | 7 | 0 | 0 | 330,301,440 |
+| IQ4_XS | 117 | 117 | 0 | 0 | 5,040,046,080 |
+| Q3_K | 7 | 7 | 0 | 0 | 311,951,360 |
+| Q4_K | 104 | 104 | 0 | 0 | 4,671,078,400 |
+| Q5_K | 131 | 131 | 0 | 0 | 5,273,026,560 |
+| Q6_K | 24 | 24 | 0 | 0 | 1,571,225,600 |
+| Q8_0 | 104 | 104 | 0 | 0 | 69,632,000 |
+
+- F32 原始逻辑 bytes `10,582,016`，不计入量化 fallback。四个新增类型的主模型 fallback 均 0，probe failures 0。
+- 运行期源码复核：IQ4/Q3/IQ3 的大M shard matmul在调用内临时重建dense权重，没有写入常驻缓存；decode读取compressed rep。两目标模型HF配置均 `tie_word_embeddings=false`，不走tied lm-head的resident dense缓存分支。设备allocator保留的空闲显存与仍被模型引用的FP16权重分开理解。
+- 配套启动脚本同步后，另核对59个SGLang生产文件、ESIMD kernel源文件及启动脚本，全部host/container SHA256相同；逐文件记录 `/tmp/qwen_full_source_sync_audit_20260910.json`。
+- `4adbc1272` 新增 opt-in `SGLANG_GGUF_XPU_LOG_RESIDENCY=1`，默认关闭；同步前逐文件 readlink 后 docker cp。当前容器 gguf.py SHA256 `bf9ced9528f18e7a2e7e8c380df8583e03eaeb3cf86ec2e58b64a11f5cfa7efe`，wheel/overlay 未变。新增日志与 IQ3/Q3/IQ4 回归 `46 passed`（`/tmp/qwen_residency_unit_20260910.log`）。
+- native_final 真实加载每 rank 306 层记录、594 个 prepared shard，全为 native。该计数包含融合层拆分 shard，不能当作 GGUF 唯一 tensor 数；NL/XS 同样在最终 canonical kind `iq4` 中汇总。日志中没有 layer.prefix 的层为 `?`，按每条记录处理，storage 只按 `(device,data_ptr,nbytes)` 去重。
+
+| canonical kind | 每 rank 去重 physical storage bytes |
+|---|---:|
+| iq3_s | 83,558,400 |
+| iq4 | 3,858,923,520 |
+| q3_k | 200,540,160 |
+| q4_k | 3,246,489,600 |
+| q5_k | 3,544,842,240 |
+| q6_k | 794,787,840 |
+| q8_0 | 52,920,320 |
+| 合计 | 11,782,062,080 |
+
+- 这个加载期统计只涵盖 dense linear/embedding 的 final reps、merged reps 和 groups；不是进程总显存，不含 KV、其他模型缓冲区和后续运行期缓存，不声称覆盖 MoE。按源码来源映射的 bytes 与实际 storage 分开保存。
+- 实际混合 topology 中包括 IQ3+IQ4、IQ4+Q3、IQ4+Q4、IQ4+Q5、IQ4+Q5+Q8、IQ4+Q6+Q8；完整 36 种带 multiplicity 的 topology 及各层 reps/groups/merged 组合在汇总 JSON。此为加载覆盖证据，数值集成回归由前述 49 项测试和 E2E 提供，未声称逐层完整数值比较。
+- 原始记录容器 `/tmp/qwen_native_final_20260910.log`；离线汇总宿主 `/tmp/qwen_native_final_residency_20260910.json`，脚本 `test/manual/quant/summarize_gguf_xpu_residency.py`，含零记录/错误 JSON 失败处理。测试构建与请求日志已归档宿主 `/home/intel/shaojun/sglang/artifacts/qwen3_8_iq3_20260910`，完成后追加最终日志和 SHA256 manifest。
+
+### Run `20260910-S5-native-final-stress`
+
+- 第三次 native 冷启动 server `87535`、sampler `87536`。加载 `40.68/40.63 s`，resident `11.65 GB/rank`，KV `376960`，固定 benchmark decode 中位数 `23.2396 tok/s`、TTFT `1.4539 s`，固定集与阶段4一致（无 thinking 的多步算术仍错为362）。
+- benchmark 后持续客户端计划1800秒，`--skip-probes --request-timeout-seconds 60 --stop-on-transport-error --fail-on-errors`。实际 `227.733 s` 后退出1：42个请求，41个 HTTP200，一个 timeout；末尾 health+marker recovery 失败，`completed_requested_duration=false`。
+- 第18、38个请求在 concurrency2 JSON marker 输出中重复数字；第34个请求 content 为空且 reasoning 重复。第42个请求超时。最后模型日志完成一次decode时 `#queue-req:1`，之后没有新batch，不能仅凭 TP idle broadcast 栈将根因归为 Gloo。
+- 该轮没有前置 timeout/cancel，故这些探测不是复现 I-007 的必要条件。首轮失败记录保留。
+- 原始容器 `/tmp/qwen_native_final_stress_20260910.jsonl`、`/tmp/qwen_native_final_stress_summary_20260910.json`。宿主现场 `/tmp/qwen_native_final_tp{0,1}_stall_20260910.txt` 与 `http_stall`。客户端正常写出失败 summary；准确server PID SIGTERM后30001释放。
+- 下一步分别诊断共享 GDN 小 batch 输出路径与 scheduler/Mamba 排队停滞，并继续最终 fallback 矩阵。保持 TP2，不以改变 TP 或掩盖输出检查作为稳定性通过。
+
+### Run `20260910-S5-gdn-race-repro`
+
+- I-006 定位取得局部复现证据：实际 TP2 local heads `H=8, HV=24, K=V=128`；`gdn_conv_fused_seq.h:630` 用 `N*HV<=WG_SIZE`（64）决定 inline shift，因此 N2 为内联，N3/4 为独立 shift。
+- 每个 HV 是独立 workgroup；workgroup barrier 无法保证所有 head 的 conv-state 读取完成，hv0 提前写 conv state 会与其他 head 读取竞争。总 workgroup 数小不能提供跨 workgroup 同步保证。
+- 使用当前未修改 wheel，对相同两个输入和缓存槽 `[3,1]` 分别运行 N2 与 N3（额外独立有效槽4），再运行第二份 N3 control。4随机种子×8连续步骤，共32步；N2/N3 每一步均不同，且只发生在第二行。输出 max_abs `0.00803375244140625`，SSM `0.21857452392578125`；第一行 bit-exact，N3/control 全 bit-exact；全部 conv 更新与独立 shift oracle bit-exact，无非有限值。
+- 原始容器 `/tmp/qwen_gdn_shift_before_20260910.jsonl`；临时复现宿主 `/tmp/validate_gdn_inline_shift_20260910.py`，仅在30001停止、XPU6空闲后运行。该实验强力支持 inline 分支污染，仍需修复后同测及 E2E 确认 I-006 是否全部解决。
+- 决策：独立于 IQ3_S 的小修复，统一在 recurrence kernel 后运行已有 conv-state shift kernel；不增加 fusion，也不改变 TP。I-007 调度停滞仍单独诊断，不能假定同时修复。
+
+### Run `20260910-S5-quant-matrix-before-gdn-fix`
+
+以下使用同一个 IQ3_S wheel `fe61a59f…`，公共 GDN 仍有已定位的内联状态竞争。它是量化接入后的完整逐类型对照，不能作为修复后稳定性结果。所有行均 TP2/XPU6,7/30001、同一 benchmark；cold 与 cached prefill 严格分开。
+
+| 配置 | resident GB/rank（日志） | KV tokens | decode256 median tok/s | TTFT median s | cold marker prompt/e2e tok/s |
+|---|---:|---:|---:|---:|---:|
+| native_final | 11.65 | 376960 | 23.2396 | 1.4539 | 975.66 |
+| iq3_fallback | 11.91 | 368640 | 23.2023 | 1.4230 | 997.81 |
+| q3_final_fallback | 12.22 | 358528 | 22.9265 | 1.4246 | 992.34 |
+| iq4_final_fallback | 20.43 | 89344 | 21.4802 | 1.0422 | 1193.74 |
+| q36_regression | 14.10 | 296832 | 35.2965 | 1.2567 | 1178.41 |
+
+- `q3_final_fallback` 只禁 Q3_K，IQ3_S/IQ4 保持 native；server `104736`、sampler `104737`。`iq4_final_fallback` 只禁 IQ4_NL/XS，Q3_K/IQ3_S 保持 native；server `111215`、sampler `111216`。两轮固定 API 集及长 marker 完成，C2 异常仍存在；准确 PID SIGTERM 后30001均释放。
+- 容器原始 `/tmp/qwen_{q3_final_fallback,iq4_final_fallback}_20260910.log`、对应 `_bench_20260910.jsonl` 和 `_memory_20260910.jsonl`。统计宿主 `/tmp/qwen_<label>_report_20260910.json`。数据为独立单轮三次测量，不能将小幅差异解释为统计显著。
+- 修复前后使用隔离 overlay 备份 `/llm-scaler/overlays/qwen3_8_pre_gdn_shift`；旧wheel另存 `/tmp/qwen_pre_gdn_shift_20260910.whl`，便于复现，不修改全局site-packages。
+
+### Run `20260910-S5-gdn-port-kernel`
+
+- 历史溯源：llm-scaler `2ac6a6f` 已在2026-09-07修复 vLLM 副本的相同竞争；SGLang独立副本没有同步。新提交 `0a08e20` 只将当前 SGLang seq dispatch 改为统一独立 shift，保留本分支 native/transposed 布局与负索引保护；不是改写或替换既有 IQ kernels。
+- 新回归在旧wheel两种布局均失败（`/tmp/qwen_gdn_shift_pytest_before_20260910.log`），新wheel GDN+IQ3/Q3/IQ4 synthetic `63 passed`（`/tmp/qwen_gdn_quant_regression_20260910.log`）；新wheel IQ3真实shape/TP-local共20 cases通过，扩大到384采样行后worst max_abs `0.0009765625 < 0.01`，全部finite（`/tmp/qwen_iq3_kernel_after_gdn_20260910.log`）。与较早192行sample的最大值不直接比较。
+- 构建发现：当前自定义 Ninja `sycl_compile` rule 没有 header depfile。第一次仅改header后build虽成功，实际只重新device-link，`esimd_kernel_lgrf.o`仍旧；该中间wheel没有安装。删除准确的生成物 `build/temp.linux-x86_64-cpython-312/csrc/xpu/esimd_kernel_lgrf.o` 后重新build，日志确认实际编译 `esimd_kernel_lgrf.sycl`。日志 `/tmp/qwen_gdn_build_20260910.log`（无效重链轮）、`/tmp/qwen_gdn_build_force_20260910.log`（有效重编轮）。后续只改kernel header时必须显式让对应object重新编译。
+- 构建仍使用 `source /opt/intel/oneapi/setvars.sh` + `CXX=icpx MAX_JOBS=8 python3 -m build --wheel --no-isolation`，仅安装overlay。最终wheel SHA256 `dc8cd7c9ec463e43d5a18e2be8636d0a5799b71b2c649379314993667fb14d70`；lgrf SO `3d5c04e121958d7877783231cb033343510086062e4926ccd4e1a719486508a8`；core SO `1032f160680452c5024d6919c8860e4356a8c262d810aa19655c1a79b10da304`。旧wheel/overlay备份保持不动。
+- 两次kernel submit使用相同 PyTorch XPU stream，其native queue为in_order（已按安装的torch commit `70d99e998b4955e0049d13a98d77ae1b14db1f45`核对），因此所有head读取完成后才会shift；不需要新增host同步。普通decode小batch多一次既有kernel launch，性能待E2E记录。
+- 接下来仅带临时 `QWEN_SCHEDULER_DIAG=1` 重放原调度代码，验证GDN修复后内容与剩余I-007。临时文件宿主 `/tmp/qwen_scheduler_diag/{scheduler,request_receiver}.py`，逐文件readlink后docker cp；仓库canonical文件不含该heartbeat。最终bench前必须恢复canonical。
+
+### Run `20260910-S5-gdn-fixed-scheduler-diag`
+
+- 新 GDN wheel，原调度代码加 opt-in heartbeat；server PID `122449`，sampler `122450`，TP2/6,7/30001。连续客户端计划300秒，45秒请求timeout，不含前置probe。
+- 前44个请求均HTTP200且内容检查全部通过，包括原来稳定出错的C2 marker与第二路diary；GDN局部修复后暂未复现I-006。第45/46个请求在停止服务之前超时，随后诊断流程结束并向准确server PID发SIGTERM；末尾47/48及recovery与清理时间可能重叠，不作为额外独立失败证据。客户端总记录48，退出1，实际265.85秒，未完成300秒。
+- 决定性证据：08:45:52→08:45:57，TP0 recv_iteration `1,049,110→1,116,442`，TP1同步持续增长。两rank持续显示 `waiting_queue_len=2, running_batch_len=0, batch_is_full=True, admission_status=blocked_batch_is_full`。因此先前的空请求broadcast栈只是高频正常轮询采样，**Gloo未停滞**。
+- I-007根因：`alloc_group_begin()`把匹配前预留槽从free_slots移走；随后的`get_num_allocatable_reqs()`只读free_slots，误判没有容量，设置full并在消耗预留槽前break。group_end归还槽后，空running batch没有后续decode更新来清full，形成持续拒绝准入。实际CPU复现同一方法显示可用量 `1→0→1`。
+- 修复范围收敛为独立的remaining-reserved计数，仅用于scheduler的已有准入上限；不改变available_size的free-only定义，也不重写prefix/COW/HiMamba/preemption/session/multimodal路径。上层`_resolve_max_num_reqs()`始终按Mamba pool/ratio限制request pool，普通64槽/no-overlap配置上限16；小池回归会核对此生产约束。
+- 原始容器 `/tmp/qwen_gdn_fixed_diag_20260910.log`、`/tmp/qwen_gdn_fixed_diag_stress_20260910.jsonl`、`/tmp/qwen_gdn_fixed_diag_stress_summary_20260910.json`。CPU复现宿主 `/tmp/repro_mamba_group_admission_20260910.py`；历史kernel审计宿主 `/tmp/qwen_kernel_history_audit_20260910.md`。
+- 30001确认释放、30000无listener；临时diagnostic源码将在下一轮正式修复验证前恢复。
+
+### Run `20260910-S5-mamba-reservation-fix`
+
+- SGLang commit `7ae8901f0`：Mamba allocator 单独暴露尚未消耗的 group reservation，scheduler 的原有容量上限包含这些槽；available_size/bulk allocation 保持原语义。
+- CPU regression 调用真实 `_get_new_batch_prefill_raw()`，确认最后一个槽被 group 暂存时仍能到达 request init，并消耗该槽；另覆盖归还、clear、失败/重复 group、bulk 分配，以及真实生产 pool4→request-cap1。
+- 用 Git HEAD 修复前 `get_num_allocatable_reqs()` 替换测试进程中的方法：6 tests 中上述准入两项失败；新版本 `6 passed`。日志 `/tmp/qwen_mamba_reservation_{red,unit}_20260910.log`。不修改运行中服务代码对象。
+- 独立审查无 blocker；调度/COW/HiMamba/priority/session/multimodal 原流程保留。临时 heartbeat 的 request_receiver 和 scheduler 已恢复仓库源码；新服务没有 diagnostic 环境变量。
+- 原生量化单测汇总 `53 passed`（IQ3/Q3/IQ4/Q4及驻留统计），日志 `/tmp/qwen_final_quant_unit_20260910.log`。
+
+### Run `20260910-S5-gdn-snapshot-tracking`
+
+- 全面审查此前快速路径发现 I-008：模型层 ESIMD decode 更新 working conv/SSM 后直接 return，跳过标准 backend 的 `_track_mamba_state_decode()`。extra_buffer/interval64 的调度仍标记 snapshot 长度并将 tracking slot 放入 prefix cache，可能将旧状态关联到已生成的 token 前缀。
+- 最小修复：写回真实 pool 后、任何 norm/out-projection 返回之前调用既有 tracking helper。传入 native `pool_conv`/`pool_ssm`；不新增 CPU mask.any 同步。
+- CPU test 对实际 AST 提取 wrapper 执行状态更新及复制，旧代码 4 个 tracked 子场景失败，新代码 3 tests/8 子场景通过；覆盖两种 norm 返回、legacy conv 写回顺序和 false/None masks。日志 `/tmp/qwen_gdn_snapshot_tracking_{red,green}_20260910.log`。
+- 实际启用的 extend 路径仍返回标准 backend 的 conv/SSM tracking；另一个模型层 prefill shortcut 环境开关未启用，未发现当前 reachable prefill 的对应遗漏。
+- 修复前服务 `tracking_before` server PID136233、sampler136234，GDN race 已修、admission 已修，model module 在 snapshot hook 同步前已加载。generated-prefix probe 命中256 token，大于初始64 token；cached/cold 8 个生成 token 相同，首 token logprob 差第一次 -0.03019、重复一次 -0.18070。它们是数值观测，不构成错误文本复现；局部状态测试提供直接根因证据。
+- 首次 probe 将 HTTP200 text/plain flush 响应误判为 JSON 错误，脚本已修复且保留原始记录；重跑 flush confirmed、cold cached_tokens=0、prefill control hit、generated-prefix hit 均成立，transport failures=0。
+- server136233 已准确 SIGTERM，两个测试端口均无 listener。实际 XPU snapshot equality 与 snapshot/source 复用后下一步 output/conv/SSM bit-exact 已通过（`/tmp/qwen_gdn_snapshot_xpu_20260910.log`）；修复提交 `70e30c29d`。后续运行修复后相同 API probe，以及最终持续回归。
+
+### Run `20260910-S5-final-fixed-native`
+
+- 最终代码 SGLang `70e30c29d`、llm-scaler `0a08e20`，wheel `dc8cd7c9…`；六个关键 host/container source SHA256 相同，已恢复无 heartbeat 的仓库版本。完整 provenance `/tmp/qwen_final_provenance_20260910.json`，wheel/module hashes `/tmp/qwen_final_wheel_hashes_20260910.json`。
+- label `native_closed`，server146380、sampler146381，启动09:10:54 UTC；resident11.65 GB/rank，KV376960，加载39.74/40.14 s。
+- benchmark：decode中位21.8241 tok/s，cold marker995.0285有效prompt tok/s；C2/C4所有序列检查通过，marker与18831-token长上下文通过；thinking-off算术仍362，保留此前 native/fallback 均出现的错误，不标记此题正确；未以独立 HF/FP16 后端定位其来源。
+- generated-prefix 修复后 API probe：缓存256>初始64，cold cached_tokens=0，全部flush确认；generated cached/cold 输出8token相同，首token logprob差 -0.002326，普通prefill control差+0.002292。此对照仅作数值观察，不要求prefill/decode路径bit-exact。
+- 最终驻留日志再次确认每rank306层记录/594准备shards均native；去重物理storage11,782,062,080bytes/rank，与修复前统计相同。原始完整log和 `/tmp/qwen_native_closed_residency_20260910.json` 一起归档。
+- 旧符号兼容性补充：除真实 pre-IQ3 wheel 测试外，使用当前源码实际 `_imp_kernels` 与 import assignments，模拟分别缺 IQ4/Q3/IQ3 以及同时缺全部六个新符号的模块，4/4通过，其他20或16个kernel符号保持原对象。此为CPU模拟模块检查，不声称额外安装过三个历史wheel。宿主 `/tmp/qwen_optional_symbol_matrix_20260910.{py,log}`。
+- 30分钟stress **通过**，09:14:31.272→09:45:18.121 UTC，实际1846.84896秒（包括探测及完整收尾），请求窗口完成，退出0。308/308 HTTP200、308/308内容检查通过、0 transport errors。前置主动timeout与取消流被观察到，初始与最终health/marker恢复均通过。
+- 客户端并发1/2/4分别44/88/176个请求；1K/4K × 128/256全部覆盖。154个decode请求实际输出均等于目标128/256 token；另154个marker_json请求严格检查marker。检查不等同于任意生成内容的全面事实准确性。
+- 各phase最长延迟51.8858秒（4K/256），小于60秒request timeout。服务批处理大小可随缓存状态与准入变化，客户端并发数不能当作每步实际device batch size。
+- 压测期间显存平台约XPU6 32648.41 MiB、XPU7 32536.91 MiB，无持续上升。停止准确server PID146380后端口30001释放，XPU6/7回落50.6484/52.5742 MiB；下一轮启动前实测同值。原始交接空闲43.43/45.33 MiB不作为本轮实测值替代。30000始终无listener。
+- 原始 `/tmp/qwen_native_closed_stress_20260910.jsonl`、summary JSON、service/benchmark/memory logs；下一轮开始逐类型最终矩阵。
+
+### Run `20260910-S5-external-device-observation`
+
+- 09:55:53→09:56:00 UTC，非任务卡4/5的外部显存占用从约1511/999 MiB升至19875/19682 MiB，之后约30494/30128 MiB。此时本任务在newtypes_closed_fallback加载阶段，任务server环境仍明确 `ZE_AFFINITY_MASK=6,7`。
+- 本任务对4/5只使用xpu-smi只读采样，没有启动计算或停止任何外部进程；核对时30000仍无listener，同容器当前实际launch_server为本轮记录的30001 PID。未追踪或改变其他容器服务。
+- 最后两组（新增类型全部fallback、Qwen3.6）与此前测试的外部负载状态不同，因此性能表作为本机实测描述，不能将所有小幅差异作严格受控因果比较。权重常驻字节数/原生覆盖及数值验证结论不依赖此性能假设。
+
+### Run `20260910-S5-fixed-matrix-before-empty-tracking-guard`
+
+以下六组均为 SGLang `70e30c29d` / llm-scaler `0a08e20` / wheel `dc8cd7c9…`。这是公共正确性修复后的完整矩阵，和较早未修 GDN 的矩阵分开。每组 decode、TTFT 各三次；cold marker 是 prompt tokens / 完整请求耗时，包含输出开销，不称纯 prefill kernel 吞吐；cached 两次另存原始JSON。
+
+| 配置 | resident GB/rank（日志） | KV tokens | decode median tok/s | TTFT median s | cold marker prompt/e2e tok/s |
+|---|---:|---:|---:|---:|---:|
+| native_closed | 11.65 | 376960 | 21.8241 | 1.4549 | 995.03 |
+| q3_closed_fallback | 12.22 | 358528 | 21.4789 | 1.4243 | 969.89 |
+| iq4_closed_fallback | 20.43 | 89344 | 18.6300 | 1.0388 | 1180.91 |
+| iq3_closed_fallback | 11.91 | 368640 | 21.8454 | 1.4187 | 1022.02 |
+| newtypes_closed_fallback | 22.08 | 35136 | 18.5962 | 0.9621 | 1210.76 |
+| q36_closed_regression | 14.10 | 296832 | 21.5226 | 1.2493 | 1114.94 |
+
+- 六组 C2/C4 所有数字前缀检查通过，18,831-token 长 marker 均正确，HTTP 均200。Qwen3.8 各配置 thinking-off 多步算术均362，保留此错误；Qwen3.6 则372，其他固定集通过。
+- native 相比新增类型全部 fallback，日志 resident 从22.08降至11.65 GB/rank，节省10.43 GB/rank，KV从35,136增至376,960。不能把“新增类型全部 fallback”称作全模型FP16；Q4/Q5/Q6/Q8始终原生。
+- 最终加载记录各rank306条、594个prepared shards。native/fallback分别为594/0；Q3回退587/7；IQ4回退456/138；IQ3回退590/4；新增类型全部回退445/149。这里是包含融合拆分的shard数，不替代源GGUF唯一tensor计数。
+- 各rank最终去重weight storage bytes：native 11,782,062,080；Q3回退12,383,682,560；IQ4回退21,197,127,680；IQ3回退12,055,019,520；新增类型全部回退22,962,995,200。融合/合并副本随配置变化，单类型差值不要求严格相加。
+- 对应准确server PID：146380、211400、217802、225578、231973、240557，均已逐一SIGTERM并确认30001释放；30000均无listener。完整启动/采样PID账本 `/tmp/qwen_iq3_this_session_pids.json`。
+- 汇总 `/tmp/qwen_final_matrix_20260910.json`，包含原始三次值、固定题文本及并发/长上下文判断；驻留汇总 `/tmp/qwen_final_residency_matrix_20260910.json`。原始 `/tmp/qwen_<label>_20260910.log`、`_bench_20260910.jsonl`、`_memory_20260910.jsonl`。
+
+### Run `20260910-S5-q36-performance-investigation`
+
+- Qwen3.6 公共修复前decode中位35.2965 tok/s，修复后21.5226。外部4/5负载消退后的独立冷启动 `q36_performance_recheck`（server246776）三次21.1756/21.9929/21.8711，中位21.8711，故不能仅归因外部负载。固定内容检查仍通过。
+- py-spy 200Hz轮明显落后，采样时间失真，只保留诊断原始文件，不用于定量性能结论。20Hz×10秒复测199 samples、0 errors、无behind警告，17 samples包含 `_track_mamba_state_decode`，54包含ESIMD wrapper，30包含GGUF shard matmul；仅说明host路径有开销，不足以归因全部性能回退。被profiler扰动的decode请求不并入正式benchmark。
+- 源码确认 eager `_forward_metadata` 已一次性计算明确的 `has_mamba_track_mask`。图捕获/回放构造器不赋值，因此不能使用旧的默认False直接跳过。试验方案将默认改为None代表未知，只在明确False时跳过每层masked tracking调用，True/None仍复制，不增加逐层GPU同步。
+- 原始 `/tmp/qwen_q36_performance_recheck_decode_20260910.jsonl`、`/tmp/qwen_q36_tracking_profile{,_lowrate}_20260910.txt`。server246776已准确SIGTERM，30001释放。
+
+### Run `20260910-S5-empty-tracking-guard`
+
+- SGLang `51a0d849b`：`ForwardMetadata.has_mamba_track_mask` 改为Optional bool，默认None表示producer未知，仅明确False跳过ESIMD快照helper。eager每次产生明确bool；graph capture/replay省略字段时仍提交tracking。其他metadata消费者的truthiness行为不变，无新增逐层同步。
+- CPU容器测试6项/14子场景全部通过，覆盖真实producer、dataclass未知默认、False零调用、True/None/缺字段保留复制、working pool写回和两条norm路径；实际XPU未知标志snapshot及下一步reuse仍bit-exact。日志 `/tmp/qwen_gdn_empty_tracking_{unit,xpu}_20260910.log`。宿主最初两次pytest因缺少sglang依赖（最终为orjson）未收集；正式通过来自完整容器依赖环境，未修改宿主依赖。
+- Qwen3.6 server269269，新gate+同一正确性wheel；decode三次24.3678/24.6638/24.9409 tok/s，中位24.6638，较无gate空闲复测21.8711提升约12.8%，仍低于旧35.2965。固定集、C2/C4数字前缀、长marker通过，TTFT中位1.25016 s。
+- Qwen3.6 generated-prefix全部flush/cache检查通过：命中256>初始64，cached/cold8token相同，首tokenlogprob差-0.00128844；普通prefill control差-0.00015945。该API数值仅观察，不声称两个计算路径bit-exact。
+- server269269准确SIGTERM后30001释放；新版本七个关键host/container源码hash一致，provenance `/tmp/qwen_guard_provenance_20260910.json`。旧30分钟结果严格归属于70e30c29d，此后补充新gate版本回归，不覆盖或改写旧结果。
+- 独立GDN旧/新overlay计时只作诊断：N1吞吐式每调用8.113→11.165微秒，逐调用同步延迟44.978→43.010微秒；N2 10.305→12.712微秒；N4旧/新本来均独立shift，21.882→16.663微秒。局部新增约3微秒×48层不足以解释服务剩余降速，不能把全部成本归因独立shift。原始 `/tmp/qwen_gdn_shift_cost_{old,new}_20260910.json`，不把已知有race旧wheel当正确性通过版本。
+
+### Run `20260910-S5-q36-wheel-and-hook-isolation`
+
+- 同一当前Python `51a0d849b` 只将服务PYTHONPATH指向旧 `qwen3_8_pre_gdn_shift` overlay；不重新安装、不覆盖当前正确性wheel。诊断server277096，decode三次23.7453/24.5680/24.8752，中位24.5680，与当前wheel24.6638接近。已知旧wheel有GDN race，绝不作为交付版本或正确性通过证据。
+- 第二次仅容器 `qwen3_5.py` 临时使用Git `7ae8901f0` 的完整原文件（没有新增snapshot调用），当前正确性wheel保持不变；诊断server282320。decode三次23.5925/24.4124/24.5482，中位24.4124，同样没有恢复35.2965。文件逐次readlink后docker cp，诊断后恢复canonical源码。
+- 两个诊断server均已准确SIGTERM，30001释放。逐一对照表明当前条件下新wheel/快照hook均不足以解释旧35.30到当前24.6的差异；不能将全部历史差异归因某个公共正确性修复。原始 `/tmp/qwen_q36_{wheel_cost_old,no_snapshot_hook}_decode_20260910.jsonl`，临时前置源码 `/tmp/qwen_q36_no_snapshot_hook_20260910.py`。
+- 这些是各一轮三次测量，未控制整台宿主机历史负载/频率，仍保留历史性能下降的观察。后续收口必须报告当前最终版本实测，而非选择较快旧数字。
+
+### Run `20260910-S5-launcher-provenance-audit`
+
+- 对容器当前已修改的49个SGLang tracked文件逐个SHA256核对，全部与宿主canonical一致。保存的scheduler/request_receiver diagnostic文件相对7ae父提交只多显式heartbeat hunk，没有丢弃额外容器优化。加载期residency日志没有改变decode热路径。
+- 解析旧/新Qwen3.6完整ServerArgs，除random_seed外相同：模型、TP2、dtype、page64、track64、graph/overlap/cache、请求容量16都一致。实际decode均running1、queue0、mamba_num2，准入修复没有扩大实际单请求batch。
+- 发现启动脚本漂移：当前容器脚本与早先宿主 `/tmp/start_qwen3_6_service.container.sh` 完全相同（SHA256 `97a694…`），但比宿主llm-scaler canonical少 `SGL_XPU_GGUF_RESADD_NORM_KQ`、`SGL_XPU_GGUF_MLP_SILU`、`SGL_XPU_GGUF_NORM_OUT_Q5K` 三个export；其余内容相同。这三个开关早已在用户提交 `1ee060e` 添加，SGLang默认关闭。
+- 没有证据表明该旧容器脚本在两次历史性能测量之间变化，因此不把它直接认定为35→24差异根因。需要修复最终交付的配置一致性：现有native_guard为旧脚本基线，结束后同步宿主已提交脚本并单独验证既有fusion路径，保留两套配置的结果。
+- 后续找到配套提交证据：SGLang `b4599c0ef` 把这三个环境开关默认从1改成0，llm-scaler `1ee060e` 配套在GGUF启动时显式设1。系统site-packages旧模型文件仍默认1，且旧Qwen3.6服务日志有大量 `gguf_resadd_norm_kq` / `gguf_mlp_silu` ACTIVE。模型文件同步到宿主版本而启动脚本未同步，造成既有fusion被关闭；这比“kernel修复导致降速”有更直接的执行路径证据。待配套脚本同步后的同模型测量确认性能恢复。
+- 双rank ACTIVE条数提供直接执行证据：旧Qwen3.6为KQ128 / MLP128 / Q5K96，修复后旧脚本两轮均0/0/0；旧Qwen3.8 native_final为2/10/66，native_closed与native_guard均0/0/0。这也解释为什么Qwen3.6受影响大于Qwen3.8：后者大量IQ4/Q3/IQ3混合层本来就不满足旧Q4/Q6 fusion类型guard。计数是日志ACTIVE条数，不是唯一GGUF tensor数。
+
+### Run `20260910-S5-canonical-launcher-q36`
+
+- 配套部署修复：readlink后docker cp宿主llm-scaler `sglang/scripts/start_qwen3_6_service.sh`，脚本内容来自已有 `1ee060e` + `4f47c57`，没有新增fusion kernel。SGLang仍51a0d849b，wheel仍dc8cd7c9…。
+- server306766，TP2/6,7/30001；读取其实际 `/proc/PID/environ` 确认三个GGUF fusion开关均1，SPEC_DRAFT_PATH不存在。四个运行关键文件（包括launcher）host/container hash一致，记录 `/tmp/qwen_q36_canonical_launcher_provenance_20260910.json`。
+- Qwen3.6 decode三次34.8545/35.0673/35.0056 tok/s，中位35.0056，接近旧35.2965（约-0.82%，单轮波动范围内，不声称性能提升）。相较旧脚本guard24.6638恢复约42%。TTFT中位1.25176 s，C2/C4数字前缀全部通过，固定集与18,831-token长marker通过。
+- generated-prefix全部flush/cache门禁通过，transport failures0。准确server306766 SIGTERM后30001释放，30000无listener。
+- I-009闭环：历史ACTIVE→关闭→配套脚本恢复ACTIVE与性能恢复互相印证，原因是默认开关修改与配套启动脚本漏同步，而不是Q3/IQ4/IQ3 kernel数值或GDN正确性修复。后续最终矩阵/稳定性使用配套完整配置；此前70e/51a旧脚本结果保留为独立基线。
+
+### Run `20260910-S5-existing-fusions-numeric`
+
+- 为既有三类fusion补直接数值证据，脚本 `test/manual/quant/validate_qwen_existing_gguf_fusions.py`。模型不加载、服务停止后仅XPU6/7执行；使用production Q4/Q5/Q6 canonical repack/dequant，FP32 dense reference保留FP16 residual/norm/GEMV/gated中间舍入。
+- Synthetic权重使用有限GGUF block scales（d=2^-15、dmin=2^-16），随机量化payload/subscale；这些范围在第一次执行前选定，避免不合理的大权重使FP16 SiLU乘积溢出。门限从第一次执行固定max_abs0.01，没有放宽。实际K5120、GDN K3072/V128，小输出行64/128用于局部运算检查；不把它称作完整真实tensor验证。
+- KQ M1/2/4/8/16共5场景：混合Q4+Q6共享输出buffer的偏移/gap、fp16 BA、输入residual保持不变、独立new-residual和normed输出；worst max_abs0.001953125。
+- Dense MLP Q4 SiLU M1/2/4共3场景，worst0.0001220703125。Q5 gated norm M1一个场景，max_abs0。均finite，9/9场景通过；MLP默认M<=4、Q5默认M1，未伪称启用了不支持的M。
+- 原始 `/tmp/qwen_existing_fusions_numeric_20260910.json` 与stderr log（空），实际安装的是当前dc8cd7c9…wheel。已有IQ3/Q3/IQ4数值证据仍按此前各自reference/kernel门禁保留，不重复编造新的量化验证轮次。
+
+### Run `20260910-S5-final-canonical-native`
+
+- 最终完整运行配置：SGLang逻辑51a0d849b（另776268441/998a68870仅测试脚本）、llm-scaler0a08e20、dc8cd7c9…wheel、已同步1ee/4f启动脚本。实际进程的三个既有GGUF fusion开关均1，TP2/6,7/30001，SPEC_DRAFT_PATH不存在；provenance `/tmp/qwen_native_canonical_provenance_20260910.json`。
+- label native_canonical，server314138、sampler314139；加载44.38/44.60 s，日志resident11.65 GB/rank，KV376960。decode三次22.4960/22.8788/22.8746，中位22.8746 tok/s；TTFT中位1.45490 s；首次marker989.9489 prompt/e2e tok/s，cached两次7646.44/7719.29单列。
+- C2/C4数字前缀检查全部通过，固定API集、marker及18,831-token长marker完成；多步算术仍按已知错误单独记录。ACTIVE日志双rank计数恢复KQ2/MLP10/Q5K66；每rank306加载记录、594prepared shards全部native，去重weight storage11,782,062,080 bytes。
+- generated-prefix门禁通过：flush均确认、命中已生成前缀、cold cached_tokens0，缓存/冷跑输出8token相同。首tokenlogprob差-0.0151707，普通prefill control差+0.0125694；仅记录路径舍入观察，不将cached/prefill数值要求为bit-exact。实际snapshot等于working以及下一步reuse的bit-exact证据仍来自单独XPU测试。
+- **最终30分钟稳定性通过**：10:46:09.724→11:16:33.548 UTC，elapsed1823.8241 s，完成1800 s窗口，退出0。314/314 HTTP200和内容检查通过，0传输错误；前置主动timeout与cancel被观察到，初始/最终health+marker恢复通过。
+- 客户端C1/C2/C4各46/92/176请求；157个decode的实际输出长度均满足128/256目标，另157个marker_json严格检查marker。最长请求49.6619 s，小于60 s timeout。内容检查的范围是长度/非空和marker等约定规则，不等同任意文本全面事实准确性。
+- 实际输入长度：stress的1K阶段1051–1060 token，4K阶段4052–4060 token（含chat模板/marker差异）；固定benchmark marker为2829 token。最终独立显存探测另用严格1000/4000 raw input_ids并核对服务返回计数，不混用这三个口径。
+- 显存平台XPU6约32641.19 MiB、XPU7约32540.91 MiB，无持续增长。11:16:37准确SIGTERM server314138后30001释放，XPU6/7回到50.6484/52.5742 MiB；下一轮启动前同值。30000无listener且未操作。
+- 原始 `/tmp/qwen_native_canonical_{bench,stress,memory,prefix}_20260910.jsonl`，stress summary JSON、服务log及每rankresidency JSON。后续逐类型最终对照固定这套完整配置。
+
+### Run `20260910-S5-delivery-close`
+
+指定开发容器与隔离 overlay 的原生支持任务完成。最终依据为配套 canonical launcher 下的六组对照、314 请求持续回归、精确输入长度显存探测及清理记录；较早名字含 final/closed 的报告保留为历史，不替代本节。此结论不包含另建 Docker 发布镜像或未要求的后续性能优化。
+
+#### 最终性能对照
+
+所有行固定 SGLang 51a0d849b 运行逻辑、llm-scaler 0a08e20、同一 dc8cd7c9… wheel，以及宿主已有 1ee060e/4f 配套 launcher。后续 776268441/998a68870 仅增加及格式化测试脚本。TP2、XPU6/7、30001，三个既有 GGUF fusion 开关均为1，SPEC_DRAFT_PATH 未设置。
+
+| 配置 | load 两rank (s) | resident 日志 GB/rank | KV tokens | decode 三次 (tok/s) | decode 中位 | TTFT 中位(s) | cold marker prompt/e2e tok/s | cached marker 两次 |
+|---|---|---:|---:|---|---:|---:|---:|---|
+| native | 44.38/44.60 | 11.65 | 376,960 | 22.4960 / 22.8788 / 22.8746 | 22.8746 | 1.45490 | 989.95 | 7646.44 / 7719.29 |
+| Q3 fallback | 42.39/42.55 | 12.22 | 358,528 | 22.7211 / 22.8710 / 22.8341 | 22.8341 | 1.41745 | 964.95 | 7682.21 / 7723.76 |
+| IQ4 fallback | 89.90/90.33 | 20.43 | 89,344 | 21.1757 / 21.1473 / 21.2873 | 21.1757 | 1.03933 | 1198.89 | 7860.44 / 8078.32 |
+| IQ3 fallback | 42.86/42.89 | 11.91 | 368,640 | 22.8790 / 23.0171 / 23.0561 | 23.0171 | 1.42481 | 988.84 | 7743.22 / 7681.05 |
+| 新增类型全部 fallback | 95.26/95.58 | 22.08 | 35,136 | 21.4806 / 21.7103 / 21.7683 | 21.7103 | 0.96200 | 1251.30 | 8070.99 / 8144.54 |
+| Qwen3.6 native | 38.50/38.63 | 14.10 | 296,832 | 34.8545 / 35.0673 / 35.0056 | 35.0056 | 1.25176 | 1160.62 | 10410.19 / 12010.15 |
+
+Fallback 只将对应类型恢复为常驻 FP16，其他类型继续原生；“新增类型全部 fallback”关闭 IQ4_NL/XS、Q3_K、IQ3_S，Q4/Q5/Q6/Q8 保持原生。Native 的大 M prefill 可临时 dense reconstruction，不代表权重永久展开。
+
+Native 相比全部新增类型 fallback 的主要收益是权重/KV 容量，不能宣称所有场景更快。IQ3 单独回退的 decode 略高，按本轮观察保留；不以三次短测做显著性结论。Cold marker 是实际2829-token输入除以完整请求耗时，含生成开销；后两次命中 prefix cache，分列且不称纯 prefill 吞吐。Qwen3.6 decode35.0056 tok/s，与旧35.2965相差约-0.82%，此前大幅回退已恢复。
+
+六组 C2/C4 数字前缀检查、marker 与18,831-token长上下文检查通过。固定1+1、JSON、代码结构、常识正常。**已知正确性例外保留**：Qwen3.8 thinking-off 的17*23-19仍答362（应为372），native和各fallback一致；未使用独立HF/FP16后端，不能据此确定是模型本身问题。Qwen3.6回答372。HTTP200不等于此算术内容通过。
+
+#### 最终真实驻留
+
+以下是每rank的prepared shard分类及按storage地址去重的权重字节数；不含KV、临时激活/解量化或allocator缓存。主模型唯一源tensor仍为498量化+353F32，额外15个MTP未启用。不能将prepared shard数当作GGUF唯一tensor数。
+
+| 配置 | rank | prepared 分类 | physical weight storage bytes |
+|---|---:|---|---:|
+| native_canonical | 0 | {"native": 594} | 11,782,062,080 |
+| native_canonical | 1 | {"native": 594} | 11,782,062,080 |
+| q3_canonical_fallback | 0 | {"fallback": 7, "native": 587} | 12,383,682,560 |
+| q3_canonical_fallback | 1 | {"fallback": 7, "native": 587} | 12,383,682,560 |
+| iq4_canonical_fallback | 0 | {"fallback": 138, "native": 456} | 21,197,127,680 |
+| iq4_canonical_fallback | 1 | {"fallback": 138, "native": 456} | 21,197,127,680 |
+| iq3_canonical_fallback | 0 | {"fallback": 4, "native": 590} | 12,055,019,520 |
+| iq3_canonical_fallback | 1 | {"fallback": 4, "native": 590} | 12,055,019,520 |
+| newtypes_canonical_fallback | 0 | {"fallback": 149, "native": 445} | 22,962,995,200 |
+| newtypes_canonical_fallback | 1 | {"fallback": 149, "native": 445} | 22,962,995,200 |
+| q36_canonical_launcher | 0 | {"native": 498, "unquantized": 96} | 14,315,028,480 |
+| q36_canonical_launcher | 1 | {"native": 498, "unquantized": 96} | 14,315,028,480 |
+
+IQ4_NL、IQ4_XS、Q3_K、IQ3_S 在最终 native 下 fallback 均0。完整原始类型计数/逻辑bytes见阶段5覆盖表，实际storage按kind明细见 qwen_canonical_residency_matrix_20260910.json。旧pre-IQ3 wheel实测仅IQ3回退；缺少IQ4/Q3/IQ3/全部新增符号的optional import模拟矩阵4/4通过，后者不是四个实际安装wheel。
+
+#### 精确输入长度显存探测
+
+新启动独立native_memory_final，加载后记录idle；每次flush确认成功，分别送入严格1000/4000 raw input_ids、生成1token，并断言服务prompt_tokens吻合、cached_tokens=0；随后实际生成256token。设备显存单位MiB。
+
+| 时点 | XPU4（只读） | XPU5（只读） | XPU6 | XPU7 |
+|---|---:|---:|---:|---:|
+| 启动前 | 992.54 | 992.59 | 50.65 | 52.57 |
+| 加载后idle | 996.45 | 996.50 | 28538.60 | 27788.88 |
+| 1000-token prefill采样峰值 | 999.30 | 999.37 | 30849.12 | 30099.40 |
+| 4000-token prefill采样峰值 | 999.31 | 999.37 | 31219.33 | 30469.73 |
+| 256-token decode采样峰值 | 999.30 | 999.37 | 31560.47 | 30810.94 |
+| 256-token decode采样中位 | 999.30 | 999.37 | 31560.47 | 30810.93 |
+| 停止后 | 992.53 | 992.59 | 50.65 | 52.57 |
+
+Sampler每轮sleep0.1 s，加上telemetry耗时后的实际间隔min/median/max为1.489/1.499/1.512 s。表中是设备采样峰值，不是精确分配峰值；时间戳在查询结束后生成，短请求窗口存在边界误差。总显存包含预分配KV与allocator缓存，不能据此反推常驻权重为FP16。完整采样/请求窗口见 qwen_exact_memory_report_20260910.json。
+
+#### 交付和清理
+
+- IQ3 canonical/kernel/dispatch 已分提交；公共路径 I-006 GDN有序shift、I-007准入预留槽、I-008生成前缀快照，以及I-009配套launcher同步均完成回归。明确空快照跳过保留未知/graph metadata的保守复制。
+- 量化SGLang单测53通过，GDN+新增量化kernel回归63通过，既有三类fusion直接数值9/9通过；真实IQ3四tensor全行canonical与两shape/TP局部kernel门禁见阶段4记录。
+- 最终原生稳定性1823.8241秒、314/314请求内容门禁通过，0传输错误、timeout/cancel后恢复正常，无显存持续增长；不将固定算术错误隐藏在稳定性pass中。
+- 所有本轮服务均以记录的准确PID发送SIGTERM。最终30001释放、没有遗留本轮launch_server，XPU6/7回落；30000始终只读检查，不停止、不恢复、不操作外部服务。最终观测时间和PID表见 delivery provenance。
+- 归档目录：[验证产物](../artifacts/qwen3_8_iq3_20260910/README.md)。入口为 qwen_canonical_matrix_20260910.json、qwen_canonical_residency_matrix_20260910.json、qwen_exact_memory_report_20260910.json、qwen_delivery_provenance_20260910.json；manifest.json记录每个文件bytes和SHA256，保留原始请求/响应与历史失败日志。
+- 最终wheel为 custom_esimd_kernels_sglang-0.1.0-cp312-cp312-linux_x86_64.whl，306,270,361 bytes，SHA256 `dc8cd7c9ec463e43d5a18e2be8636d0a5799b71b2c649379314993667fb14d70`。只安装到 `/llm-scaler/overlays/qwen3_8`，并在宿主归档一份；未覆盖全局site-packages。
 
 ### Run `YYYYMMDD-HHMM-Sx-NN`
 
@@ -884,7 +1178,10 @@ concurrency 2 因 fallback 一路只生成 11 tokens，吞吐不可比。阶段 
 | I-003 | `20260910-0446-S0-02` | 已修复 | 复制容器 build source 可能不被默认 Python 使用 | 默认 import 来自 site-packages，`PYTHONPATH` 为空 | 30001 使用 source overlay，并验证模块 `__file__` | `20260910-0502-S1-03` |
 | I-004 | `20260910-0458-S1-02` | 已修复 | 首次 forward 在 `w.t().contiguous()` OOM | 大型 dense FP16 fallback 被永久缓存第二份 transpose | 仅缓存不超过 16 MiB 的小型 FP16 shard | `20260910-0502-S1-03` |
 | I-005 | `20260910-0603-S2-04` | 已修复（测试流程） | 手写 fallback 启动先后因 GGUF config 缺失和 FP32 SSM state 内存不足退出 | 没有复现 `start_qwen3_6_service.sh` 设置的完整环境 | E2E 统一通过启动脚本，只增加被测 fallback 开关 | `20260910-0603-S2-04` |
-| I-006 | `20260910-0526-S2-03` | 待后续诊断 | concurrency 2 的数字序列偶发粘连、重复或提前结束，串行正常 | native IQ4 与 forced fallback 均可复现，已排除 IQ4 为唯一原因；模型/批调度路径待定位 | 不阻塞 IQ4 数值与显存闭环；后续使用更稳健并发正确性集并单独定位 | `20260910-0603-S2-04`（确认非 IQ4 专属） |
+| I-006 | `20260910-0526-S2-03` | 已修复，native持续回归通过 | concurrency 2 的数字序列偶发粘连、重复或提前结束 | GDN conv-state inline shift 跨 workgroup 读写竞争；vLLM fork 的历史修复漏同步 | `0a08e20` 使用既有独立 shift kernel；两种布局 red/green 及 44 请求内容检查通过 | `20260910-S5-gdn-fixed-scheduler-diag` |
+| I-007 | `20260910-S5-stability-first` | 已修复，native持续回归通过 | 连续请求后空running batch仍保持full，队列饥饿 | Mamba预留槽未计入准入；heartbeat证明Gloo继续前进 | 单独补预留槽计数，保留容量上限 | `20260910-S5-gdn-fixed-scheduler-diag` |
+| I-008 | `20260910-S5-gdn-snapshot-tracking` | 已修复，真实XPU/API回归通过 | 已生成前缀的 tracking slot 未更新 | 模型 ESIMD decode 提前返回跳过 backend snapshot helper | 写回 pool 后补调用；CPU red/green 通过 | `20260910-S5-gdn-snapshot-tracking` |
+| I-009 | `20260910-S5-q36-performance-investigation` | 已修复，Qwen3.6性能恢复 | decode从35.30降至约24.6 | b459默认关闭fusion与1ee启动脚本显式开启未成套同步 | 同步已有canonical启动脚本，核对实际环境/ACTIVE日志 | `20260910-S5-canonical-launcher-q36` |
 
 ## 7. 阶段总结模板
 

@@ -23,8 +23,10 @@
 - Native kernel 与 reference dequant + dense matmul 的数值误差在约定阈值内。
 - OpenAI API 的固定测试集输出合理，无乱码、重复失控、空输出或明显错误。
 - 记录 idle、prefill 峰值、decode 稳态显存以及基础延迟/吞吐。
-- 每次占用卡 6、7 前，完整保存 30000 服务现场并受控停止；测试结束后按原配置恢复 30000，健康、输出和显存与基线一致。
+- 本轮遵循最新交接约束：30000 不得受影响；启动前后只读检查 listener，不停止或恢复外部服务。
 - 所有新增路径均有可控 fallback，旧 GGUF 类型和 Qwen3.6 不回归。
+
+已知验收例外：Qwen3.8禁用thinking时17*23-19在native/各fallback均答362（正确372）。此错误保留且未归因；其余约定内容门禁及原生kernel数值验证通过。详见最终开发日志。
 
 “能启动”只是阶段 1 的目标，不是整个任务的完成标准。
 
@@ -525,27 +527,40 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 ## 阶段 5：全量收口与稳定性
 
+状态：完成（2026-09-10）。最终配套canonical配置30分钟314/314请求通过；native、逐类型及新增类型全部fallback矩阵、Qwen3.6回归、精确1000/4000-token显存探测和资源清理均完成。新增四种量化类型0 FP16 fallback。Qwen3.6性能恢复35.01 tok/s。已知算术例外单列于开发日志，不作为正确输出通过；失败历史保留。指定容器/overlay交付完成，另建发布镜像及后续可选优化不在本次完成声明内。
+
 ### 覆盖检查
 
-- [ ] 输出每种 GGUF 类型的 tensor 数、压缩常驻数、FP16 fallback 数和字节数。
-- [ ] IQ4_NL、IQ4_XS、Q3_K、IQ3_S 的 FP16 fallback 数为 0。
-- [ ] 检查所有混合组合，不仅是单类型矩阵。
-- [ ] Qwen3.6 GGUF 做完整回归，至少覆盖加载、固定正确性集和基础性能。
-- [ ] 旧 kernel wheel 缺少新符号时能安全 fallback，且已有 Q4/Q5/Q6/Q8 kernel 不被整体禁用。
+- [x] 输出每种 GGUF 类型的原始 tensor 数、压缩常驻数、FP16 fallback 数和逻辑字节数；另收集真实每 rank storage。
+- [x] IQ4_NL、IQ4_XS、Q3_K、IQ3_S 的 FP16 fallback 数为 0（source probe 与真实加载日志双重确认）。
+- [x] 汇总所有实际加载 reps/groups/merged 混合组合，并完成量化 dispatch 回归；非逐层完整数值比较。
+- [x] Qwen3.6 GGUF 完成加载、固定正确性集、C2/C4 与基础性能测量；最终版本无 I-006 复现，性能回退I-009已通过配套launcher同步恢复。
+- [x] pre-IQ3 wheel 缺少 IQ3_S 符号时仅 IQ3_S fallback，Q4/Q5/Q6/Q8/IQ4/Q3 仍可用。
+
+### 回归中新发现的公共路径修复
+
+- [x] I-006：GDN inline conv-state shift 跨 workgroup 竞争，`0a08e20` 已修。两种布局 red/green、量化 kernel 回归及 44 请求并发内容检查通过；完整持续回归见下方。
+- [x] I-007：`7ae8901f0` 修复调度准入遗漏 Mamba group reservation。临时 heartbeat 已确认空 running batch 的 full 标志阻塞；修复限定为单独统计尚未消耗的预留槽，保留 available_size 的 free-only 语义、bulk alloc 行为和上层 request-pool 容量限制。CPU 回归覆盖实际准入、保留槽消耗/归还、失败分组/clear、bulk 分配与小 Mamba pool 的生产容量上限；COW/HiMamba/priority/session/multimodal 原路径不改写。
+- [x] 临时诊断源码在最终 benchmark 前恢复，59 个生产源码文件 host/container SHA256 一致，最终验证使用仓库源码和隔离 wheel。
+- [x] I-008：`70e30c29d` 补齐 ESIMD decode 的 generated-prefix snapshot tracking。CPU red/green 与实际 XPU snapshot/reuse bit-exact 检查通过；补充 cached/cold API 对照。
 
 ### 稳定性 E2E
 
-- [ ] 冷启动至少 3 次。
-- [ ] 连续请求至少 30 分钟，无内存持续增长、hang 或错误累积。
-- [ ] 1K/4K prefill，128/256-token decode。
-- [ ] concurrency 1/2/4；如资源允许再测 8。
-- [ ] API 超时、取消请求、服务停止后的资源回收正常。
-- [ ] 最终记录 native、逐类型 fallback 和可行的全 fallback 对照。
-- [ ] 每轮 30000 均完成受控停止和同配置恢复，没有遗留状态差异。
+- [x] native 冷启动至少 3 次（iq3_native、iq3_stability、native_final），均加载并 health 200。
+- [x] 连续请求至少 30 分钟，无内存持续增长、hang 或错误累积。
+- [x] 1K/4K prefill，128/256-token decode。
+- [x] concurrency 1/2/4；最终native持续窗口各46/92/176请求通过，未扩展到8。
+- [x] API 超时、取消请求、服务停止后的资源回收正常。
+- [x] 最终记录 native、逐类型 fallback 和新增类型全部 fallback 对照（IQ4/Q3/IQ3 同时关闭，既有 Q4/Q5/Q6/Q8 保持原生）。
+- [x] 每轮只读确认 30000 状态不受影响；本轮禁止停止或恢复 30000（最新交接约束优先）。
 
 ## 阶段 6：性能分析与可选优化
 
-只有阶段 5 全部通过后才开始：
+常规性能优化为后续可选工作，不阻塞本次交付。已完成的有限回归诊断：I-008 快照修复每层调用 masked tracking，即使本步没有快照也会提交 kernel。先用已有 eager metadata 的明确 False 跳过空操作；图捕获/回放的未知标志必须保守保留复制。CPU分支、实际XPU snapshot/reuse、generated-prefix API、Qwen3.6及最终E2E对照均已完成。51a0d849b保留该修复；未新增fusion kernel。
+
+全局provenance检查额外发现容器启动脚本遗漏宿主既有提交 `1ee060e` 的三个GGUF fusion开关。已完成旧脚本基线和宿主canonical脚本下Qwen3.6/Qwen3.8验证，仅启用此前已实现的路径，另补三类既有fusion数值9/9通过。最终报告已绑定启动脚本hash与实际进程环境。
+
+后续可选优化：
 
 - profile 决定瓶颈是否在 GEMV、dequant、大 M prefill、GDN、通信或 launch overhead；
 - 再评估 fusion、Q8 `ssm_alpha/beta` 路径和大 M DPAS；
@@ -599,7 +614,7 @@ qkv:     [IQ4_XS, Q6_K, Q8_0]
 - 输出错误但 kernel 单测通过：优先检查 col_perm、shard 顺序、mixed output slice、merge/group 和实际加载 `.so`。
 - 显存未下降：检查 dense 缓存和 fallback 计数，不以服务能运行作为通过。
 - 性能退化：先保证正确性，使用单类型 fallback A/B 定位；未经 profile 不做 fusion。
-- 30000 无法恢复、卡 6/7 未释放或卡 4/5 被误用：立即停止 30001 的记录 PID，保留现场，不继续下一阶段。
+- 30000 状态意外变化、卡 6/7 未释放或卡 4/5 被误用：立即停止 30001 的记录 PID，保留现场，不继续下一阶段。
 - 每个新类型都保留独立环境变量 fallback；回滚不依赖覆盖全局 wheel，也不回退用户无关改动。
 
 ## 11. 每阶段交付物
@@ -613,7 +628,7 @@ qkv:     [IQ4_XS, Q6_K, Q8_0]
 - 正确性请求和响应；
 - 显存五时点数据；
 - 性能每次测量及中位数；
-- 30000 停止/恢复前后对比及卡 4/5 隔离性记录；
+- 30000 只读状态前后对比及卡 4/5 隔离性记录（本轮不操作 30000）；
 - 开发验证日志中的结论、遗留问题和下一步决定。
 
 只有上述材料齐全，阶段状态才能从 `进行中` 改为 `通过`。
