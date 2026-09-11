@@ -19,8 +19,8 @@
 
 | 阶段 | 状态 | 最近 Run | 正确性 | 显存 | 性能 | 隔离性 | 备注 |
 |---|---|---|---|---|---|---|---|
-| 0 基线 | 进行中 | `20260910-0448-S0-03` | 30000 health 超时，待调查 | 已采一组瞬时值 | 未执行 | 待记录停止/恢复方法 | 目标设备已改为 6/7 |
-| 1 Q4_K col_perm | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前启动阻塞点 |
+| 0 基线 | 通过 | `20260910-0451-S0-04` | 30000 已由外部停止 | XPU 6/7 约 229 MiB | N/A | 无待停止服务 | 目标设备为 6/7 |
+| 1 Q4_K col_perm | 通过 | `20260910-0502-S1-03` | 固定请求集通过 | 峰后 31.76/31.01 GiB | 已记录 | 仅使用 6/7 | 含 large-FP16 transpose OOM 修复 |
 | 2 IQ4_NL/XS native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 3 Q3_K native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
 | 4 IQ3_S native | 未开始 | — | 未执行 | 未执行 | 未执行 | 未执行 | 当前为 FP16 fallback |
@@ -35,11 +35,11 @@
 |---|---|
 | SGLang 宿主机仓库 | `/home/intel/shaojun/sglang/sglang` |
 | SGLang origin | `https://github.com/analytics-zoo/sglang` |
-| SGLang branch / commit | `feature/qwen3.8-gguf-xpu` / `b4599c0ef327` |
+| SGLang branch / 当前基线 commit | `feature/qwen3.8-gguf-xpu` / `5034fd1b6d8f`（功能改动尚未提交） |
 | SGLang upstream base | `origin/dev-bmg` / `66861ee2e0c485c4d34d1de56787ddfdf3fd2895` |
 | llm-scaler 宿主机仓库 | `/home/intel/shaojun/sglang/llm-scaler` |
 | llm-scaler origin | `https://github.com/intel/llm-scaler.git` |
-| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `1ee060ea038a` |
+| llm-scaler branch / commit | `feature/qwen3.8-gguf-xpu` / `4f47c5783f19` |
 | llm-scaler upstream base | `origin/main` / `5e2fea9596146af6e90038365ebd462ef59f5d23` |
 | 容器 | `sglang-dev-gguf` |
 | 宿主机 `gguf.py` | `/home/intel/shaojun/sglang/sglang/python/sglang/srt/layers/quantization/gguf.py` |
@@ -203,6 +203,158 @@
 - 未产生正确性、显存或性能新数据。
 - 阶段 0 仍为“进行中”：必须先解决/解释 30000 `/health` 超时，并记录可复现的停止与恢复方法。
 
+### Run `20260910-0451-S0-04`
+
+目的：开始阶段 1 前复查端口和 XPU 状态。
+
+- 30000、30001 均无 listener。
+- `sglang-dev-gguf` 内没有 SGLang 模型服务进程。
+- 30000 在本任务采取停止动作前已经被外部停止，因此本轮没有可记录或可恢复的服务进程。
+- XPU 6/7 分别约 228.96/228.82 MiB，可用于本任务。
+- SGLang 文档基线已提交为 `5034fd1b6`。
+- llm-scaler 的既有 `--skip-server-warmup` 已独立提交为 `4f47c57`。
+
+结论：阶段 0 通过。本轮 30000 停止/恢复项明确记为 N/A。
+
+### Run `20260910-0452-S1-01`
+
+目的：验证 Q4_K GDN `ssm_out` 压缩态 `col_perm`。
+
+#### 实现
+
+- `_xpu_repack_q4_k(qweight, col_perm=None)` 在 nibble element order 中重排。
+- scale/min 以 `head_v_dim // 32` 粒度重排。
+- chunked wrapper 传递 `col_perm`。
+- `_xpu_prepare_shard()` 的 Q4_K 分支传递 `col_perm`，删除旧 assert。
+- 对 `head_v_dim % 32` 和 `ratio * nk * head_v_dim == K` 增加显式检查。
+
+#### Synthetic 测试
+
+命令：
+
+```bash
+PYTHONPATH=/llm-scaler/sglang/sglang/python \
+python3 -m pytest -q \
+  test/registered/unit/layers/quantization/test_gguf_xpu_q4_k_repack.py
+```
+
+结果：首次 Q4-only 测试 `5 passed`；加入 large-FP16 cache 回归后为 `7 passed`。覆盖：
+
+- 默认参数与显式 `col_perm=None` 一致；
+- packed nibble、scale、min 与 element-order reference 一致；
+- repack/dequant 与 dense permutation bitwise 一致；
+- chunked 与 non-chunked 一致；
+- 非 32 对齐和 K 不匹配会明确失败；
+- 大型 FP16 fallback 不进入 transpose cache，小型 FP16 shard 仍缓存。
+
+#### 五个实际 tensor 全量验证
+
+命令：
+
+```bash
+PYTHONPATH=/llm-scaler/sglang/sglang/python \
+python3 test/manual/quant/validate_qwen3_8_q4_k_col_perm.py \
+  /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --all-rows --row-chunk 256
+```
+
+每个 tensor 均为 `[N=5120,K=6144]`，TP2 local K=3072，`col_perm=(3,8,128)`。以下误差同时覆盖 base repack 与 rank0/rank1 组合路径；mean abs 均约 `8e-6`：
+
+| Tensor | 全路径最坏 max abs |
+|---|---:|
+| `blk.14.ssm_out.weight` | 0.000371933 |
+| `blk.22.ssm_out.weight` | 0.000403404 |
+| `blk.29.ssm_out.weight` | 0.000268936 |
+| `blk.38.ssm_out.weight` | 0.000431061 |
+| `blk.45.ssm_out.weight` | 0.000270844 |
+
+总体最坏 `max_abs=0.000431061 < 0.0005`，五个 tensor 全部 5120 行通过。
+
+### Run `20260910-0458-S1-02`
+
+结论：失败，但已定位并修复。
+
+- PID：11630。
+- 使用 `PYTHONPATH=/llm-scaler/sglang/sglang/python`，确认实际加载新 `gguf.py`。
+- 模型加载成功，Q4_K assert 已消失。
+- 权重加载耗时 TP0/TP1 为 89.14/87.79 秒；每 rank 报告权重占用 22.08 GB、剩余 9.81 GB。
+- cache 分配后剩余 6.32 GB；XPU 6/7 观测显存约 27,518.98/27,154.44 MiB。
+- 首次 `/health` 触发 forward 后，在 `_xpu_shard_matmul()` 的 `w.t().contiguous()` 报 `UR_RESULT_ERROR_OUT_OF_RESOURCES`，服务退出。
+
+根因：IQ4/Q3/IQ3 当前已作为大矩阵 dense FP16 常驻，原 `_fp16_wt_cache` 又逐层永久保存 contiguous transpose，形成第二份大权重并在首次 forward 中累积。这个 cache 原本只为小型 GDN a/b FP16 shard 设计。
+
+修复：新增默认 16 MiB 的 `SGLANG_GGUF_XPU_FP16_WT_CACHE_MAX_BYTES` 上限；大矩阵直接把 transpose view 交给 `torch.mm`，不进入永久 cache，小矩阵保持原优化。
+
+### Run `20260910-0502-S1-03`
+
+结论：阶段 1 通过。
+
+#### 环境与产物
+
+| 项目 | 值 |
+|---|---|
+| 服务 PID | 12937 |
+| 日志 | `/tmp/qwen3_8_q4_stage1_20260910_0503.log`（容器内） |
+| 日志 SHA256 | `b42c5d21ebcbeceea0aacb92e174cd941a1e4c8496012842869f3a6bfd44ccb0` |
+| `gguf.py` SHA256 | `bb08e06578a041b9e7bc293679cc3a4a5d5a167b36a2bea72adb8c41acd7b0aa` |
+| SGLang import | `/llm-scaler/sglang/sglang/python/sglang/.../gguf.py` |
+| ESIMD import | system `custom_esimd_kernels_sglang`，Q4_K symbol 可用 |
+| 设备/TP/端口 | XPU 6、7 / TP2 / 30001 |
+
+#### 启动和正确性
+
+- 权重加载耗时 TP0/TP1：88.01/86.91 秒。
+- 权重阶段每 rank：22.08 GB，剩余 9.81 GB。
+- memory pool 后每 rank 剩余 6.32 GB。
+- `/health`：HTTP 200，首次 5.015 秒，warm 后 1.002 秒。
+- `/v1/models`：HTTP 200，2.7 ms，model id 为 `/models/Qwen3.8-27B`。
+- thinking 模式 `max_tokens=128`：`1+1 -> 2`，`17*23-19 -> 372`。
+- non-thinking 模式：严格 JSON 可解析且为 `{"answer":7,"ok":true}`；完整素数函数逻辑正确；标准大气压水的冰点回答 `0℃`。
+- 长上下文：实际 `prompt_tokens=2952`，正确提取 `BLUE-7391`。
+- non-thinking 256-token 连续 decode：顺序数字输出正常，无乱码/异常重复，因长度限制结束。
+- thinking 模式 `max_tokens=32` 时 reasoning 用尽 token、最终 content 为空；这是请求预算问题，不是模型数值错误，正确性测试后续固定 `max_tokens>=128` 或关闭 thinking。
+
+#### 显存
+
+| 时点 | XPU 6 | XPU 7 |
+|---|---:|---:|
+| 启动前 | 228.96 MiB | 227.01 MiB |
+| 加载完成、首次 forward 前 | 27,518.98 MiB | 27,154.44 MiB |
+| 首次 forward 后 | 31,704.81 MiB | 30,953.31 MiB |
+| 长 prefill/并发后 | 31,762.81 MiB | 31,009.40 MiB |
+| 停止 30001 后 | 228.96 MiB | 227.01 MiB |
+
+显存余量非常小，但多轮请求后没有继续线性增长。阶段 2 的 native IQ4 必须明显降低该值。
+
+#### 基础性能
+
+性能固定 `temperature=0`、`enable_thinking=false`，以下为当前大量 FP16 fallback 下的阶段基线：
+
+| 场景 | Run 1 | Run 2 | Run 3 | 中位数 |
+|---|---:|---:|---:|---:|
+| short TTFT | 0.9738 s | 0.9621 s | 0.9621 s | 0.9621 s |
+| decode 256 e2e | 21.831 tok/s | 21.952 tok/s | 22.060 tok/s | 21.952 tok/s |
+| 1462-token prefill | 935.643 tok/s | 1041.434 tok/s | 1041.966 tok/s | 1041.434 tok/s |
+
+| 并发 | completion tokens | wall time | 聚合吞吐 | HTTP 成功 |
+|---:|---:|---:|---:|---:|
+| 2 | 256 | 8.3015 s | 30.838 tok/s | 2/2 |
+| 4 | 512 | 8.2563 s | 62.013 tok/s | 4/4 |
+
+#### 清理与隔离性
+
+- 仅对记录的 PID 12937 发送 SIGTERM，服务 graceful exit。
+- 30001 已释放；XPU 6/7 回落到 228.96/227.01 MiB。
+- 本轮开始前 30000 已由外部停止，因此未执行停止或恢复操作。
+- 服务显式设置 `ZE_AFFINITY_MASK=6,7`；没有把本任务进程放到卡 4/5。
+
+#### 已知限制与下一步
+
+- IQ4_NL、IQ4_XS、Q3_K、IQ3_S 仍为 dense FP16 fallback。
+- 峰后显存达到 97.26%/94.95%，仅适合作为过渡正确性路径。
+- 日志中的部分 fusion 因混合 quant type 不适用，这是阶段 2 后需要重新评估的性能现象。
+- 下一步进入阶段 2：IQ4_NL/IQ4_XS canonical repack、native kernel 和完整 E2E A/B。
+
 ## 5. Run 记录模板
 
 复制本节建立新 Run，不要覆盖旧 Run。
@@ -363,9 +515,10 @@
 
 | Issue ID | 首次 Run | 状态 | 现象 | 根因 | 修复 | 回归 Run |
 |---|---|---|---|---|---|---|
-| I-001 | Qwen3.8 首次启动 | 已定位/待修复 | `q4_k GDN out_proj col-perm unsupported` | Q4_K repack 缺少 value-head 列重排 | 阶段 1 | — |
-| I-002 | `20260910-0436-S0-01` | 待调查 | 30000 `/health` 5 秒超时 | 未确认 | 在任何受控停止前先延时重测并记录 PID、命令、日志和恢复方法 | — |
-| I-003 | `20260910-0446-S0-02` | 已定位/流程修正 | 复制容器 build source 可能不被默认 Python 使用 | 默认 import 来自 site-packages，`PYTHONPATH` 为空 | 30001 使用独立 overlay，并把模块 `__file__` 设为启动门禁 | 待阶段 1 |
+| I-001 | Qwen3.8 首次启动 | 已修复 | `q4_k GDN out_proj col-perm unsupported` | Q4_K repack 缺少 value-head 列重排 | 阶段 1 完成压缩态重排 | `20260910-0502-S1-03` |
+| I-002 | `20260910-0436-S0-01` | 外部状态变化 | 30000 `/health` 5 秒超时 | 未确认；阶段 1 开始前服务已由外部停止 | 本轮停止/恢复为 N/A | `20260910-0451-S0-04` |
+| I-003 | `20260910-0446-S0-02` | 已修复 | 复制容器 build source 可能不被默认 Python 使用 | 默认 import 来自 site-packages，`PYTHONPATH` 为空 | 30001 使用 source overlay，并验证模块 `__file__` | `20260910-0502-S1-03` |
+| I-004 | `20260910-0458-S1-02` | 已修复 | 首次 forward 在 `w.t().contiguous()` OOM | 大型 dense FP16 fallback 被永久缓存第二份 transpose | 仅缓存不超过 16 MiB 的小型 FP16 shard | `20260910-0502-S1-03` |
 
 ## 7. 阶段总结模板
 

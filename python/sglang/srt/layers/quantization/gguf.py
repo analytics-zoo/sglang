@@ -941,7 +941,7 @@ _REPACK_CHUNK_BUDGET_BYTES = int(
     os.environ.get("SGLANG_GGUF_XPU_REPACK_CHUNK_BYTES", str(32 << 20)))
 
 
-def _xpu_repack_q4_k(qweight: torch.Tensor):
+def _xpu_repack_q4_k(qweight: torch.Tensor, col_perm=None):
     """GGUF q4_K super-blocks -> ESIMD interleaved (ql [N,K/2] u8, scale + min
     [N,K/32] f16, pre-computed from the 6-bit sub-fields). Same interleaved
     nibble layout as q4_0 so the GEMV deinterleave is identical.
@@ -949,7 +949,9 @@ def _xpu_repack_q4_k(qweight: torch.Tensor):
     GGML block_q4_K = {half2 dm(dall,dmin); u8 scales[12]; u8 qs[128]}, 8
     sub-blocks of 32. get_scale_min_k4 unpacks the 6-bit sub-scale/min; scale =
     dall*sc6, min = dmin*mn6 (skill Stage 1, zero extra memory). dequant on GPU:
-    w = scale*nibble - min. Validated vs gguf-lib (q4_k_repack_ref.py, ~2.5e-4).
+    w = scale*nibble - min. Optional col_perm (GDN out_proj) is applied in
+    element order before packing. Validated vs gguf-lib (q4_k_repack_ref.py,
+    ~2.5e-4).
     """
     N = qweight.shape[0]
     nsb = qweight.shape[1] // _Q4_K_BYTES
@@ -982,6 +984,21 @@ def _xpu_repack_q4_k(qweight: torch.Tensor):
         nib[:, :, 64 * il:64 * il + 32] = qg & 0x0F
         nib[:, :, 64 * il + 32:64 * il + 64] = qg >> 4
     nib = nib.view(N, K)
+    if col_perm is not None:
+        ratio, nk, hvd = col_perm
+        if hvd % 32 != 0:
+            raise ValueError(
+                f"q4_k col_perm head_v_dim must be divisible by 32, got {hvd}"
+            )
+        if ratio * nk * hvd != K:
+            raise ValueError(
+                "q4_k col_perm shape does not match K: "
+                f"ratio={ratio}, nk={nk}, head_v_dim={hvd}, K={K}"
+            )
+        nib = _q5q6_col_perm_elems(nib, col_perm)
+        g = hvd // 32
+        scale = _q5q6_col_perm_elems(scale.view(N, K // 32), (ratio, nk, g))
+        minv = _q5q6_col_perm_elems(minv.view(N, K // 32), (ratio, nk, g))
     even = nib[:, 0::2]
     odd = nib[:, 1::2]
     ql = (even | (odd << 4)).to(torch.uint8)
@@ -1005,17 +1022,18 @@ def _xpu_dequant_q4_k(ql: torch.Tensor, scale: torch.Tensor, minv: torch.Tensor,
 
 
 def _xpu_repack_q4_k_chunked(qweight: torch.Tensor,
-                             chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS):
+                             chunk_rows: int = _MOE_DOWN_REPACK_CHUNK_ROWS,
+                             col_perm=None):
     """Row-chunked wrapper around _xpu_repack_q4_k (see _xpu_repack_q5_k_down_combined
     docstring for why: bounds the u4-family int32 intermediates to chunk_rows
     regardless of how many experts (E*half rows) are stacked)."""
     N = qweight.shape[0]
     if N <= chunk_rows:
-        return _xpu_repack_q4_k(qweight)
+        return _xpu_repack_q4_k(qweight, col_perm=col_perm)
     ql_out, sc_out, mn_out = [], [], []
     for lo in range(0, N, chunk_rows):
         hi = min(lo + chunk_rows, N)
-        ql, sc, mn = _xpu_repack_q4_k(qweight[lo:hi])
+        ql, sc, mn = _xpu_repack_q4_k(qweight[lo:hi], col_perm=col_perm)
         ql_out.append(ql); sc_out.append(sc); mn_out.append(mn)
         if qweight.device.type == "xpu":
             torch.xpu.empty_cache()
@@ -1629,10 +1647,9 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
             scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
         return ("q8_0", qs, scale)
     if qweight_type == _Q4_K_TYPE and esimd_gemv_q4_k is not None and not _force_dq:
-        # _xpu_repack_q4_k_chunked has no col_perm support; fail loudly rather
-        # than silently dropping the permute and producing wrong weights.
-        assert col_perm is None, "q4_k GDN out_proj col-perm unsupported"
-        ql, scale, minv = _xpu_repack_q4_k_chunked(qweight)
+        ql, scale, minv = _xpu_repack_q4_k_chunked(
+            qweight, col_perm=col_perm
+        )
         return ("q4_k", ql, scale, minv)
     _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
     _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
@@ -1721,6 +1738,9 @@ def _as_fp16c(x: torch.Tensor) -> torch.Tensor:
 # and this dict is bounded by the number of fp16 shards (~60). See the fp16
 # branch of _xpu_shard_matmul.
 _fp16_wt_cache: dict = {}
+_FP16_WT_CACHE_MAX_BYTES = int(
+    os.environ.get("SGLANG_GGUF_XPU_FP16_WT_CACHE_MAX_BYTES", str(16 << 20))
+)
 
 
 def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
@@ -1855,6 +1875,15 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
     # output is allocated per call (no persistent-buffer aliasing risk).
     w = rep[1]
     xf = x if x.dtype == w.dtype else x.to(w.dtype)
+    # The cache was introduced for the small unquantized GDN a/b shards. Newer
+    # GGUF files may contain large quant types without native kernels; those are
+    # already resident as dense fp16 fallback weights. Permanently caching a
+    # second contiguous copy for every such matrix can consume another ~10 GiB
+    # per TP rank and OOM during the first forward. Let torch.mm consume the
+    # transpose view for large fallback matrices instead. Native IQ/Q3 kernels
+    # will bypass this fp16 path entirely once available.
+    if w.numel() * w.element_size() > _FP16_WT_CACHE_MAX_BYTES:
+        return torch.mm(xf, w.t())
     wt = _fp16_wt_cache.get(id(w))
     if wt is None:
         wt = w.t().contiguous()  # [K, N], computed once per weight

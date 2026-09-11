@@ -393,19 +393,19 @@ Native 与 fallback A/B 使用同一模型、同一请求、同一参数。文�
 
 ### 工作内容
 
-- [ ] 记录仓库 commit、dirty diff 和 `gguf.py` SHA256。
-- [ ] 记录容器状态、容器内实际源码路径和 SHA256。
-- [ ] 记录 30000 所属容器/进程、PID、工作目录、完整命令行/环境、启动时间、日志、健康和 smoke 输出。
-- [ ] 验证 30000 的原配置恢复命令，但此阶段不必立即停止服务。
-- [ ] 记录 XPU 4～7 的空闲/现有服务显存。
-- [ ] 固化正确性 prompt、性能参数和结果保存目录。
-- [ ] 保存 Qwen3.8 tensor 名称、shape、量化类型清单，避免后续凭印象判断覆盖率。
+- [x] 记录仓库 commit、dirty diff 和 `gguf.py` SHA256。
+- [x] 记录容器状态、容器内实际源码路径和 SHA256。
+- [x] 记录 30000 状态；开始阶段 1 时该服务已经由外部停止，端口为空，无可恢复进程。
+- [x] 将“本轮无需停止/恢复 30000”作为显式 N/A 记录，而不是虚构恢复结果。
+- [x] 记录 XPU 4～7 的空闲/现有服务显存。
+- [x] 固化正确性 prompt、性能参数和结果保存位置。
+- [x] 保存 Qwen3.8 tensor 名称、shape、量化类型清单，避免后续凭印象判断覆盖率。
 
 ### 阶段门禁
 
-- [ ] 能明确识别并分别操作 30000、30001，且不会使用宽泛进程匹配。
-- [ ] 30000 基线和恢复命令可用于开发后的同条件恢复与比较。
-- [ ] 日志中没有把未执行项目标为通过。
+- [x] 能明确识别并分别操作 30000、30001，且不会使用宽泛进程匹配。
+- [x] 已记录 30000 在阶段 1 开始前不存在，因此该轮恢复项为 N/A。
+- [x] 日志中没有把未执行项目标为通过。
 
 ## 阶段 1：Q4_K GDN `ssm_out` 完整闭环
 
@@ -413,33 +413,34 @@ Q4_K 已有 XPU GEMV kernel。本阶段不开发新 GEMV，只补齐压缩态 va
 
 ### 实现
 
-- [ ] 为 `_xpu_repack_q4_k(qweight, col_perm=None)` 增加参数。
-- [ ] 在 element-order nibble 重新打包之前执行 `_q5q6_col_perm_elems(nib, col_perm)`。
-- [ ] 以 `head_v_dim // 32` 粒度重排 scale 和 min。
-- [ ] `_xpu_repack_q4_k_chunked(..., col_perm=None)` 将参数传入每个 chunk。
-- [ ] `_xpu_prepare_shard()` 删除 Q4_K 的禁止断言并传递 `col_perm`。
-- [ ] 保持 row chunking，避免完整 `[N,K] int32` 临时量随大 tensor 膨胀。
+- [x] 为 `_xpu_repack_q4_k(qweight, col_perm=None)` 增加参数。
+- [x] 在 element-order nibble 重新打包之前执行 `_q5q6_col_perm_elems(nib, col_perm)`。
+- [x] 以 `head_v_dim // 32` 粒度重排 scale 和 min。
+- [x] `_xpu_repack_q4_k_chunked(..., col_perm=None)` 将参数传入每个 chunk。
+- [x] `_xpu_prepare_shard()` 删除 Q4_K 的禁止断言并传递 `col_perm`。
+- [x] 保持 row chunking，避免完整 `[N,K] int32` 临时量随大 tensor 膨胀。
+- [x] 限制 large FP16 fallback 的 transpose cache，避免首次 forward 永久复制全部 fallback 权重导致 OOM。
 
 TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group 整除。仍需在代码中校验约束，不能只依赖当前模型。
 
 ### 局部验证
 
-- [ ] 无 `col_perm` 的新旧 repack 输出完全一致。
-- [ ] chunked 与 non-chunked 输出完全一致。
-- [ ] synthetic tensor 覆盖 nibble、scale、min 的边界值。
-- [ ] 五个实际 Q4_K `ssm_out` 全部测试，不只抽一个 layer。
-- [ ] 对原始 GGUF reference dequant 后执行 `[ratio,nk,hvd] -> [nk,ratio,hvd]`。
-- [ ] 分别验证 TP rank 0、rank 1 的 repack + `_xpu_dequant_q4_k`。
-- [ ] 记录 max abs、mean abs、max relative error，并检查 shape/dtype/contiguous。
+- [x] 无 `col_perm` 的默认/显式 `None` repack 输出完全一致。
+- [x] chunked 与 non-chunked 输出完全一致。
+- [x] deterministic synthetic tensor 覆盖 nibble、scale、min 重排。
+- [x] 五个实际 Q4_K `ssm_out` 的全部 5120 行均已测试。
+- [x] 对原始 GGUF reference dequant 后执行 `[ratio,nk,hvd] -> [nk,ratio,hvd]`。
+- [x] 分别验证 TP rank 0、rank 1 的 repack + `_xpu_dequant_q4_k`。
+- [x] 记录 max abs/mean abs；最坏 max abs `4.3106e-4`，mean abs 约 `8e-6`，无 NaN/Inf。
 
 ### E2E 门禁
 
-- [ ] 30001 完整加载成功，日志不再出现 Q4_K col-perm assert。
-- [ ] 固定正确性请求集全部通过。
-- [ ] 完成显存五时点记录。
-- [ ] 完成短请求、1K prefill、256-token decode、并发 2/4 基础测试。
-- [ ] 日志明确说明 IQ4/Q3/IQ3 此时仍为 FP16 fallback。
-- [ ] 30000 已按原配置恢复；卡 4/5 未被本任务使用。
+- [x] 30001 完整加载成功，日志不再出现 Q4_K col-perm assert。
+- [x] 固定正确性请求集全部通过；thinking 模式下需给足 reasoning token，性能测试固定关闭 thinking。
+- [x] 完成启动前、加载后、首次 forward 后、压力后和停止后的显存记录。
+- [x] 完成短请求、约 1.5K prefill、256-token decode、并发 2/4 基础测试。
+- [x] 日志明确说明 IQ4/Q3/IQ3 此时仍为 FP16 fallback。
+- [x] 本轮开始前 30000 已不存在，恢复项为 N/A；30001 仅使用 `ZE_AFFINITY_MASK=6,7`。
 
 ## 阶段 2：IQ4_NL / IQ4_XS 原生纵向切片
 
