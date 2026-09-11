@@ -233,7 +233,7 @@ weight = scale * IQ4_LUT[index]
 - IQ4_XS：将 super-scale 与有符号 6-bit subscale 展开，预计算 final scale。
 - IQ4_XS 的 `blk.13/16/17/18/33.ssm_out.weight` 同样需要压缩态 `col_perm`。
 
-Q3_K 计划归一为低 2 bit、高/符号 mask，以及每 16 个元素的 FP16 scale。IQ3_S 计划归一为 4-bit magnitude、1-bit sign，以及每 64 个元素的 FP16 scale。最终表示以 reference 测试结果为准，不能仅凭格式推导直接冻结 ABI。
+Q3_K 计划归一为低 2 bit、高/符号 mask，以及每 16 个元素的 FP16 scale。IQ3_S 归一为 9-bit grid index（qs + qh）、每元素 1-bit sign，以及每 32 个元素的 FP16 final scale；每 256 元素常驻 120 bytes，不常驻展开 magnitude。最终表示以 reference 测试结果为准，不能仅凭格式推导直接冻结 ABI。
 
 ## 5. 验证原则：局部证明 + 阶段 E2E
 
@@ -504,15 +504,15 @@ TP2 预期 `col_perm=(3, 8, 128)`；128 可被 Q4_K 的 32-element scale group �
 
 ### 实现
 
-- [ ] 实现 row-chunked IQ3_S canonical repack。
+- [x] 实现 row-chunked IQ3_S canonical repack。
 - [ ] 实现 `esimd_gemv_iq3_s` 和 `esimd_gemv_iq3_s_m`，覆盖 M=1/2/4/8/16。
 - [ ] 完整接入 rep、dense reconstruction、merge/group、mixed output-slice dispatch。
 - [ ] 增加 `SGLANG_GGUF_XPU_NO_IQ3S=1` fallback 开关。
 
 ### 局部验证
 
-- [ ] synthetic block 覆盖 magnitude grid、sign 和 scale 边界。
-- [ ] 四个实际 IQ3_S tensor 全部做 reference dequant 检查。
+- [x] synthetic block 覆盖 magnitude grid、sign 和 scale 边界。
+- [x] 四个实际 IQ3_S tensor 全部做 reference dequant 检查。
 - [ ] M=1/2/4/8/16 与 dense matmul 对比通过。
 - [ ] mixed shard、output slice 和单类型 fallback 通过。
 

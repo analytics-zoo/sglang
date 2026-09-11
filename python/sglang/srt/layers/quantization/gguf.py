@@ -946,6 +946,10 @@ _IQ4_XS_BYTES = 136      # d(f16) + scales_h(u16) + scales_l[4] + qs[128]
 _IQ4_LUT = (-127, -104, -83, -65, -49, -35, -22, -10,
             1, 13, 25, 38, 53, 69, 89, 113)
 
+_IQ3_S_TYPE = int(WeightType.IQ3_S)
+_IQ3_S_SB = 256
+_IQ3_S_BYTES = 110      # d(f16) + qs[64] + qh[8] + signs[32] + scales[4]
+
 _Q3_K_SB = 256
 _Q3_K_BYTES = 110       # hmask[32] + qs[64] + scales[12] + d(f16)
 
@@ -1081,6 +1085,66 @@ def _xpu_dequant_iq4(packed: torch.Tensor, scale: torch.Tensor,
         .view(N, K)
         .contiguous()
     )
+
+
+def _xpu_repack_iq3_s(qweight: torch.Tensor, col_perm=None):
+    """IQ3_S -> qs[N,K/4], qh[N,K/32], signs[N,K/8], scale[N,K/32].
+
+    Each 9-bit index selects four consecutive magnitudes from the GGML
+    512x4 grid. qh and signs use least-significant-bit-first ordering.
+    Only the per-32-element final d*(1+2*nibble) scale is expanded to FP16;
+    no per-element magnitude array is retained.
+    """
+    if qweight.ndim != 2 or qweight.shape[1] % _IQ3_S_BYTES:
+        raise ValueError(f"invalid IQ3_S packed shape {tuple(qweight.shape)}")
+    N = qweight.shape[0]
+    nsb = qweight.shape[1] // _IQ3_S_BYTES
+    buf = qweight.reshape(N, nsb, _IQ3_S_BYTES)
+    d = buf[:, :, :2].contiguous().view(torch.float16).view(N, nsb).float()
+    qs = buf[:, :, 2:66].reshape(N, nsb * 64)
+    qh = buf[:, :, 66:74].reshape(N, nsb * 8)
+    signs = buf[:, :, 74:106].reshape(N, nsb * 32)
+    raw_scale = buf[:, :, 106:110].to(torch.int32)
+    subscale = torch.stack((raw_scale & 15, raw_scale >> 4), dim=-1)
+    scale = (d.unsqueeze(-1) * (1 + 2 * subscale.reshape(N, nsb, 8)))
+    scale = scale.to(torch.float16).reshape(N, nsb * 8)
+    if col_perm is not None:
+        ratio, nk, hvd = col_perm
+        if hvd % 32:
+            raise ValueError("iq3_s col_perm head_v_dim must be divisible by 32")
+        if ratio * nk * hvd != nsb * _IQ3_S_SB:
+            raise ValueError("iq3_s col_perm shape does not match K")
+        # Head boundaries align with all four compressed group sizes.
+        qs = _q5q6_col_perm_elems(qs, (ratio, nk, hvd // 4))
+        qh = _q5q6_col_perm_elems(qh, (ratio, nk, hvd // 32))
+        signs = _q5q6_col_perm_elems(signs, (ratio, nk, hvd // 8))
+        scale = _q5q6_col_perm_elems(scale, (ratio, nk, hvd // 32))
+    # clone detaches slices from the raw block storage, including N=1.
+    return tuple(t.contiguous().clone() for t in (qs, qh, signs, scale))
+
+
+def _xpu_dequant_iq3_s(qs: torch.Tensor, qh: torch.Tensor,
+                       signs: torch.Tensor, scale: torch.Tensor,
+                       out_dtype: torch.dtype) -> torch.Tensor:
+    """Reconstruct canonical IQ3_S for the dense prefill/reference path."""
+    from gguf.quants import IQ3_S
+
+    N, quarter = qs.shape
+    K = quarter * 4
+    if (qh.shape != (N, K // 32) or signs.shape != (N, K // 8)
+            or scale.shape != (N, K // 32)):
+        raise ValueError("IQ3_S canonical shapes do not match K")
+    shifts = torch.arange(8, dtype=torch.int32, device=qs.device)
+    high = ((qh.to(torch.int32).unsqueeze(-1) >> shifts) & 1).reshape(N, -1)
+    indices = qs.to(torch.int32) | (high << 8)
+    IQ3_S.init_grid()
+    grid = torch.as_tensor(IQ3_S.grid.reshape(512, 4), device=qs.device)
+    values = grid[indices.long()].reshape(N, K)
+    negative = ((signs.to(torch.int32).unsqueeze(-1) >> shifts) & 1)
+    values = values * (1 - 2 * negative.reshape(N, K))
+    # Match other canonical formats: multiplication uses the requested dtype.
+    return (values.to(out_dtype).reshape(N, K // 32, 32)
+            * scale.to(out_dtype).unsqueeze(-1)).reshape(N, K).contiguous()
 
 
 def _xpu_q3_k_apply_col_perm(low: torch.Tensor, subtract: torch.Tensor,

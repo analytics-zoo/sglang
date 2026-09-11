@@ -664,6 +664,16 @@ concurrency 2 因 fallback 一路只生成 11 tokens，吞吐不可比。阶段 
 - 30000 在阶段前后都不存在；没有恢复动作。
 - 阶段 3 所有门禁完成，下一步进入阶段 4 IQ3_S。
 
+### Run `20260910-S4-canonical`
+
+- 两个 feature 工作区初始干净；30000/30001 均无 listener。本轮不操作 30000。
+- IQ3_S ABI：qs[N,K/4]、qh[N,K/32]、signs[N,K/8] uint8；scale[N,K/32] FP16。120 bytes/256 elements；col_perm 按压缩 group 重排，hvd 必须整除 32。
+- Synthetic canonical 14/14 通过。首次全行测试四个 tensor 共 32,768 行，CPU/XPU repack 全部 bit-exact、all finite；max_abs 分别 5.7220459e-5 / 5.0067902e-5 / 1.0728836e-4 / 5.7220459e-5，mean_abs 约 1.51～1.56e-6。
+- 首次沿用 Q3_K 的 1e-4 门限失败，未进入服务测试。独立诊断确认 blk.15 row=3456 k=12258：FP32 scale=0.016304492950439453、FP16 scale=0.0163116455078125；magnitude=15，使 scale 舍入放大为 0.00010728836059570312。该 tensor 所有行与 reference 按 FP16 scale 重算后逐元素一致，无 index/sign 映射误差。
+- 依据该舍入证据，将 IQ3_S canonical 固定阈值设为 1.2e-4；validator 增加全行 scale 舍入解释检查后重跑。Kernel 阈值继续固定为 0.01。
+- 重跑通过：四个 tensor 全部 32,768 行，所有误差均由 FP16 scale 舍入解释，cosine >= 0.9999999792；CPU/XPU bit-exact。通过日志 `/tmp/qwen3_8_iq3_s_canonical_pass_20260910.log`。
+- 初测日志 `/tmp/qwen3_8_iq3_s_canonical_20260910.log`；诊断 `/tmp/qwen3_8_iq3_s_rounding_20260910.log`；单测 `/tmp/qwen3_8_iq3_s_unit_canonical_20260910.log`（容器内）。
+
 ## 5. Run 记录模板
 
 复制本节建立新 Run，不要覆盖旧 Run。
