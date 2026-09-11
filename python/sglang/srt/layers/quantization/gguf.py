@@ -121,6 +121,10 @@ elif _is_xpu:
     # these new symbols cannot disable any existing GGUF kernel.
     (esimd_gemv_iq4,) = _imp_kernels(("esimd_gemv_iq4",))
     (esimd_gemv_iq4_m,) = _imp_kernels(("esimd_gemv_iq4_m",))
+    # Q3_K is optional and imported independently so an older extension
+    # missing these symbols cannot disable the existing k-quant kernels.
+    (esimd_gemv_q3_k,) = _imp_kernels(("esimd_gemv_q3_k",))
+    (esimd_gemv_q3_k_m,) = _imp_kernels(("esimd_gemv_q3_k_m",))
     esimd_gemv_q5_k, esimd_gemv_q6_k = _imp_kernels(("esimd_gemv_q5_k", "esimd_gemv_q6_k"))
     # M-tiled k-quant GEMVs (small M: MTP verify, or plain decode at batch>1) —
     # optional (older .so may lack them).
@@ -1361,7 +1365,7 @@ _Q6_K_BYTES = 128 + 64 + 16 + 2       # ql[128] + qh[64] + scales[16] + d = 210
 # Resident-rep kind tags whose tuples hold ONLY [N, ...] row-indexed tensors and
 # whose per-row reduction is independent of N. Used by _xpu_try_merge_shards and
 # _xpu_perm_rep_rows to row-concatenate / row-permute generically.
-_XPU_KQUANT_KINDS = ("q4_k", "q5_k", "q6_k")
+_XPU_KQUANT_KINDS = ("q3_k", "q4_k", "q5_k", "q6_k")
 _XPU_PACKED_ROW_KINDS = _XPU_KQUANT_KINDS + ("iq4",)
 
 # Opt-in shard-merge accounting: maps "<kind>x<nshards>" -> [not_merged, merged].
@@ -1898,7 +1902,8 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
                        params_dtype: torch.dtype, col_perm=None):
     """Return a resident per-shard rep: q4_0 -> ('q4_0', packed_u8, scale_f16),
     IQ4_NL/IQ4_XS -> shared packed LUT-index + final-scale rep,
-    q5_k/q6_k -> packed (ql, qh, scale[, min]), other quant -> ('fp16', dense),
+    q3_k/q5_k/q6_k -> packed (ql, qh, scale[, min]),
+    other quant -> ('fp16', dense),
     unquantized -> ('fp16', w, None).
 
     col_perm (GDN out_proj value-head reorder) is applied INSIDE the quant repack
@@ -1945,6 +1950,17 @@ def _xpu_prepare_shard(qweight: torch.Tensor, qweight_type: int,
             repack, qweight, col_perm=col_perm
         )
         return ("iq4", packed, scale)
+    _no_q3 = os.environ.get("SGLANG_GGUF_XPU_NO_Q3K") == "1"
+    if (
+        qweight_type == _Q3_K_TYPE
+        and esimd_gemv_q3_k is not None
+        and not _force_dq
+        and not _no_q3
+    ):
+        ql, qh, scale = _xpu_repack_rows_chunked(
+            _xpu_repack_q3_k, qweight, col_perm=col_perm
+        )
+        return ("q3_k", ql, qh, scale)
     _no_q5 = os.environ.get("SGLANG_GGUF_XPU_NO_Q5K") == "1"
     _no_q6 = os.environ.get("SGLANG_GGUF_XPU_NO_Q6K") == "1"
     # The q5_K/q6_K ESIMD reps pre-shuffle qh into per-tile chunks matching the
@@ -1987,6 +2003,8 @@ def _xpu_dequant_rep_to_fp16(rep, out_dtype: torch.dtype) -> torch.Tensor:
         return _xpu_dequant_q4_k(rep[1], rep[2], rep[3], out_dtype)
     if kind == "iq4":
         return _xpu_dequant_iq4(rep[1], rep[2], out_dtype)
+    if kind == "q3_k":
+        return _xpu_dequant_q3_k(rep[1], rep[2], rep[3], out_dtype)
     if kind == "q5_k":
         return _xpu_dequant_q5_k(rep[1], rep[2], rep[3], rep[4], out_dtype)
     if kind == "q6_k":
@@ -2132,6 +2150,24 @@ def _xpu_shard_matmul(x: torch.Tensor, rep) -> torch.Tensor:
             esimd_gemv_iq4_m(xf, packed, scale, out)
             return out
         w = _xpu_dequant_iq4(packed, scale, torch.float16)
+        return xf @ w.t()
+    if kind == "q3_k":
+        _, ql, qh, scale = rep
+        N = ql.shape[0]
+        M = x.shape[0]
+        xf = _as_fp16c(x)
+        out = torch.empty(M, N, dtype=torch.float16, device=x.device)
+        if M == 1:
+            esimd_gemv_q3_k(xf, ql, qh, scale, out)
+            return out
+        if (
+            not _NO_KQUANT_M
+            and esimd_gemv_q3_k_m is not None
+            and 2 <= M <= 16
+        ):
+            esimd_gemv_q3_k_m(xf, ql, qh, scale, out)
+            return out
+        w = _xpu_dequant_q3_k(ql, qh, scale, torch.float16)
         return xf @ w.t()
     if kind == "q5_k":
         _, ql, qh, scale, minv = rep
@@ -2303,7 +2339,7 @@ def _xpu_bake_out_row_perm(reps: dict, merged, ids: list, perm: torch.Tensor):
 
 def _xpu_try_merge_shards(reps: dict, ids: list):
     """D1: if every shard in `ids` is the SAME GEMV rep kind (fp16 / q8_0 /
-    q4_0 / q4_k / q5_k / q6_k / iq4) with the same K, build one merged rep by
+    q4_0 / q3_k / q4_k / q5_k / q6_k / iq4) with the same K, build one merged rep by
     row-concatenating the per-shard weights, plus the per-shard N sizes (to
     slice the output). Returns (merged_rep, [N0, N1, ...]) or None if not
     mergeable (mixed kinds / mismatched K). Bit-exact: rows of every rep kind
@@ -2388,7 +2424,7 @@ def _xpu_try_merge_shards(reps: dict, ids: list):
 
 # Rep kinds that have an M==1 ESIMD GEMV taking a caller-supplied `out`.
 _XPU_GEMV_OUT_KINDS = (
-    "q4_0", "q8_0", "q4_k", "q5_k", "q6_k", "iq4"
+    "q4_0", "q8_0", "q3_k", "q4_k", "q5_k", "q6_k", "iq4"
 )
 _XPU_NO_GROUP_SLICE = (
     os.environ.get("SGLANG_GGUF_XPU_NO_GROUP_SLICE") == "1")
@@ -2449,6 +2485,9 @@ def _xpu_groups_m_ok(groups):
         elif kind == "iq4":
             if esimd_gemv_iq4_m is None:
                 return False
+        elif kind == "q3_k":
+            if esimd_gemv_q3_k_m is None:
+                return False
         elif kind in ("q5_k", "q6_k"):
             op = esimd_gemv_q5_k_m if kind == "q5_k" else esimd_gemv_q6_k_m
             if op is None or (rep[1].shape[1] * 2) % (_Q5Q6_VL // 2):
@@ -2474,6 +2513,8 @@ def _xpu_rep_gemv_into(x_row, rep, out):
         esimd_gemv_q4_k(x_row, rep[1], rep[2], rep[3], out)
     elif kind == "iq4":
         esimd_gemv_iq4(x_row, rep[1], rep[2], out)
+    elif kind == "q3_k":
+        esimd_gemv_q3_k(x_row, rep[1], rep[2], rep[3], out)
     elif kind == "q5_k":
         esimd_gemv_q5_k(x_row, rep[1], rep[2], rep[3], rep[4], out)
     elif kind == "q6_k":
@@ -2500,6 +2541,10 @@ def _xpu_rep_gemv_m_into(x, rep, out):
         if esimd_gemv_iq4_m is None:
             return False
         esimd_gemv_iq4_m(x, rep[1], rep[2], out)
+    elif kind == "q3_k":
+        if esimd_gemv_q3_k_m is None:
+            return False
+        esimd_gemv_q3_k_m(x, rep[1], rep[2], rep[3], out)
     elif kind == "q5_k":
         if esimd_gemv_q5_k_m is None or (rep[1].shape[1] * 2) % (_Q5Q6_VL // 2):
             return False
@@ -2817,6 +2862,8 @@ def _xpu_dequant_rep(rep, out_dtype=torch.float16):
         return _xpu_dequant_q4_k(rep[1], rep[2], rep[3], out_dtype)
     if kind == "iq4":
         return _xpu_dequant_iq4(rep[1], rep[2], out_dtype)
+    if kind == "q3_k":
+        return _xpu_dequant_q3_k(rep[1], rep[2], rep[3], out_dtype)
     if kind == "q5_k":
         return _xpu_dequant_q5_k(rep[1], rep[2], rep[3], rep[4], out_dtype)
     if kind == "q6_k":
@@ -2844,6 +2891,8 @@ def _xpu_rep_gemv(x_row, rep):
         esimd_gemv_q8_0(x_row, rep[1], rep[2], out)
     elif kind == "q4_k":
         esimd_gemv_q4_k(x_row, rep[1], rep[2], rep[3], out)
+    elif kind == "q3_k":
+        esimd_gemv_q3_k(x_row, rep[1], rep[2], rep[3], out)
     elif kind == "q5_k":
         esimd_gemv_q5_k(x_row, rep[1], rep[2], rep[3], rep[4], out)
     elif kind == "q6_k":
