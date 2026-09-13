@@ -13,9 +13,11 @@
 # ==============================================================================
 """Config loading utilities."""
 
+import os
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.srt.configs.model_config_parser_registry import (
@@ -36,8 +38,10 @@ from .common import (
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
+    gguf_sidecar_dir,
     resolve_runai_obj_uri,
 )
+from .gguf_native import build_gguf_config, has_native_gguf_support
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
@@ -51,6 +55,26 @@ def _apply_deepseek_ocr_overrides(config, model):
     config._name_or_path = model
 
 
+_LONGCAT_ARCHS = {
+    "LongcatCausalLM",
+    "LongcatFlashForCausalLM",
+    "LongcatFlashNgramForCausalLM",
+}
+
+
+def _try_load_longcat_config(model, revision: Optional[str], **kwargs):
+    config_dict, _ = PretrainedConfig.get_config_dict(
+        model, revision=revision, **kwargs
+    )
+    architectures = config_dict.get("architectures") or []
+    if not any(arch in _LONGCAT_ARCHS for arch in architectures):
+        return None
+
+    return _CONFIG_REGISTRY["longcat_flash"].from_pretrained(
+        model, revision=revision, **kwargs
+    )
+
+
 @register_model_config_parser("hf")
 class HfModelConfigParser(ModelConfigParserBase):
     def parse(
@@ -60,12 +84,24 @@ class HfModelConfigParser(ModelConfigParserBase):
         revision: Optional[str] = None,
         **kwargs,
     ):
-        config = AutoConfig.from_pretrained(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
+        # XPU/qwen35 GGUF bypass (env-gated; inert when SGLANG_GGUF_HF_CONFIG_DIR
+        # unset): transformers' GGUF config parser rejects arch qwen35/qwen35moe.
+        # Redirect to a sibling HF checkpoint dir for the *config* only; the GGUF
+        # weights still load via the GGUF model loader. Layered on top of the
+        # NEW_BASE longcat + AutoConfig path.
+        _hf_cfg_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if _hf_cfg_dir and str(model).endswith(".gguf"):
+            model = _hf_cfg_dir
+            kwargs.pop("gguf_file", None)
+
+        config = _try_load_longcat_config(model, revision, **kwargs)
+        if config is None:
+            config = AutoConfig.from_pretrained(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
 
         if (
             config.architectures is not None
@@ -221,15 +257,29 @@ def get_config(
     **kwargs,
 ):
     is_gguf = check_gguf_file(model)
+    gguf_has_sidecar_config = False
     if is_gguf:
         if model_config_parser not in ("auto", "hf"):
             raise ValueError(
                 f"model_config_parser={model_config_parser!r} is incompatible "
                 "with GGUF inputs; only 'hf' (or 'auto') is supported."
             )
-        _ensure_gguf_version()
-        kwargs["gguf_file"] = model
-        model = Path(model).parent
+        _hf_cfg_dir = os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+        if _hf_cfg_dir:
+            # XPU/qwen35 GGUF bypass: source config from a sibling HF dir and
+            # never hand transformers the .gguf path (its parser rejects qwen35).
+            model = _hf_cfg_dir
+        else:
+            _ensure_gguf_version()
+            gguf_has_sidecar_config = gguf_sidecar_dir(model, "config.json") is not None
+            if not gguf_has_sidecar_config and has_native_gguf_support(model):
+                config = build_gguf_config(model)
+                if model_override_args:
+                    config.update(model_override_args)
+                return config
+            if not gguf_has_sidecar_config:
+                kwargs["gguf_file"] = model
+            model = Path(model).parent
         # Skip auto-resolution for GGUF: the name-based Mistral heuristic
         # would misfire on the rewritten parent dir.
         model_config_parser = "hf"
@@ -251,11 +301,32 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # A plain update() setattrs a dict-valued override straight onto the
+        # config, so '{"text_config": {...}}' on a VLM would replace the whole
+        # sub-config with a dict and break attribute access downstream.
+        for key, value in model_override_args.items():
+            current = getattr(config, key, None)
+            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
+                current.update(value)
+            else:
+                setattr(config, key, value)
 
-    if is_gguf:
+    if (
+        is_gguf
+        and not gguf_has_sidecar_config
+        and not os.environ.get("SGLANG_GGUF_HF_CONFIG_DIR")
+    ):
+        # Normal GGUF path: transformers' CausalLM name map gives the runtime
+        # arch. Skipped when a sidecar config exists (NEW_BASE) or under
+        # SGLANG_GGUF_HF_CONFIG_DIR (XPU/qwen35) - there we already read the
+        # correct architectures straight from the sibling HF config.json and
+        # must NOT clobber it with transformers' text-only CausalLM name.
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+            raise RuntimeError(
+                f"Can't get gguf config for {config.model_type}. Place a "
+                "config.json next to the .gguf file to load the config from "
+                "there instead."
+            )
         _set_architectures(config, MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type])
 
     return config
