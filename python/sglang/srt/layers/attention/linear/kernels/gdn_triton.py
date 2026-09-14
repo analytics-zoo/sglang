@@ -299,7 +299,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         # rollback is a one-liner.
         if (
             is_xpu()
-            and envs.SGLANG_XPU_MTP_GDN_VERIFY.get()
+            and envs.SGL_XPU_MTP_GDN_VERIFY.get()
             and q.size(-1) == 128
             and v.size(-1) == 128
             and v.size(-2) % q.size(-2) == 0  # H_v % H_k == 0 (GQA on GDN)

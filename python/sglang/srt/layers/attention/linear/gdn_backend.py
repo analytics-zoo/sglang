@@ -426,7 +426,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # retrieve_next_token/sibling/parent tree walk.
             _use_esimd_verify_conv = (
                 is_xpu()
-                and envs.SGLANG_XPU_MTP_GDN_VERIFY.get()
+                and envs.SGL_XPU_MTP_GDN_VERIFY.get()
                 and hasattr(torch.ops, "eagle_ops")
                 and hasattr(torch.ops.eagle_ops, "causal_conv1d_verify")
             )
