@@ -52,7 +52,7 @@ from sglang.srt.speculative.triton_ops.eagle import (
     fill_bonus_tokens as fill_bonus_tokens,
 )
 from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
-from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -68,6 +68,17 @@ if TYPE_CHECKING:
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
+        top_k_renorm_prob,
+        top_p_renorm_prob,
+        tree_speculative_sampling_target_only,
+    )
+elif is_xpu():
+    # sgl_kernel builds these three for CUDA/MUSA only. On XPU the names are
+    # simply undefined, so any temperature > 0 request under speculative
+    # decoding raises NameError inside verify() and takes the server down with
+    # it -- which limited XPU to greedy speculative decoding. These are torch +
+    # SYCL implementations of the same ops.
+    from custom_esimd_kernels_sglang.spec_sampling import (
         top_k_renorm_prob,
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
@@ -525,19 +536,21 @@ class EagleVerifyInputV2Mixin:
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
+            if getattr(sampling_info, "need_top_k_sampling", True):
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, self.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+            if getattr(sampling_info, "need_top_p_sampling", False):
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    ),
+                )
             maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
             draft_probs = torch.zeros_like(target_probs)
